@@ -67,4 +67,5 @@ npm run start
 
 真实 Pi Worker 需要 Pi SDK 可用的模型凭据。models.dev 原始目录会在首次使用 `/provider` 时读取，
 并转换为 Pi 支持的 `anthropic-messages`、`openai-completions`、`openai-responses` 或
-`google-generative-ai` 接口。
+`google-generative-ai` 等接口。接口类型可使用完整 ID，也可使用 `anthropic`、`openai`、
+`responses`、`google`、`codex`、`azure`、`vertex`、`mistral`、`bedrock` 等别名。

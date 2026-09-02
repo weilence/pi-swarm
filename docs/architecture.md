@@ -29,3 +29,6 @@ means registering more workers and routing tasks, without changing the CLI lifec
 The CLI loads `.env` before constructing the registry and worker. Runtime commands include
 `/provider` and `/model` backed by the models.dev provider catalog, plus `/thinking level` and
 `/status`. models.dev records are normalized into Pi's supported API types at the adapter seam.
+Specialized Pi API identifiers such as `openai-codex-responses`, `azure-openai-responses`,
+`google-vertex`, `mistral-conversations`, `bedrock-converse-stream`, and `pi-messages` are
+accepted as explicit interface selections.

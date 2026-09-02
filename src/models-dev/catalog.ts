@@ -1,6 +1,6 @@
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
-export type PiApi = "anthropic-messages" | "openai-completions" | "openai-responses" | "google-generative-ai";
+export type PiApi = "anthropic-messages" | "openai-completions" | "openai-responses" | "google-generative-ai" | "openai-codex-responses" | "azure-openai-responses" | "google-vertex" | "mistral-conversations" | "bedrock-converse-stream" | "pi-messages";
 
 export interface ModelsDevModel {
   id: string;
@@ -59,8 +59,19 @@ export function parsePiApi(value?: string): PiApi | undefined {
     "openai-completions": "openai-completions",
     responses: "openai-responses",
     "openai-responses": "openai-responses",
+    codex: "openai-codex-responses",
+    "openai-codex-responses": "openai-codex-responses",
+    azure: "azure-openai-responses",
+    "azure-openai-responses": "azure-openai-responses",
     google: "google-generative-ai",
-    "google-generative-ai": "google-generative-ai"
+    "google-generative-ai": "google-generative-ai",
+    vertex: "google-vertex",
+    "google-vertex": "google-vertex",
+    mistral: "mistral-conversations",
+    "mistral-conversations": "mistral-conversations",
+    bedrock: "bedrock-converse-stream",
+    "bedrock-converse-stream": "bedrock-converse-stream",
+    "pi-messages": "pi-messages"
   };
   const parsed = aliases[value.toLowerCase()];
   if (!parsed) throw new Error(`不支持的 Pi 接口类型：${value}`);
