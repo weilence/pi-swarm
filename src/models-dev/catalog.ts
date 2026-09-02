@@ -2,7 +2,8 @@ import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { KnownApi } from "@earendil-works/pi-ai";
 import { getApiProviders } from "@earendil-works/pi-ai/compat";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import { getUserDataDir } from "../core/userdata.ts";
 
 export type { KnownApi };
 
@@ -37,7 +38,7 @@ export interface CatalogUpdateInfo {
 
 export interface ModelsDevCatalogOptions {
   endpoint?: string;
-  /** On-disk cache file; defaults to <cwd>/.cache/models-dev.json. */
+  /** On-disk cache file; defaults to <user data dir>/models-dev.json (see getUserDataDir). */
   cacheFile?: string;
   onUpdate?: (info: CatalogUpdateInfo) => void;
 }
@@ -64,7 +65,7 @@ export class ModelsDevCatalog {
 
   public constructor(options: ModelsDevCatalogOptions = {}) {
     this.endpoint = options.endpoint ?? "https://models.dev/api.json";
-    this.cacheFile = options.cacheFile ?? resolve(process.cwd(), ".cache", "models-dev.json");
+    this.cacheFile = options.cacheFile ?? join(getUserDataDir(), "models-dev.json");
     this.onUpdate = options.onUpdate;
   }
 

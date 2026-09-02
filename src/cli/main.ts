@@ -15,6 +15,7 @@ import type { ConfigurableModuleWorker } from "../core/worker.ts";
 import { ModelsDevCatalog } from "../models-dev/catalog.ts";
 import { InkApp } from "./ink-app.tsx";
 import { LogStore } from "./log-store.ts";
+import { moduleRegistryFile } from "../core/userdata.ts";
 import { executeCommand, type CommandServices, type CommandState } from "./commands.ts";
 
 try {
@@ -24,7 +25,7 @@ try {
 }
 
 const registryData = JSON.parse(
-  await readFile(new URL("../../module-registry.json", import.meta.url), "utf8")
+  await readFile(moduleRegistryFile(), "utf8")
 ) as { modules: ModuleDefinition[] };
 const registry = new ModuleRegistry(registryData.modules);
 const events = new EventBus();

@@ -5,7 +5,6 @@
   "description": "Prototype Supervisor and module Workers built around Pi SDK",
   "type": "module",
   "scripts": {
-    "demo": "tsx src/cli/demo.ts",
     "start": "tsx src/cli/main.ts",
     "test": "tsx --test \"tests/*.test.{ts,tsx}\"",
     "typecheck": "tsc --noEmit"

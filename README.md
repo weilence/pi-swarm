@@ -11,10 +11,10 @@ This repository is intentionally a small, throwaway validation scaffold. It answ
 ```powershell
 npm install
 npm run typecheck
-npm run demo
+npm run start
 ```
 
-The demo uses `MockPiWorker` so it runs without model credentials. `PiSdkWorker` is wired to the pinned `@earendil-works/pi-coding-agent` package and is ready for a credentialed smoke test.
+`npm run start` uses `MockPiWorker` by default so it runs without model credentials. `PiSdkWorker` is wired to the pinned `@earendil-works/pi-coding-agent` package and is ready for a credentialed smoke test.
 
 The two registered modules are placeholders in `modules/user-service` and `modules/order-service`; replace them with links or checked-out directories for your real programs.
 
@@ -58,8 +58,7 @@ npm run start
 非交互环境（管道/CI）自动回退到纯文本模式，此时可用
 `/provider <id> [接口类型]`、`/model <id>`、`/thinking level` 等带参数形式。
 默认使用 `MockPiWorker`（同样支持 provider/模型/thinking 运行时切换，仅不调用真实模型），
-设置 `PI_SWARM_WORKER=pi` 可切换为 `PiSdkWorker`。`npm run demo` 仍然是一次性并行演示，
-执行完成后正常退出。
+设置 `PI_SWARM_WORKER=pi` 可切换为 `PiSdkWorker`。
 
 程序启动时会自动读取项目根目录的 `.env`（已存在的系统环境变量优先）。例如：
 
@@ -75,7 +74,9 @@ npm run start
 本仓库只需维护 models.dev 的 `npm` 包名到 `KnownApi` 的映射表（`NPM_API_RULES`，
 包名精确匹配），未列出的兼容供应商默认 `openai-completions`。models.dev 目录采用
 本地缓存 + 后台校验（stale-while-revalidate）：首次使用 `/provider` 时从网络读取并
-写入 `.cache/models-dev.json`（已 gitignore），之后每次启动立即使用磁盘缓存，并在后台
+写入用户数据目录（`getUserDataDir()`，按平台分别为 `%APPDATA%\pi-swarm`、
+`~/Library/Application Support/pi-swarm`、`~/.config/pi-swarm`）下的
+`models-dev.json`，之后每次启动立即使用磁盘缓存，并在后台
 携带缓存的 ETag 发起 `If-None-Match` 条件请求——服务器返回 304 即判定无更新（不传正文），
 返回 200 时再做全量内容比对，仅在有变化时更新内存与磁盘并写日志提示；
 无 ETag 或服务器不支持时自动回落为全量下载比对，网络失败时继续使用缓存。
