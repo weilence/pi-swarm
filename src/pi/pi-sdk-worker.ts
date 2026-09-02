@@ -1,4 +1,4 @@
-import type { StatefulModuleWorker } from "../core/worker.js";
+import type { ConfigurableModuleWorker } from "../core/worker.js";
 import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.js";
 import { join } from "node:path";
 import {
@@ -6,15 +6,21 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   SessionManager,
+  ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
+import type { PiApi } from "../models-dev/catalog.js";
 
 /** A Pi-backed worker that keeps one AgentSession alive for multiple tasks. */
-export class PiSdkWorker implements StatefulModuleWorker {
+export class PiSdkWorker implements ConfigurableModuleWorker {
   private session?: AgentSession;
   private unsubscribe?: () => void;
   private workingDirectory?: string;
   private requestedModel?: string;
   private requestedThinkingLevel?: string;
+  private modelRuntime?: ModelRuntime;
+  private providerConfig?: Parameters<ModelRuntime["registerProvider"]>[1];
+  private providerId = "models-dev";
+  private selectedModelId?: string;
 
   public constructor(
     private readonly workerName: string,
@@ -33,6 +39,8 @@ export class PiSdkWorker implements StatefulModuleWorker {
       return this.session;
     }
 
+    this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    if (this.providerConfig) this.modelRuntime.registerProvider(this.providerId, this.providerConfig);
     const resourceLoader = new DefaultResourceLoader({
       cwd: task.workingDirectory,
       agentDir: join(task.workingDirectory, ".pi-agent"),
@@ -47,7 +55,8 @@ export class PiSdkWorker implements StatefulModuleWorker {
     const { session } = await createAgentSession({
       cwd: task.workingDirectory,
       resourceLoader,
-      sessionManager: SessionManager.inMemory()
+      sessionManager: SessionManager.inMemory(),
+      modelRuntime: this.modelRuntime
     });
     this.session = session;
     this.workingDirectory = task.workingDirectory;
@@ -58,6 +67,7 @@ export class PiSdkWorker implements StatefulModuleWorker {
     });
     if (this.requestedModel) await this.applyModel(this.requestedModel);
     if (this.requestedThinkingLevel) this.applyThinkingLevel(this.requestedThinkingLevel);
+    if (this.selectedModelId) await this.applyModel(`${this.providerId}/${this.selectedModelId}`);
     return session;
   }
 
@@ -81,6 +91,21 @@ export class PiSdkWorker implements StatefulModuleWorker {
 
   public async setModel(specifier: string): Promise<string> {
     return this.applyModel(specifier.trim());
+  }
+
+  public async configureProvider(providerId: string, config: unknown, modelId?: string): Promise<string> {
+    this.providerId = providerId;
+    this.providerConfig = config as Parameters<ModelRuntime["registerProvider"]>[1];
+    this.selectedModelId = modelId;
+    if (this.modelRuntime) {
+      this.modelRuntime.registerProvider(providerId, this.providerConfig);
+      if (modelId) await this.applyModel(`${providerId}/${modelId}`);
+    }
+    return `provider 已配置，接口：${this.providerConfig.api ?? "默认"}${modelId ? `；模型：${modelId}` : ""}`;
+  }
+
+  public listModels(): string[] {
+    return this.providerConfig?.models?.map((model) => model.id) ?? [];
   }
 
   private applyThinkingLevel(level: string): string {
@@ -134,5 +159,9 @@ export class PiSdkWorker implements StatefulModuleWorker {
     this.workingDirectory = undefined;
     this.requestedModel = undefined;
     this.requestedThinkingLevel = undefined;
+    this.modelRuntime = undefined;
+    this.providerConfig = undefined;
+    this.providerId = "models-dev";
+    this.selectedModelId = undefined;
   }
 }

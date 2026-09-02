@@ -14,4 +14,6 @@ export interface ConfigurableModuleWorker extends StatefulModuleWorker {
   setModel?(specifier: string): Promise<string>;
   setThinkingLevel?(level: string): Promise<string>;
   status?(): string;
+  configureProvider?(providerId: string, config: unknown, modelId?: string): Promise<string>;
+  listModels?(): string[];
 }

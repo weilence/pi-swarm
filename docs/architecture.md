@@ -26,5 +26,6 @@ The current interactive entry point intentionally binds one work agent to one re
 is optional so the existing one-shot workers remain compatible. Adding multiple work agents later
 means registering more workers and routing tasks, without changing the CLI lifecycle.
 
-The CLI loads `.env` before constructing the registry and worker. Runtime commands are currently
-implemented by the Pi adapter: `/model provider/model`, `/thinking level`, and `/status`.
+The CLI loads `.env` before constructing the registry and worker. Runtime commands include
+`/provider` and `/model` backed by the models.dev provider catalog, plus `/thinking level` and
+`/status`. models.dev records are normalized into Pi's supported API types at the adapter seam.

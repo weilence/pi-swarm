@@ -51,7 +51,8 @@ npm run start
 ```
 
 它会启动一个 Supervisor 和一个持续复用的 work agent。每行输入一个任务，主 agent
-会把任务交给 work agent；输入 `/model provider/model`、`/thinking level` 可在运行时调整 Pi 会话，
+会把任务交给 work agent；输入 `/provider <id> [接口类型]` 从 models.dev 选择供应商和 Pi 接口，
+输入 `/model` 列出该供应商模型，输入 `/model <id>` 选择模型；`/thinking level` 可在运行时调整 Pi 会话，
 `/status` 查看当前配置；输入 `/exit` 或 `/quit` 才会结束进程。当前默认使用
 `MockPiWorker`，可替换为 `PiSdkWorker`。`npm run demo` 仍然是一次性并行演示，
 执行完成后正常退出。
@@ -64,4 +65,6 @@ Copy-Item .env.example .env
 npm run start
 ```
 
-真实 Pi Worker 需要 Pi SDK 可用的模型凭据；模型名称使用 `provider/model` 格式。
+真实 Pi Worker 需要 Pi SDK 可用的模型凭据。models.dev 原始目录会在首次使用 `/provider` 时读取，
+并转换为 Pi 支持的 `anthropic-messages`、`openai-completions`、`openai-responses` 或
+`google-generative-ai` 接口。
