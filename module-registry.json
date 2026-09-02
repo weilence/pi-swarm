@@ -1,0 +1,20 @@
+{
+  "modules": [
+    {
+      "id": "user-service",
+      "path": "modules/user-service",
+      "contextFiles": ["AGENT.md", "CONTEXT.md", "docs/api-contract.md"],
+      "allowedPaths": ["src/**", "tests/**", "docs/**"],
+      "testCommand": "npm test",
+      "contractCommand": "npm run contract-test"
+    },
+    {
+      "id": "order-service",
+      "path": "modules/order-service",
+      "contextFiles": ["AGENT.md", "CONTEXT.md", "docs/api-contract.md"],
+      "allowedPaths": ["src/**", "tests/**", "docs/**"],
+      "testCommand": "npm test",
+      "contractCommand": "npm run contract-test"
+    }
+  ]
+}
