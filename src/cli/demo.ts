@@ -1,9 +1,9 @@
 import { readFile } from "node:fs/promises";
-import { EventBus } from "../core/event-bus.js";
-import { ModuleRegistry } from "../core/module-registry.js";
-import { Supervisor } from "../core/supervisor.js";
-import { MockPiWorker } from "../workers/mock-pi-worker.js";
-import type { ModuleDefinition, TaskEnvelope } from "../protocol/contracts.js";
+import { EventBus } from "../core/event-bus.ts";
+import { ModuleRegistry } from "../core/module-registry.ts";
+import { Supervisor } from "../core/supervisor.ts";
+import { MockPiWorker } from "../workers/mock-pi-worker.ts";
+import type { ModuleDefinition, TaskEnvelope } from "../protocol/contracts.ts";
 
 const registryData = JSON.parse(
   await readFile(new URL("../../module-registry.json", import.meta.url), "utf8")

@@ -1,4 +1,4 @@
-import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.js";
+import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.ts";
 
 export interface ModuleWorker {
   run(task: TaskEnvelope): Promise<WorkerResult>;
@@ -17,3 +17,6 @@ export interface ConfigurableModuleWorker extends StatefulModuleWorker {
   configureProvider?(providerId: string, config: unknown, modelId?: string): Promise<string>;
   listModels?(): string[];
 }
+
+/** Thinking levels accepted by workers, in picker display order. */
+export const THINKING_LEVELS: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];

@@ -1,4 +1,4 @@
-import type { ModuleDefinition } from "../protocol/contracts.js";
+import type { ModuleDefinition } from "../protocol/contracts.ts";
 
 export class ModuleRegistry {
   public constructor(private readonly modules: ModuleDefinition[]) {}

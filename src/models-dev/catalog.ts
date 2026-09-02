@@ -1,6 +1,13 @@
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { KnownApi } from "@earendil-works/pi-ai";
+import { getApiProviders } from "@earendil-works/pi-ai/compat";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 
-export type PiApi = "anthropic-messages" | "openai-completions" | "openai-responses" | "google-generative-ai" | "openai-codex-responses" | "azure-openai-responses" | "google-vertex" | "mistral-conversations" | "bedrock-converse-stream" | "pi-messages";
+export type { KnownApi };
+
+/** API types offered in the picker, derived from Pi's runtime api registry. */
+export const PI_API_TYPES: readonly KnownApi[] = getApiProviders().map((provider) => provider.api as KnownApi);
 
 export interface ModelsDevModel {
   id: string;
@@ -20,18 +27,53 @@ export interface ModelsDevProvider {
   models: Record<string, ModelsDevModel>;
 }
 
+export interface CatalogUpdateInfo {
+  source: "network" | "cache" | "refresh" | "refresh-failed";
+  count: number;
+  /** True when the provider list changed (first fetch counts as a change). */
+  updated: boolean;
+  error?: unknown;
+}
+
+export interface ModelsDevCatalogOptions {
+  endpoint?: string;
+  /** On-disk cache file; defaults to <cwd>/.cache/models-dev.json. */
+  cacheFile?: string;
+  onUpdate?: (info: CatalogUpdateInfo) => void;
+}
+
+interface CachePayload {
+  fetchedAt: number;
+  providers: ModelsDevProvider[];
+  etag?: string;
+}
+
+/**
+ * models.dev catalog with stale-while-revalidate caching:
+ * a disk cache is served instantly while a background fetch checks for updates,
+ * so pickers never wait on the network after the first run.
+ */
 export class ModelsDevCatalog {
   private providers?: ModelsDevProvider[];
+  private etag?: string;
+  private inflight?: Promise<ModelsDevProvider[]>;
+  private revalidating = false;
+  private readonly endpoint: string;
+  private readonly cacheFile: string;
+  private readonly onUpdate?: (info: CatalogUpdateInfo) => void;
 
-  public constructor(private readonly endpoint = "https://models.dev/api.json") {}
+  public constructor(options: ModelsDevCatalogOptions = {}) {
+    this.endpoint = options.endpoint ?? "https://models.dev/api.json";
+    this.cacheFile = options.cacheFile ?? resolve(process.cwd(), ".cache", "models-dev.json");
+    this.onUpdate = options.onUpdate;
+  }
 
   public async load(): Promise<ModelsDevProvider[]> {
     if (this.providers) return [...this.providers];
-    const response = await fetch(this.endpoint);
-    if (!response.ok) throw new Error(`models.dev 请求失败：HTTP ${response.status}`);
-    const raw = await response.json() as Record<string, Omit<ModelsDevProvider, "id">>;
-    this.providers = Object.entries(raw).map(([id, provider]) => ({ id, ...provider }));
-    return [...this.providers];
+    this.inflight ??= this.loadUncached().finally(() => {
+      this.inflight = undefined;
+    });
+    return await this.inflight;
   }
 
   public async get(id: string): Promise<ModelsDevProvider> {
@@ -39,46 +81,140 @@ export class ModelsDevCatalog {
     if (!provider) throw new Error(`models.dev 中找不到 provider：${id}`);
     return provider;
   }
+
+  /** Warm the catalog at startup; failures stay silent until the data is actually needed. */
+  public async prefetch(): Promise<void> {
+    try {
+      await this.load();
+    } catch {
+      // surfaced by load() when a command really needs the catalog
+    }
+  }
+
+  private async loadUncached(): Promise<ModelsDevProvider[]> {
+    const cached = await this.readCache();
+    if (cached) {
+      this.providers = cached.providers;
+      this.etag = cached.etag;
+      this.onUpdate?.({ source: "cache", count: cached.providers.length, updated: false });
+      void this.revalidate();
+      return [...this.providers];
+    }
+    return await this.fetchAndStore();
+  }
+
+  /**
+   * Background freshness check, at most once per process. Sends the cached
+   * ETag as `If-None-Match`: a 304 settles "no update" without transferring
+   * the body; a 200 falls back to a full deep comparison of the payload.
+   */
+  private async revalidate(): Promise<void> {
+    if (this.revalidating) return;
+    this.revalidating = true;
+    try {
+      const { notModified, providers, etag } = await this.fetchProviders(this.etag);
+      if (notModified) {
+        this.onUpdate?.({ source: "refresh", count: this.providers?.length ?? 0, updated: false });
+        return;
+      }
+      const changed = !this.providers || JSON.stringify(providers) !== JSON.stringify(this.providers);
+      if (changed) this.providers = providers;
+      if (changed || etag !== this.etag) {
+        this.etag = etag;
+        await this.writeCache(this.providers!, etag);
+      }
+      this.onUpdate?.({ source: "refresh", count: providers.length, updated: changed });
+    } catch (error) {
+      this.onUpdate?.({ source: "refresh-failed", count: this.providers?.length ?? 0, updated: false, error });
+    } finally {
+      this.revalidating = false;
+    }
+  }
+
+  private async fetchAndStore(): Promise<ModelsDevProvider[]> {
+    const { providers, etag } = await this.fetchProviders();
+    this.providers = providers;
+    this.etag = etag;
+    await this.writeCache(providers, etag);
+    this.onUpdate?.({ source: "network", count: providers.length, updated: true });
+    return [...providers];
+  }
+
+  private async fetchProviders(ifNoneMatch?: string): Promise<{
+    notModified: boolean;
+    providers: ModelsDevProvider[];
+    etag?: string;
+  }> {
+    const response = await fetch(this.endpoint, {
+      signal: AbortSignal.timeout(15_000),
+      ...(ifNoneMatch ? { headers: { "if-none-match": ifNoneMatch } } : {})
+    });
+    if (response.status === 304) return { notModified: true, providers: [] };
+    if (!response.ok) throw new Error(`models.dev 请求失败：HTTP ${response.status}`);
+    const raw = await response.json();
+    if (typeof raw !== "object" || raw === null) throw new Error("models.dev 响应格式异常");
+    const providers = Object.entries(raw as Record<string, Omit<ModelsDevProvider, "id">>).map(([id, provider]) => ({
+      id,
+      ...provider
+    }));
+    return { notModified: false, providers, etag: response.headers.get("etag") ?? undefined };
+  }
+
+  private async readCache(): Promise<CachePayload | undefined> {
+    try {
+      const payload = JSON.parse(await readFile(this.cacheFile, "utf8")) as CachePayload;
+      const valid =
+        typeof payload.fetchedAt === "number" &&
+        Array.isArray(payload.providers) &&
+        payload.providers.every((provider) => typeof provider?.id === "string" && typeof provider?.models === "object") &&
+        (payload.etag === undefined || typeof payload.etag === "string");
+      if (!valid) return undefined;
+      return { fetchedAt: payload.fetchedAt, providers: payload.providers, etag: payload.etag };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writeCache(providers: ModelsDevProvider[], etag?: string): Promise<void> {
+    const payload: CachePayload = { fetchedAt: Date.now(), providers, etag };
+    await mkdir(dirname(this.cacheFile), { recursive: true });
+    const tmpFile = `${this.cacheFile}.${process.pid}.tmp`;
+    await writeFile(tmpFile, JSON.stringify(payload), "utf8");
+    await rename(tmpFile, this.cacheFile);
+  }
 }
 
-export function inferPiApi(provider: ModelsDevProvider, override?: PiApi): PiApi {
+/**
+ * models.dev `npm` (AI SDK package) → Pi `KnownApi` mapping, exact package
+ * name match. Packages not listed (community OpenAI-compatible providers)
+ * fall back to `openai-completions`.
+ */
+const NPM_API_RULES: Readonly<Record<string, KnownApi>> = {
+  "@ai-sdk/anthropic": "anthropic-messages",
+  "@ai-sdk/amazon-bedrock": "bedrock-converse-stream",
+  "@ai-sdk/google-vertex": "google-vertex",
+  "@ai-sdk/google": "google-generative-ai",
+  "@ai-sdk/azure": "azure-openai-responses",
+  "@ai-sdk/mistral": "mistral-conversations",
+  "@ai-sdk/openai": "openai-responses"
+};
+
+const DEFAULT_API: KnownApi = "openai-completions";
+
+export function inferPiApi(provider: ModelsDevProvider, override?: KnownApi): KnownApi {
   if (override) return override;
-  const npm = provider.npm ?? "";
-  if (npm.includes("anthropic")) return "anthropic-messages";
-  if (npm.includes("google")) return "google-generative-ai";
-  if (npm.includes("responses")) return "openai-responses";
-  return "openai-completions";
+  return NPM_API_RULES[provider.npm ?? ""] ?? DEFAULT_API;
 }
 
-export function parsePiApi(value?: string): PiApi | undefined {
+/** Validates the API type given to `/provider <id> <api>`: exact KnownApi id or nothing. */
+export function parsePiApi(value?: string): KnownApi | undefined {
   if (!value) return undefined;
-  const aliases: Record<string, PiApi> = {
-    anthropic: "anthropic-messages",
-    "anthropic-messages": "anthropic-messages",
-    openai: "openai-completions",
-    "openai-completions": "openai-completions",
-    responses: "openai-responses",
-    "openai-responses": "openai-responses",
-    codex: "openai-codex-responses",
-    "openai-codex-responses": "openai-codex-responses",
-    azure: "azure-openai-responses",
-    "azure-openai-responses": "azure-openai-responses",
-    google: "google-generative-ai",
-    "google-generative-ai": "google-generative-ai",
-    vertex: "google-vertex",
-    "google-vertex": "google-vertex",
-    mistral: "mistral-conversations",
-    "mistral-conversations": "mistral-conversations",
-    bedrock: "bedrock-converse-stream",
-    "bedrock-converse-stream": "bedrock-converse-stream",
-    "pi-messages": "pi-messages"
-  };
-  const parsed = aliases[value.toLowerCase()];
-  if (!parsed) throw new Error(`不支持的 Pi 接口类型：${value}`);
+  const parsed = PI_API_TYPES.find((api) => api === value);
+  if (!parsed) throw new Error(`不支持的 Pi 接口类型：${value}（可选：${PI_API_TYPES.join(", ")}）`);
   return parsed;
 }
 
-export function toPiProviderConfig(provider: ModelsDevProvider, api?: PiApi) {
+export function toPiProviderConfig(provider: ModelsDevProvider, api?: KnownApi) {
   const selectedApi = inferPiApi(provider, api);
   const envKey = provider.env?.[0];
   return {

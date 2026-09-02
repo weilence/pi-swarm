@@ -1,4 +1,4 @@
-import type { EventEnvelope } from "../protocol/contracts.js";
+import type { EventEnvelope } from "../protocol/contracts.ts";
 
 export class EventBus {
   private readonly events: EventEnvelope[] = [];

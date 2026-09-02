@@ -1,5 +1,6 @@
-import type { ConfigurableModuleWorker } from "../core/worker.js";
-import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.js";
+import type { ConfigurableModuleWorker } from "../core/worker.ts";
+import { THINKING_LEVELS } from "../core/worker.ts";
+import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.ts";
 import { join } from "node:path";
 import {
   type AgentSession,
@@ -8,7 +9,6 @@ import {
   SessionManager,
   ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
-import type { PiApi } from "../models-dev/catalog.js";
 
 /** A Pi-backed worker that keeps one AgentSession alive for multiple tasks. */
 export class PiSdkWorker implements ConfigurableModuleWorker {
@@ -110,8 +110,7 @@ export class PiSdkWorker implements ConfigurableModuleWorker {
 
   private applyThinkingLevel(level: string): string {
     const normalized = level.trim().toLowerCase();
-    const allowed = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-    if (!allowed.includes(normalized)) throw new Error(`thinking level 应为：${allowed.join(", ")}`);
+    if (!THINKING_LEVELS.includes(normalized)) throw new Error(`thinking level 应为：${THINKING_LEVELS.join(", ")}`);
     if (!this.session) {
       this.requestedThinkingLevel = normalized;
       return `thinking level 将在首次任务建立会话后切换为 ${normalized}`;

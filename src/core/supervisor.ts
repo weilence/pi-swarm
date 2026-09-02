@@ -1,7 +1,7 @@
-import { EventBus } from "./event-bus.js";
-import { ModuleRegistry } from "./module-registry.js";
-import type { StatefulModuleWorker } from "./worker.js";
-import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.js";
+import { EventBus } from "./event-bus.ts";
+import { ModuleRegistry } from "./module-registry.ts";
+import type { StatefulModuleWorker } from "./worker.ts";
+import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.ts";
 
 export class Supervisor {
   public constructor(
