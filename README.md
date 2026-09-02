@@ -41,3 +41,24 @@ Each module owns its `AGENT.md`, `CONTEXT.md`, contracts, decisions, and trouble
 - Pi SDK integration is isolated in `src/pi/pi-sdk-worker.ts`.
 
 See [docs/quick-validation-plan.md](docs/quick-validation-plan.md) and [docs/architecture.md](docs/architecture.md).
+
+## 持续运行的主 agent
+
+启动交互式主 agent：
+
+```powershell
+npm run start
+```
+
+它会启动一个 Supervisor 和一个持续复用的 work agent。每行输入一个任务，主 agent
+会把任务交给 work agent；输入 `/exit` 或 `/quit` 才会结束进程。当前默认使用
+`MockPiWorker`，后续可替换为 `PiSdkWorker`。`npm run demo` 仍然是一次性并行演示，
+执行完成后正常退出。
+
+要切换到真实 Pi Worker（需要 Pi SDK 可用的模型凭据）：
+
+```powershell
+$env:PI_SWARM_WORKER = "pi"
+$env:PI_SWARM_MODULE = "user-service"
+npm run start
+```

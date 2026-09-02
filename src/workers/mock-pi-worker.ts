@@ -1,9 +1,16 @@
-import type { ModuleWorker } from "../core/worker.js";
+import type { StatefulModuleWorker } from "../core/worker.js";
 import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.js";
 
 /** Prototype-only worker. Replace with PiSdkWorker once the Pi version is pinned. */
-export class MockPiWorker implements ModuleWorker {
+export class MockPiWorker implements StatefulModuleWorker {
+  private started = false;
+
+  public async start(): Promise<void> {
+    this.started = true;
+  }
+
   public async run(task: TaskEnvelope): Promise<WorkerResult> {
+    if (!this.started) await this.start();
     await new Promise((resolve) => setTimeout(resolve, 50));
     return {
       taskId: task.taskId,
@@ -14,5 +21,9 @@ export class MockPiWorker implements ModuleWorker {
       risks: [],
       messages: []
     };
+  }
+
+  public close(): void {
+    this.started = false;
   }
 }

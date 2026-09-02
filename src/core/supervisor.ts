@@ -1,14 +1,22 @@
 import { EventBus } from "./event-bus.js";
 import { ModuleRegistry } from "./module-registry.js";
-import type { ModuleWorker } from "./worker.js";
+import type { StatefulModuleWorker } from "./worker.js";
 import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.js";
 
 export class Supervisor {
   public constructor(
     private readonly registry: ModuleRegistry,
-    private readonly workers: Map<string, ModuleWorker>,
+    private readonly workers: Map<string, StatefulModuleWorker>,
     private readonly events: EventBus
   ) {}
+
+  public async start(): Promise<void> {
+    await Promise.all([...this.workers.values()].map((worker) => worker.start?.()));
+  }
+
+  public async close(): Promise<void> {
+    await Promise.all([...this.workers.values()].map((worker) => worker.close?.()));
+  }
 
   public async dispatch(tasks: TaskEnvelope[]): Promise<WorkerResult[]> {
     for (const task of tasks) {

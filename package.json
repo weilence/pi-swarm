@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "demo": "tsx src/cli/demo.ts",
+    "start": "tsx src/cli/main.ts",
+    "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
