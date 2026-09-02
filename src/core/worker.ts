@@ -9,3 +9,9 @@ export interface StatefulModuleWorker extends ModuleWorker {
   start?(): Promise<void>;
   close?(): Promise<void> | void;
 }
+
+export interface ConfigurableModuleWorker extends StatefulModuleWorker {
+  setModel?(specifier: string): Promise<string>;
+  setThinkingLevel?(level: string): Promise<string>;
+  status?(): string;
+}

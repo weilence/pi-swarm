@@ -13,6 +13,8 @@ export class PiSdkWorker implements StatefulModuleWorker {
   private session?: AgentSession;
   private unsubscribe?: () => void;
   private workingDirectory?: string;
+  private requestedModel?: string;
+  private requestedThinkingLevel?: string;
 
   public constructor(
     private readonly workerName: string,
@@ -54,7 +56,55 @@ export class PiSdkWorker implements StatefulModuleWorker {
         this.onText(event.assistantMessageEvent.delta);
       }
     });
+    if (this.requestedModel) await this.applyModel(this.requestedModel);
+    if (this.requestedThinkingLevel) this.applyThinkingLevel(this.requestedThinkingLevel);
     return session;
+  }
+
+  private async applyModel(specifier: string): Promise<string> {
+    if (!this.session) {
+      this.requestedModel = specifier;
+      return `模型将在首次任务建立会话后切换为 ${specifier}`;
+    }
+    const separator = specifier.indexOf("/");
+    if (separator <= 0 || separator === specifier.length - 1) {
+      throw new Error("模型格式应为 provider/model，例如 openai/gpt-4o");
+    }
+    const provider = specifier.slice(0, separator);
+    const modelId = specifier.slice(separator + 1);
+    const model = this.session.modelRuntime.getModel(provider, modelId);
+    if (!model) throw new Error(`找不到模型：${specifier}`);
+    await this.session.setModel(model);
+    this.requestedModel = specifier;
+    return `当前模型：${specifier}`;
+  }
+
+  public async setModel(specifier: string): Promise<string> {
+    return this.applyModel(specifier.trim());
+  }
+
+  private applyThinkingLevel(level: string): string {
+    const normalized = level.trim().toLowerCase();
+    const allowed = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    if (!allowed.includes(normalized)) throw new Error(`thinking level 应为：${allowed.join(", ")}`);
+    if (!this.session) {
+      this.requestedThinkingLevel = normalized;
+      return `thinking level 将在首次任务建立会话后切换为 ${normalized}`;
+    }
+    this.session.setThinkingLevel(normalized as never);
+    this.requestedThinkingLevel = normalized;
+    return `当前 thinking level：${normalized}`;
+  }
+
+  public async setThinkingLevel(level: string): Promise<string> {
+    return this.applyThinkingLevel(level);
+  }
+
+  public status(): string {
+    if (!this.session) return "Pi 会话尚未建立（将在第一个任务时建立）";
+    const model = this.session.model;
+    const modelName = model ? `${model.provider}/${model.id}` : "未选择";
+    return `模型：${modelName}；thinking：${this.session.thinkingLevel}`;
   }
 
   public async run(task: TaskEnvelope): Promise<WorkerResult> {
@@ -82,5 +132,7 @@ export class PiSdkWorker implements StatefulModuleWorker {
     this.session?.dispose();
     this.session = undefined;
     this.workingDirectory = undefined;
+    this.requestedModel = undefined;
+    this.requestedThinkingLevel = undefined;
   }
 }

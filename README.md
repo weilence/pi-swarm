@@ -51,14 +51,17 @@ npm run start
 ```
 
 它会启动一个 Supervisor 和一个持续复用的 work agent。每行输入一个任务，主 agent
-会把任务交给 work agent；输入 `/exit` 或 `/quit` 才会结束进程。当前默认使用
-`MockPiWorker`，后续可替换为 `PiSdkWorker`。`npm run demo` 仍然是一次性并行演示，
+会把任务交给 work agent；输入 `/model provider/model`、`/thinking level` 可在运行时调整 Pi 会话，
+`/status` 查看当前配置；输入 `/exit` 或 `/quit` 才会结束进程。当前默认使用
+`MockPiWorker`，可替换为 `PiSdkWorker`。`npm run demo` 仍然是一次性并行演示，
 执行完成后正常退出。
 
-要切换到真实 Pi Worker（需要 Pi SDK 可用的模型凭据）：
+程序启动时会自动读取项目根目录的 `.env`（已存在的系统环境变量优先）。例如：
 
 ```powershell
-$env:PI_SWARM_WORKER = "pi"
-$env:PI_SWARM_MODULE = "user-service"
+Copy-Item .env.example .env
+# 编辑 .env，设置 PI_SWARM_WORKER=pi 和 OPENAI_API_KEY/ANTHROPIC_API_KEY 等
 npm run start
 ```
+
+真实 Pi Worker 需要 Pi SDK 可用的模型凭据；模型名称使用 `provider/model` 格式。

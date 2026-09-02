@@ -25,3 +25,6 @@ The current interactive entry point intentionally binds one work agent to one re
 `Supervisor.start()` and `Supervisor.close()` define the lifecycle seam; `StatefulModuleWorker`
 is optional so the existing one-shot workers remain compatible. Adding multiple work agents later
 means registering more workers and routing tasks, without changing the CLI lifecycle.
+
+The CLI loads `.env` before constructing the registry and worker. Runtime commands are currently
+implemented by the Pi adapter: `/model provider/model`, `/thinking level`, and `/status`.
