@@ -10,7 +10,7 @@ import {
   SelectList,
   type SelectItem,
   Text,
-  TuiMainScreen,
+  TuiAltScreen,
   type TUI
 } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
@@ -18,7 +18,7 @@ import { dim } from "../core/ansi.ts";
 import type { PickerOption } from "./commands.ts";
 
 export interface TuiReplOptions {
-  /** Injected TUI for tests; defaults to a ProcessTerminal + TuiMainScreen pair. */
+  /** Injected TUI for tests; defaults to a ProcessTerminal + TuiAltScreen (fullscreen) pair. */
   ui?: TUI;
   onSubmit: (line: string) => Promise<void>;
   onExit: () => void;
@@ -118,7 +118,7 @@ class PickerComponent<T> extends Container {
  * editor with history, and overlay pickers — replacing the former Ink stack.
  */
 export class TuiRepl {
-  private readonly owned?: { terminal: ProcessTerminal; ui: TuiMainScreen };
+  private readonly owned?: { terminal: ProcessTerminal; ui: TuiAltScreen };
   private readonly ui: TUI;
   private readonly logContainer = new Container();
   private readonly streamArea = new Container();
@@ -136,7 +136,9 @@ export class TuiRepl {
       this.ui = options.ui;
     } else {
       const terminal = new ProcessTerminal();
-      const ui = new TuiMainScreen(terminal, true);
+      // Fullscreen (alternate-screen) mode: app owns the whole viewport with a
+      // scrollable document that follows new output; screen is restored on stop.
+      const ui = new TuiAltScreen(terminal, true);
       this.owned = { terminal, ui };
       this.ui = ui;
     }
@@ -236,7 +238,7 @@ export class TuiRepl {
     });
   }
 
-  private appendMarkdown(markdown: string): void {
+  public appendMarkdown(markdown: string): void {
     if (!markdown.trim()) return;
     this.logContainer.addChild(new Markdown(markdown, 0, 0, this.markdownTheme));
     this.ui.requestRender();

@@ -161,6 +161,7 @@ if (interactive) {
     ...sharedServices,
     interactive: true,
     log,
+    logMarkdown: (md) => (repl ? repl.appendMarkdown(md) : console.log(md)),
     pick: (title, options) => repl!.pick(title, options)
   };
   repl = new TuiRepl({

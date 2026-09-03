@@ -2,6 +2,7 @@ import { THINKING_LEVELS } from "../core/thinking.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
 import type { SessionManager } from "../core/session/session-manager.ts";
 import { SessionBusyError, SessionClosedError, SessionNotFoundError } from "../core/session/session-types.ts";
+import { renderSessionHistory } from "../core/session-history.ts";
 import type { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
 import {
   PI_API_TYPES,
@@ -48,6 +49,8 @@ export interface CommandServices {
   agent?: AgentController;
   catalog: ProviderCatalog;
   log: (line: string) => void;
+  /** Markdown 块输出（历史回显用）；缺省回落到 log。 */
+  logMarkdown?: (markdown: string) => void;
   /** Interactive selection; resolves to undefined when cancelled or unavailable. */
   pick: <T>(title: string, options: readonly PickerOption<T>[]) => Promise<T | undefined>;
   interactive: boolean;
@@ -411,10 +414,28 @@ async function commandSwitch(ref: string, services: CommandServices): Promise<vo
     services.log(
       `[主 agent] ${await services.agent?.rebind?.(pi) ?? `已切换会话（agent 不支持运行时切换，仅更新指针）：${target.name ?? target.id}`}`
     );
+    replaySessionHistory(pi, services);
   } catch (error) {
     const now = sessions.current();
     if (previous && now && now.id !== previous.id) await sessions.switch(previous.id).catch(() => undefined);
     services.log(`[主 agent] 切换失败：${sessionCommandError(error)}`);
+  }
+}
+
+/**
+ * 切换成功后回放目标会话历史（compaction-aware）：块经 logMarkdown（缺省
+ * 回落 log）逐条输出。整个过程不抛错——回放失败只提示，不影响切换结果。
+ * /new 不回放（新会话没有历史）。
+ */
+function replaySessionHistory(pi: PiSessionManager, services: CommandServices): void {
+  try {
+    const blocks = renderSessionHistory(pi.buildContextEntries());
+    if (blocks.length === 0) return;
+    services.log(`[主 agent] 已回放 ${blocks.length} 条历史记录：`);
+    const write = services.logMarkdown ?? services.log;
+    for (const block of blocks) write(block);
+  } catch (error) {
+    services.log(`[主 agent] 历史回放失败：${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
