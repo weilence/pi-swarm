@@ -27,19 +27,19 @@ const interactive = input.isTTY === true;
 // Streams and log lines route into the interactive REPL once it exists; before
 // that (and in pipe mode) they fall back to plain stdout.
 let repl: TuiRepl | undefined;
-const log = (line: string): void => {
-  if (repl) repl.appendLine(line);
+const log = (line: string, agent = "supervisor"): void => {
+  if (repl) repl.appendLine(line, agent);
   else console.log(line);
 };
-const streamText = (delta: string): void => {
-  if (repl) repl.streamText(delta);
+const streamText = (delta: string, agent = "supervisor"): void => {
+  if (repl) repl.streamText(delta, agent);
   else process.stdout.write(delta);
 };
-const streamThinking = (delta: string): void => {
-  if (repl) repl.streamThinking(delta);
+const streamThinking = (delta: string, agent = "supervisor"): void => {
+  if (repl) repl.streamThinking(delta, agent);
   else process.stdout.write(dim(delta));
 };
-const endStream = (): void => repl?.endStream();
+const endStream = (agent = "supervisor"): void => repl?.endStream(agent);
 
 // One shared runtime: /provider and /model register once and apply to the
 // supervisor session and every sub-agent session alike.
@@ -110,6 +110,8 @@ const supervisor: Supervisor = new Supervisor((name) => {
       onThinking: streamThinking,
       onStreamEnd: endStream
     });
+    // Lazy dispatch: make sure the sub-agent has a tab in the TUI.
+    repl?.registerAgent(name);
     subAgents.set(name, agent);
   }
   return agent;
@@ -170,6 +172,9 @@ if (interactive) {
     },
     onExit: settleExit
   });
+  // Tabs: supervisor plus every registry agent; later dispatches register lazily.
+  repl.registerAgent("supervisor");
+  for (const definition of agentRegistry.list()) repl.registerAgent(definition.name);
   repl.start();
   await exited;
   repl.stop();

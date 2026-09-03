@@ -27,9 +27,9 @@ export interface SubAgentOptions {
   cwd?: string;
   /** Returns the current global default model (provider/model) when one is configured. */
   resolveModel?: () => string | undefined;
-  onText?: (delta: string) => void;
-  onThinking?: (delta: string) => void;
-  onStreamEnd?: () => void;
+  onText?: (delta: string, agent: string) => void;
+  onThinking?: (delta: string, agent: string) => void;
+  onStreamEnd?: (agent: string) => void;
   /** Per-attempt wall-clock limit; the session is aborted when it fires. */
   timeoutMs?: number;
 }
@@ -117,6 +117,9 @@ export class SubAgent {
       throw error;
     } finally {
       clearTimeout(timer);
+      // Flush the streaming tail on success, timeout, and failure alike — same
+      // semantics as SupervisorAgent.promptModel; keeps retries residue-free.
+      this.options.onStreamEnd?.(this.options.definition.name);
     }
   }
 
@@ -147,9 +150,9 @@ export class SubAgent {
       this.collector?.handle(event);
       forwardAssistantEvent(event, {
         appendText: () => undefined,
-        onText: (delta) => this.options.onText?.(delta),
+        onText: (delta) => this.options.onText?.(delta, definition.name),
         onThinking: (delta) => {
-          if (this.options.onThinking) this.options.onThinking(delta);
+          if (this.options.onThinking) this.options.onThinking(delta, definition.name);
           else process.stdout.write(dim(delta));
         }
       });

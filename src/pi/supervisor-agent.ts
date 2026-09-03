@@ -34,11 +34,11 @@ export interface SupervisorAgentOptions {
    */
   modelRuntime?: ModelRuntime;
   /** Streams assistant text; defaults to plain stdout. */
-  onText?: (delta: string) => void;
+  onText?: (delta: string, agent: string) => void;
   /** Streams reasoning/thinking deltas; defaults to dimmed stdout. */
-  onThinking?: (delta: string) => void;
+  onThinking?: (delta: string, agent: string) => void;
   /** Called when a streaming response finishes (or fails) to flush UI tails. */
-  onStreamEnd?: () => void;
+  onStreamEnd?: (agent: string) => void;
   /** When provided, every successful configuration change is persisted. */
   configStore?: ConfigStore;
   /**
@@ -86,9 +86,9 @@ export class SupervisorAgent {
   private requestedThinkingLevel?: string;
   private readonly cwd: string;
   private readonly agentDir: string;
-  private readonly onText: (delta: string) => void;
-  private readonly onThinking: (delta: string) => void;
-  private readonly onStreamEnd?: () => void;
+  private readonly onText: (delta: string, agent: string) => void;
+  private readonly onThinking: (delta: string, agent: string) => void;
+  private readonly onStreamEnd?: (agent: string) => void;
   private readonly configStore?: ConfigStore;
   private readonly options: SupervisorAgentOptions;
   /** Holder the delegate tool reads; swapped per task in runTask(). */
@@ -192,10 +192,10 @@ export class SupervisorAgent {
           this.responseBuffer += delta;
         },
         onText: (delta) => {
-          if (this.streamToUi) this.onText(delta);
+          if (this.streamToUi) this.onText(delta, "supervisor");
         },
         onThinking: (delta) => {
-          if (this.streamToUi) this.onThinking(delta);
+          if (this.streamToUi) this.onThinking(delta, "supervisor");
         }
       });
     });
@@ -243,7 +243,7 @@ export class SupervisorAgent {
     } finally {
       this.prompting = false;
       this.streamToUi = previous;
-      this.onStreamEnd?.();
+      this.onStreamEnd?.("supervisor");
     }
   }
 
