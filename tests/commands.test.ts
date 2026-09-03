@@ -85,7 +85,7 @@ function makeServices(
 
 test("bare /provider in non-interactive mode lists providers", async () => {
   const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
-  const outcome = await executeCommand("/provider", services, { taskNumber: 0 });
+  const outcome = await executeCommand("/provider", services, {});
   assert.equal(outcome, "continue");
   assert.match(services.logs.join("\n"), /providers：anthropic \(Anthropic\), openai \(OpenAI\)/);
 });
@@ -93,7 +93,7 @@ test("bare /provider in non-interactive mode lists providers", async () => {
 test("/provider <id> configures the worker and lists models", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  await executeCommand("/provider anthropic", services, { taskNumber: 0 });
+  await executeCommand("/provider anthropic", services, {});
   assert.equal(recording.providerConfigs.length, 1);
   assert.equal(recording.providerConfigs[0].providerId, "anthropic");
   assert.equal(recording.providerConfigs[0].api, "anthropic-messages");
@@ -103,14 +103,14 @@ test("/provider <id> configures the worker and lists models", async () => {
 test("/provider with an exact api id passes it through", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  await executeCommand("/provider openai openai-responses", services, { taskNumber: 0 });
+  await executeCommand("/provider openai openai-responses", services, {});
   assert.equal(recording.providerConfigs[0].api, "openai-responses");
 });
 
 test("/provider rejects api aliases and wrong case", async () => {
   const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
-  await executeCommand("/provider openai responses", services, { taskNumber: 0 });
-  await executeCommand("/provider openai OpenAI-Responses", services, { taskNumber: 0 });
+  await executeCommand("/provider openai responses", services, {});
+  await executeCommand("/provider openai OpenAI-Responses", services, {});
   const logs = services.logs.join("\n");
   assert.match(logs, /不支持的 Pi 接口类型：responses（可选：/);
   assert.match(logs, /不支持的 Pi 接口类型：OpenAI-Responses/);
@@ -118,14 +118,14 @@ test("/provider rejects api aliases and wrong case", async () => {
 
 test("/provider with an unknown id reports a failure", async () => {
   const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
-  await executeCommand("/provider nobody", services, { taskNumber: 0 });
+  await executeCommand("/provider nobody", services, {});
   assert.match(services.logs.join("\n"), /provider 配置失败：models\.dev 中找不到 provider：nobody/);
 });
 
 test("interactive /provider chains provider, api, and model pickers", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording, ["anthropic", "auto", "claude-sonnet-4"], true);
-  await executeCommand("/provider", services, { taskNumber: 0 });
+  await executeCommand("/provider", services, {});
   assert.equal(recording.providerConfigs[0].providerId, "anthropic");
   assert.equal(recording.providerConfigs[0].api, "anthropic-messages");
   assert.deepEqual(recording.models, ["anthropic/claude-sonnet-4"]);
@@ -134,7 +134,7 @@ test("interactive /provider chains provider, api, and model pickers", async () =
 test("interactive /provider skipping the model picker still configures the provider", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording, ["openai", "openai-responses", undefined], true);
-  await executeCommand("/provider", services, { taskNumber: 0 });
+  await executeCommand("/provider", services, {});
   assert.equal(recording.providerConfigs[0].api, "openai-responses");
   assert.deepEqual(recording.models, []);
   assert.match(services.logs.join("\n"), /已跳过模型选择/);
@@ -143,11 +143,11 @@ test("interactive /provider skipping the model picker still configures the provi
 test("bare /model requires a provider first and interactive /model picks one", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const plain = makeServices(recording);
-  await executeCommand("/model", plain, { taskNumber: 0 });
+  await executeCommand("/model", plain, {});
   assert.match(plain.logs.join("\n"), /请先使用 \/provider/);
 
   const interactive = makeServices(recording, ["auto", "claude-haiku-4"], true);
-  const state: CommandState = { taskNumber: 0 };
+  const state: CommandState = {};
   await executeCommand("/provider anthropic", interactive, state);
   await executeCommand("/model", interactive, state);
   assert.deepEqual(recording.models, ["anthropic/claude-haiku-4"]);
@@ -156,7 +156,7 @@ test("bare /model requires a provider first and interactive /model picks one", a
 test("/model rejects unknown models for the selected provider but passes raw specifiers through", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  const state: CommandState = { taskNumber: 0 };
+  const state: CommandState = {};
   await executeCommand("/provider anthropic", services, state);
   await executeCommand("/model nope", services, state);
   assert.match(services.logs.join("\n"), /provider anthropic 没有模型：nope/);
@@ -167,11 +167,11 @@ test("/model rejects unknown models for the selected provider but passes raw spe
 test("/apikey sets the key through the agent and reports usage with env hints", async () => {
   const recording: Recording = { providerConfigs: [], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  await executeCommand("/apikey sk-secret-1234", services, { taskNumber: 0 });
+  await executeCommand("/apikey sk-secret-1234", services, {});
   assert.deepEqual(recording.apiKeys, ["sk-secret-1234"]);
   assert.match(services.logs.join("\n"), /API key 已配置并持久化/);
 
-  const state: CommandState = { taskNumber: 0 };
+  const state: CommandState = {};
   await executeCommand("/provider anthropic", services, state);
   await executeCommand("/apikey", services, state);
   assert.match(services.logs.join("\n"), /环境变量 ANTHROPIC_API_KEY 读取密钥/);
@@ -187,32 +187,32 @@ test("/apikey failures surface the agent error", async () => {
       throw new Error("请先使用 /provider 选择 provider");
     }
   };
-  await executeCommand("/apikey sk-secret", services, { taskNumber: 0 });
+  await executeCommand("/apikey sk-secret", services, {});
   assert.match(services.logs.join("\n"), /API key 配置失败：请先使用 \/provider 选择 provider/);
 });
 
 test("/thinking validates levels and bare form lists or picks them", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  await executeCommand("/thinking high", services, { taskNumber: 0 });
-  await executeCommand("/thinking wild", services, { taskNumber: 0 });
+  await executeCommand("/thinking high", services, {});
+  await executeCommand("/thinking wild", services, {});
   assert.match(services.logs.join("\n"), /thinking 切换失败：thinking level 应为/);
   assert.deepEqual(recording.thinkingLevels, ["high"]);
 
-  await executeCommand("/thinking", services, { taskNumber: 0 });
+  await executeCommand("/thinking", services, {});
   assert.match(services.logs.join("\n"), /thinking level 可选：off, minimal, low, medium, high, xhigh, max/);
 
   const interactive = makeServices(recording, ["xhigh"], true);
-  await executeCommand("/thinking", interactive, { taskNumber: 0 });
+  await executeCommand("/thinking", interactive, {});
   assert.deepEqual(recording.thinkingLevels, ["high", "xhigh"]);
 });
 
 test("/status reports worker state and /exit wins over other commands", async () => {
   const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
-  assert.equal(await executeCommand("/status", services, { taskNumber: 0 }), "continue");
+  assert.equal(await executeCommand("/status", services, {}), "continue");
   assert.match(services.logs.join("\n"), /模型：未选择；thinking：off/);
-  assert.equal(await executeCommand("/exit", services, { taskNumber: 0 }), "exit");
-  assert.equal(await executeCommand("/quit", services, { taskNumber: 0 }), "exit");
+  assert.equal(await executeCommand("/exit", services, {}), "exit");
+  assert.equal(await executeCommand("/quit", services, {}), "exit");
 });
 
 const testModule: ModuleDefinition = {
@@ -245,50 +245,63 @@ function makeDispatchRecording(): { dispatched: TaskEnvelope[]; supervisor: { di
   };
 }
 
-test("task dispatch plans through the supervisor agent before delegating", async () => {
-  const recording = { providerConfigs: [], models: [], thinkingLevels: [] };
-  const services = makeServices(recording);
-  const { dispatched, supervisor } = makeDispatchRecording();
-  services.supervisor = supervisor;
-  services.module = testModule;
-  services.agent = {
-    ...makeAgent(recording),
-    async plan(goal: string) {
-      return `1. 拆解 ${goal}`;
-    }
-  };
-  await executeCommand("实现登录", services, { taskNumber: 0 });
-  assert.equal(dispatched.length, 1);
-  assert.match(dispatched[0].goal, /^实现登录/);
-  assert.match(dispatched[0].goal, /Supervisor 规划要点：\n1\. 拆解 实现登录$/);
-  assert.match(services.logs.join("\n"), /supervisor 规划完成，任务已交给 worker/);
-});
-
-test("dispatch falls back to direct delegation when the supervisor model is unavailable", async () => {
-  const recording = { providerConfigs: [], models: [], thinkingLevels: [] };
-  const services = makeServices(recording);
-  const { dispatched, supervisor } = makeDispatchRecording();
-  services.supervisor = supervisor;
-  services.module = testModule;
-  services.agent = {
-    ...makeAgent(recording),
-    async plan() {
-      throw new Error("no model configured");
-    }
-  };
-  await executeCommand("实现登录", services, { taskNumber: 0 });
-  assert.equal(dispatched.length, 1);
-  assert.equal(dispatched[0].goal, "实现登录");
-  assert.match(services.logs.join("\n"), /supervisor 模型不可用，跳过规划直接派发：no model configured/);
-});
-
-test("dispatch without a planning agent delegates the goal as-is", async () => {
+test("simple intents dispatch one condensed task and stream a summary", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
   const { dispatched, supervisor } = makeDispatchRecording();
   services.supervisor = supervisor;
   services.module = testModule;
-  await executeCommand("实现登录", services, { taskNumber: 0 });
+  services.modules = [testModule];
+  const summarized: string[] = [];
+  let planned = 0;
+  services.agent = {
+    ...makeAgent(recording),
+    async analyzeIntent() {
+      return { clarity: "simple", task: "在 user-service 实现登录", questions: [] };
+    },
+    async planSteps() {
+      planned += 1;
+      return [];
+    },
+    async summarize(goal: string) {
+      summarized.push(goal);
+    }
+  };
+  await executeCommand("实现登录", services, {});
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].goal, "在 user-service 实现登录");
+  assert.equal(planned, 0, "simple intents skip planning");
+  assert.deepEqual(summarized, ["实现登录"]);
+  assert.match(services.logs.join("\n"), /意图分析：简单任务，直接执行/);
+});
+
+test("analysis failure falls back to direct delegation", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  const { dispatched, supervisor } = makeDispatchRecording();
+  services.supervisor = supervisor;
+  services.module = testModule;
+  services.modules = [testModule];
+  services.agent = {
+    ...makeAgent(recording),
+    async analyzeIntent() {
+      throw new Error("no model configured");
+    }
+  };
+  await executeCommand("实现登录", services, {});
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].goal, "实现登录");
+  assert.match(services.logs.join("\n"), /supervisor 模型不可用，跳过意图分析直接派发：no model configured/);
+});
+
+test("dispatch without an agent delegates the goal as-is", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  const { dispatched, supervisor } = makeDispatchRecording();
+  services.supervisor = supervisor;
+  services.module = testModule;
+  services.modules = [testModule];
+  await executeCommand("实现登录", services, {});
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].goal, "实现登录");
 });
@@ -296,7 +309,7 @@ test("dispatch without a planning agent delegates the goal as-is", async () => {
 test("deprecated models are hidden and badges annotate the model listings", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  const state: CommandState = { taskNumber: 0 };
+  const state: CommandState = {};
   await executeCommand("/provider anthropic", services, state);
   const listed = services.logs.join("\n");
   assert.doesNotMatch(listed, /claude-old/);
@@ -306,25 +319,4 @@ test("deprecated models are hidden and badges annotate the model listings", asyn
   const models = services.logs.join("\n");
   assert.doesNotMatch(models, /claude-old/);
   assert.match(models, /claude-lab \(Claude Lab；experimental，无工具调用，知识截止 2026-01\)/);
-});
-
-test("planning receives the selected model's knowledge cutoff", async () => {
-  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
-  const services = makeServices(recording);
-  const { supervisor } = makeDispatchRecording();
-  services.supervisor = supervisor;
-  services.module = testModule;
-  const contexts: (undefined | { knowledgeCutoff?: string })[] = [];
-  services.agent = {
-    ...makeAgent(recording),
-    async plan(_goal: string, _module: unknown, context?: { knowledgeCutoff?: string }) {
-      contexts.push(context);
-      return "1. 拆解";
-    }
-  };
-  const state: CommandState = { taskNumber: 0 };
-  await executeCommand("/provider anthropic", services, state);
-  await executeCommand("/model claude-lab", services, state);
-  await executeCommand("实现登录", services, state);
-  assert.deepEqual(contexts, [{ knowledgeCutoff: "2026-01" }]);
 });

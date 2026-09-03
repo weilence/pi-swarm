@@ -54,6 +54,15 @@ const worker: ConfigurableModuleWorker =
   workerMode === "pi"
     ? new PiSdkWorker(`${module.id} manager`, streamText, streamThinking, endStream)
     : new MockPiWorker();
+const workers = new Map<string, ConfigurableModuleWorker>([[module.id, worker]]);
+for (const extra of registry.list()) {
+  if (!workers.has(extra.id)) {
+    workers.set(
+      extra.id,
+      workerMode === "pi" ? new PiSdkWorker(`${extra.id} manager`, streamText, streamThinking, endStream) : new MockPiWorker()
+    );
+  }
+}
 const modelsCatalog = new ModelsDevCatalog({
   onUpdate: (info) => {
     if (info.source === "refresh" && info.updated) {
@@ -61,7 +70,7 @@ const modelsCatalog = new ModelsDevCatalog({
     }
   }
 });
-const supervisor = new Supervisor(registry, new Map([[module.id, worker]]), events);
+const supervisor = new Supervisor(registry, workers, events);
 const configStore = new JsonFileConfigStore();
 const supervisorAgent = new SupervisorAgent({
   onText: streamText,
@@ -96,7 +105,6 @@ log(`[主 agent] ${await supervisorAgent.restore()}`);
 void modelsCatalog.prefetch();
 
 const commandState: CommandState = {
-  taskNumber: 0,
   selectedProvider: restoredProvider,
   selectedModelId: restoredModelId
 };
@@ -105,7 +113,8 @@ const sharedServices = {
   worker,
   catalog: modelsCatalog,
   supervisor,
-  module
+  module,
+  modules: registry.list()
 };
 
 if (interactive) {
@@ -117,7 +126,8 @@ if (interactive) {
     ...sharedServices,
     interactive: true,
     log,
-    pick: (title, options) => repl!.pick(title, options)
+    pick: (title, options) => repl!.pick(title, options),
+    askUser: (question) => repl!.askQuestion(question)
   };
   repl = new TuiRepl({
     onSubmit: async (line) => {

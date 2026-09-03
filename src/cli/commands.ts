@@ -1,6 +1,7 @@
 import { THINKING_LEVELS } from "../core/worker.ts";
 import type { ConfigurableModuleWorker } from "../core/worker.ts";
-import type { ModuleDefinition, TaskEnvelope, WorkerResult } from "../protocol/contracts.ts";
+import type { ModuleDefinition } from "../protocol/contracts.ts";
+import { Orchestrator, type AgentBrain, type TaskDispatcher } from "../core/orchestrator.ts";
 import {
   PI_API_TYPES,
   inferPiApi,
@@ -23,28 +24,16 @@ export interface ProviderCatalog {
   load(): Promise<ModelsDevProvider[]>;
 }
 
-/** Minimal supervisor surface used by the CLI; the real Supervisor satisfies it structurally. */
-export interface TaskDispatcher {
-  dispatch(tasks: TaskEnvelope[]): Promise<WorkerResult[]>;
-}
-
 /**
  * Runtime-configurable, model-backed supervisor agent: target of
- * /provider /model /thinking and of task planning before dispatch.
+ * /provider /model /thinking /apikey and the orchestrator's model brain.
  */
-export interface AgentController {
+export interface AgentController extends AgentBrain {
   configureProvider?(providerId: string, config: unknown, modelId?: string): Promise<string>;
   setModel?(specifier: string): Promise<string>;
   setThinkingLevel?(level: string): Promise<string>;
   setApiKey?(key: string): Promise<string>;
   status?(): string;
-  /** Real-model planning hook invoked before a task is dispatched. */
-  plan?(goal: string, module: ModuleDefinition, context?: PlanningContext): Promise<string>;
-}
-
-/** Extra facts about the selected model, fed into supervisor planning. */
-export interface PlanningContext {
-  knowledgeCutoff?: string;
 }
 
 export interface CommandServices {
@@ -54,15 +43,18 @@ export interface CommandServices {
   log: (line: string) => void;
   /** Interactive selection; resolves to undefined when cancelled or unavailable. */
   pick: <T>(title: string, options: readonly PickerOption<T>[]) => Promise<T | undefined>;
+  /** Interactive clarification channel used by the orchestrator. */
+  askUser?: (question: string) => Promise<string>;
   interactive: boolean;
   supervisor?: TaskDispatcher;
   module?: ModuleDefinition;
+  /** All registered modules offered to intent analysis and planning. */
+  modules?: ModuleDefinition[];
 }
 
 export interface CommandState {
   selectedProvider?: ModelsDevProvider;
   selectedModelId?: string;
-  taskNumber: number;
 }
 
 export type CommandOutcome = "exit" | "continue";
@@ -292,40 +284,18 @@ async function commandThinking(level: string | undefined, services: CommandServi
   }
 }
 
-async function dispatchTask(goal: string, services: CommandServices, state: CommandState): Promise<void> {
-  if (!services.supervisor || !services.module) {
+async function dispatchTask(goal: string, services: CommandServices, _state: CommandState): Promise<void> {
+  if (!services.supervisor || !services.module || !services.modules) {
     services.log("[主 agent] 任务派发未配置。");
     return;
   }
-  state.taskNumber += 1;
-  let effectiveGoal = goal;
-  if (services.agent?.plan) {
-    try {
-      const selectedModel = state.selectedProvider && state.selectedModelId ? state.selectedProvider.models[state.selectedModelId] : undefined;
-      const plan = await services.agent.plan(goal, services.module, { knowledgeCutoff: selectedModel?.knowledge });
-      if (plan) {
-        services.log("[主 agent] supervisor 规划完成，任务已交给 worker。");
-        effectiveGoal = `${goal}\n\nSupervisor 规划要点：\n${plan}`;
-      }
-    } catch (error) {
-      services.log(`[主 agent] supervisor 模型不可用，跳过规划直接派发：${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  const task: TaskEnvelope = {
-    taskId: `T-${String(state.taskNumber).padStart(3, "0")}`,
-    module: services.module.id,
-    goal: effectiveGoal,
-    workingDirectory: services.module.path,
-    contextFiles: services.module.contextFiles,
-    allowedPaths: services.module.allowedPaths,
-    relatedModules: [],
-    requiredTests: [services.module.testCommand, services.module.contractCommand]
-  };
-
-  try {
-    const [result] = await services.supervisor.dispatch([task]);
-    services.log(`[主 agent] ${result.status}：${result.module}，变更 ${result.changedFiles.length} 个文件。`);
-  } catch (error) {
-    services.log(`[主 agent] 任务失败：${error instanceof Error ? error.message : String(error)}`);
-  }
+  const orchestrator = new Orchestrator({
+    agent: services.agent,
+    supervisor: services.supervisor,
+    modules: services.modules,
+    defaultModule: services.module.id,
+    askUser: services.askUser,
+    log: services.log
+  });
+  await orchestrator.run(goal);
 }

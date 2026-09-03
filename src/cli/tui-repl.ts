@@ -127,6 +127,7 @@ export class TuiRepl {
   private readonly markdownTheme: MarkdownTheme;
   private thinkingBuffer = "";
   private partialBlock = "";
+  private pendingAnswer?: (answer: string) => void;
 
   public constructor(private readonly options: TuiReplOptions) {
     initTheme();
@@ -141,6 +142,13 @@ export class TuiRepl {
     }
     this.editor = new Editor(this.ui, { borderColor: (text) => text, selectList: getSelectListTheme() });
     this.editor.onSubmit = (text) => {
+      if (this.pendingAnswer) {
+        const settle = this.pendingAnswer;
+        this.pendingAnswer = undefined;
+        this.setBusy(true);
+        settle(text);
+        return;
+      }
       void this.handleSubmit(text);
     };
     this.inputArea.addChild(this.editor);
@@ -213,6 +221,18 @@ export class TuiRepl {
         resolve(value);
       });
       const handle = this.ui.showOverlay(component, { anchor: "center" });
+    });
+  }
+
+  /**
+   * Asks the user one question mid-task: the question lands in the log, the
+   * input line comes back for one answer line, then busy mode resumes.
+   */
+  public askQuestion(question: string): Promise<string> {
+    return new Promise<string>((resolve) => {
+      this.appendLine(question);
+      this.setBusy(false);
+      this.pendingAnswer = resolve;
     });
   }
 

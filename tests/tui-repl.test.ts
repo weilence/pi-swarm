@@ -113,6 +113,16 @@ test("appendLine adds a plain text row", () => {
   assert.ok(log.children[0].render(80).join("\n").includes("已恢复配置"));
 });
 
+test("askQuestion collects one answer line and hands the prompt back", async () => {
+  const { repl, log } = makeRepl();
+  const answer = repl.askQuestion("[主 agent] 用哪个数据库？");
+  const editor = (repl as unknown as { editor: { handleInput(data: string): void } }).editor;
+  editor.handleInput("postgres");
+  editor.handleInput("\r");
+  assert.equal(await answer, "postgres");
+  assert.ok(log.children.length > 0);
+});
+
 test("pick selects via Enter, filters by typing, and cancels with Esc", async () => {
   const { repl, overlays } = makeRepl();
 

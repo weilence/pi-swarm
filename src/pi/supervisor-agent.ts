@@ -5,6 +5,7 @@ import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-sto
 import { getUserDataDir } from "../core/userdata.ts";
 import { dim } from "../core/ansi.ts";
 import { forwardAssistantEvent } from "./assistant-stream.ts";
+import { extractJson, parseIntentAnalysis, parsePlannedSteps, type IntentAnalysis, type PlannedStep, type StepOutcome } from "../core/orchestrator.ts";
 import {
   type AgentSession,
   createAgentSession,
@@ -42,6 +43,7 @@ export class SupervisorAgent {
   private session?: AgentSession;
   private unsubscribe?: () => void;
   private responseBuffer = "";
+  private streamToUi = true;
   private snapshot: AgentConfigSnapshot = {};
   private modelRuntime?: ModelRuntime;
   private providerConfig?: Parameters<ModelRuntime["registerProvider"]>[1];
@@ -127,8 +129,12 @@ export class SupervisorAgent {
         appendText: (delta) => {
           this.responseBuffer += delta;
         },
-        onText: this.onText,
-        onThinking: this.onThinking
+        onText: (delta) => {
+          if (this.streamToUi) this.onText(delta);
+        },
+        onThinking: (delta) => {
+          if (this.streamToUi) this.onThinking(delta);
+        }
       });
     });
     if (this.requestedModel) await this.applyModel(this.requestedModel);
@@ -137,33 +143,91 @@ export class SupervisorAgent {
   }
 
   /**
-   * Real model call: turns a user goal into an execution plan for the module
-   * worker. Streams deltas through onText and returns the accumulated text.
+   * Runs one model turn and returns the full assistant text. Intermediate
+   * turns (analysis, planning) stay quiet; set stream to show the reply live.
    */
-  public async plan(goal: string, module: ModuleDefinition, context?: { knowledgeCutoff?: string }): Promise<string> {
+  private async promptModel(prompt: string, options: { stream?: boolean } = {}): Promise<string> {
     const session = await this.ensureSession();
+    const previous = this.streamToUi;
+    this.streamToUi = options.stream === true;
     this.responseBuffer = "";
     try {
-      await session.prompt(
-        [
-          "为以下任务制定执行计划，交给模块 worker 执行。",
-          `用户目标：${goal}`,
-          `目标模块：${module.id}（工作目录 ${module.path}）`,
-          `模块上下文文件：${module.contextFiles.join(", ") || "无"}`,
-          `允许修改的路径：${module.allowedPaths.join(", ") || "无"}`,
-          `必须通过的测试：${[module.testCommand, module.contractCommand].filter(Boolean).join(", ") || "无"}`,
-          ...(context?.knowledgeCutoff
-            ? [`注意：你的知识截止于 ${context.knowledgeCutoff}，涉及更新的库版本或 API 时在计划中标注“需查证”。`]
-            : []),
-          "输出：1) 步骤拆解 2) 每步涉及的文件 3) 风险与跨模块注意点。保持简洁。"
-        ].join("\n")
-      );
-      const plan = this.responseBuffer.trim();
+      await session.prompt(prompt);
+      const text = this.responseBuffer.trim();
       this.responseBuffer = "";
-      return plan;
+      return text;
     } finally {
+      this.streamToUi = previous;
       this.onStreamEnd?.();
     }
+  }
+
+  private moduleBriefing(modules: ModuleDefinition[]): string {
+    return modules
+      .map((module) => {
+        const tests = [module.testCommand, module.contractCommand].filter(Boolean).join(", ") || "无";
+        return `- ${module.id}（目录 ${module.path}；上下文：${module.contextFiles.join(", ") || "无"}；可改：${module.allowedPaths.join(", ") || "无"}；测试：${tests}）`;
+      })
+      .join("\n");
+  }
+
+  /** Classifies the user input: simple, complex, or unclear with questions. */
+  public async analyzeIntent(input: string, modules: ModuleDefinition[], clarifications?: string): Promise<IntentAnalysis> {
+    const reply = await this.promptModel(
+      [
+        "你是 pi-swarm Supervisor 的意图分析器。分析用户输入并判定任务类型。",
+        `可用模块：\n${this.moduleBriefing(modules)}`,
+        `用户输入：「${input}」`,
+        ...(clarifications ? [`用户已补充的信息：「${clarifications}」`] : []),
+        "判定标准：simple=一步即可完成且无歧义；complex=需要多个步骤或多个模块协作；unclear=缺少关键决策或信息，无法安全开始。",
+        '仅输出 JSON，不要输出其他内容：{"clarity":"simple|complex|unclear","task":"提炼后的任务描述（吸收补充信息）","questions":["仅 unclear 时：需要用户确认的问题"]}'
+      ].join("\n")
+    );
+    const analysis = parseIntentAnalysis(extractJson(reply));
+    if (!analysis) throw new Error(`意图分析结果无法解析：${reply.slice(0, 120)}`);
+    return analysis;
+  }
+
+  /** Splits a clear task into dependency-ordered steps for module workers. */
+  public async planSteps(goal: string, modules: ModuleDefinition[], clarifications?: string): Promise<PlannedStep[]> {
+    const reply = await this.promptModel(
+      [
+        "你是 pi-swarm Supervisor 的规划器。把任务拆成模块 worker 可执行的步骤。",
+        `任务：${goal}`,
+        ...(clarifications ? [`用户补充信息：${clarifications}`] : []),
+        `可用模块（module 只能取以下 id）：\n${this.moduleBriefing(modules)}`,
+        "要求：步骤不超过 6 个；每个步骤目标具体、可独立验收；无依赖关系的步骤不要设置 dependsOn，它们会并行执行。",
+        '仅输出 JSON：{"steps":[{"id":"s1","module":"<模块id>","goal":"步骤目标","dependsOn":["前置步骤id"]}]}'
+      ].join("\n")
+    );
+    const steps = parsePlannedSteps(extractJson(reply));
+    if (!steps) throw new Error(`规划结果无法解析：${reply.slice(0, 120)}`);
+    return steps;
+  }
+
+  /** Streams a markdown summary of the finished steps to the user. */
+  public async summarize(goal: string, outcomes: StepOutcome[]): Promise<void> {
+    await this.promptModel(
+      [
+        "你是 pi-swarm Supervisor。所有步骤已执行完毕，请用 markdown 向用户输出简洁总结。",
+        `原始目标：${goal}`,
+        "步骤结果（JSON）：",
+        JSON.stringify(
+          outcomes.map(({ step, result, error }) => ({
+            step: step.id,
+            module: step.module,
+            goal: step.goal,
+            status: error ? "failed" : (result?.status ?? "unknown"),
+            changedFiles: result?.changedFiles ?? [],
+            risks: result?.risks ?? []
+          })),
+          null,
+          2
+        ),
+        "内容：完成了什么、关键变更、失败或风险、后续建议。保持简洁。"
+      ].join("\n"),
+      { stream: true }
+    );
   }
 
   public async configureProvider(providerId: string, config: unknown, modelId?: string): Promise<string> {

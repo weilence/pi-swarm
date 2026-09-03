@@ -50,12 +50,19 @@ See [docs/quick-validation-plan.md](docs/quick-validation-plan.md) and [docs/arc
 npm run start
 ```
 
-它会启动一个 Supervisor、一个接入真实模型的 supervisor agent，以及一个持续复用的
-work agent。每行输入一个任务，supervisor agent 先用真实模型生成执行规划（规划过程
-实时流式输出），再把带规划要点的任务交给 work agent；supervisor 模型不可用（未配置
-或缺少凭据）时自动跳过规划直接派发。在交互式终端（TTY）下，REPL 由 Pi 同源的
-[pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Markdown 按块流式渲染、多行编辑器
-带历史记录、模型输出与思考流分色显示）：
+它会启动一个 Supervisor、一个接入真实模型的 supervisor agent，以及每个模块一个
+持续复用的 work agent。用户输入先经 supervisor 模型做**意图分析**（静默）：
+
+- **简单任务**：提炼目标后直接派发给模块 worker；
+- **不明确任务**：向用户提问收集关键决策（交互模式下 REPL 中作答，一轮为限；
+  非交互模式按现有信息继续），随后重新分析；
+- **复杂任务**：规划器拆分步骤并标注依赖（JSON 结构化输出），按依赖分层
+  **并发执行**（同层任务由 Supervisor 并行派发，前序步骤结果自动注入后续步骤）。
+
+所有步骤完成后，supervisor 用**流式 markdown** 输出总结（变更、风险、后续建议）。
+模型不可用或结构化输出解析失败时逐级降级为直接派发。在交互式终端（TTY）下，REPL 由
+Pi 同源的 [pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Markdown 按块流式渲染、
+多行编辑器带历史记录、模型输出与思考流分色显示、执行中可弹出澄清提问）：
 直接输入 `/provider`、`/model` 或 `/thinking`（不带参数）会弹出选择列表，
 支持 `↑↓` 移动、输入即模糊过滤、`Enter` 确认、`Esc` 取消；`/provider` 选中后还会依次弹出
 接口类型与模型选择。`/status` 查看当前配置；输入 `/exit` 或 `/quit` 才会结束进程。
