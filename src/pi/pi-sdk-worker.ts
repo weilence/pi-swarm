@@ -28,7 +28,9 @@ export class PiSdkWorker implements ConfigurableModuleWorker {
     private readonly workerName: string,
     private readonly onText: (text: string) => void = (text) => process.stdout.write(text),
     private readonly onThinking: (text: string) => void = (text) => process.stdout.write(dim(text)),
-    private readonly onStreamEnd?: () => void
+    private readonly onStreamEnd?: () => void,
+    /** Extra system prompt for user-created agents (markdown body of the definition). */
+    private readonly agentSystemPrompt?: string
   ) {}
 
   public async start(): Promise<void> {
@@ -52,6 +54,7 @@ export class PiSdkWorker implements ConfigurableModuleWorker {
         ...base,
         `You are the ${this.workerName} module worker. Read these files before acting: ${task.contextFiles.join(", ")}.`,
         `Only modify paths allowed by the task: ${task.allowedPaths.join(", ")}.`,
+        ...(this.agentSystemPrompt ? [this.agentSystemPrompt] : []),
         "At the end, summarize changed files, tests, risks, and cross-module messages."
       ]
     });

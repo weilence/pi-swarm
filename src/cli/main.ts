@@ -16,6 +16,7 @@ import { dim } from "../core/ansi.ts";
 import { SupervisorAgent } from "../pi/supervisor-agent.ts";
 import { TuiRepl } from "./tui-repl.ts";
 import { moduleRegistryFile } from "../core/userdata.ts";
+import { AgentRegistry, defaultAgentDirs } from "../core/agent-registry.ts";
 import { executeCommand, type CommandServices, type CommandState } from "./commands.ts";
 
 try {
@@ -24,12 +25,41 @@ try {
   if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 }
 
-const registryData = JSON.parse(
-  await readFile(moduleRegistryFile(), "utf8")
-) as { modules: ModuleDefinition[] };
-const registry = new ModuleRegistry(registryData.modules);
+// Module registry stays for code-module workflows, but a fresh install must
+// still start with zero pre-provisioned sub-agents: a missing registry file
+// degrades to a single virtual supervisor module instead of crashing.
+async function loadModules(): Promise<ModuleDefinition[]> {
+  try {
+    const data = JSON.parse(await readFile(moduleRegistryFile(), "utf8")) as { modules?: ModuleDefinition[] };
+    return Array.isArray(data.modules) ? data.modules : [];
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+      console.warn(`[主 agent] 模块注册表读取失败，按空列表继续：${error instanceof Error ? error.message : String(error)}`);
+    }
+    return [];
+  }
+}
+const moduleDefinitions = await loadModules();
+const fallbackModule: ModuleDefinition = {
+  id: "supervisor",
+  path: process.cwd(),
+  contextFiles: [],
+  allowedPaths: [],
+  testCommand: "npm test",
+  contractCommand: ""
+};
+const registry = new ModuleRegistry(moduleDefinitions.length > 0 ? moduleDefinitions : [fallbackModule]);
 const events = new EventBus();
-const module = registry.get(process.env.PI_SWARM_MODULE ?? registry.list()[0].id);
+const requestedModuleId = process.env.PI_SWARM_MODULE;
+const firstModule = registry.list()[0];
+let module = firstModule;
+if (requestedModuleId) {
+  try {
+    module = registry.get(requestedModuleId);
+  } catch {
+    console.warn(`[主 agent] 模块 ${requestedModuleId} 不在注册表中，回退到 ${firstModule.id}。`);
+  }
+}
 const workerMode = process.env.PI_SWARM_WORKER ?? "mock";
 const interactive = input.isTTY === true;
 
@@ -60,6 +90,19 @@ for (const extra of registry.list()) {
     workers.set(
       extra.id,
       workerMode === "pi" ? new PiSdkWorker(`${extra.id} manager`, streamText, streamThinking, endStream) : new MockPiWorker()
+    );
+  }
+}
+// Agents are user-created markdown definitions (global + project dirs); none are
+// pre-provisioned, matching the "no initial sub-agents" architecture.
+const agentRegistry = await AgentRegistry.load(defaultAgentDirs(), (warning) =>
+  log(`[主 agent] agent 定义告警（${warning.file}）：${warning.problems.join("；")}`)
+);
+for (const agent of agentRegistry.list()) {
+  if (!workers.has(agent.name)) {
+    workers.set(
+      agent.name,
+      workerMode === "pi" ? new PiSdkWorker(agent.name, streamText, streamThinking, endStream, agent.systemPrompt) : new MockPiWorker()
     );
   }
 }
@@ -114,7 +157,9 @@ const sharedServices = {
   catalog: modelsCatalog,
   supervisor,
   module,
-  modules: registry.list()
+  modules: registry.list(),
+  agents: agentRegistry,
+  selfExecute: (step: { id: string; goal: string }) => supervisorAgent.executeTask(step)
 };
 
 if (interactive) {

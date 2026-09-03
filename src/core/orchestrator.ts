@@ -1,4 +1,5 @@
 import type { ModuleDefinition, TaskEnvelope, WorkerResult } from "../protocol/contracts.ts";
+import type { AgentDefinition } from "./agent-format.ts";
 
 /** Minimal supervisor surface; the real Supervisor satisfies it structurally. */
 export interface TaskDispatcher {
@@ -33,6 +34,8 @@ export interface StepOutcome {
 export interface AgentBrain {
   analyzeIntent?(input: string, modules: ModuleDefinition[], clarifications?: string): Promise<IntentAnalysis>;
   planSteps?(goal: string, modules: ModuleDefinition[], clarifications?: string): Promise<PlannedStep[]>;
+  /** Picks a user-created agent for a task by its description; null = none fits. */
+  matchAgent?(task: string, agents: AgentDefinition[]): Promise<string | null>;
   /** Streams a markdown summary of the finished steps to the UI. */
   summarize?(goal: string, outcomes: StepOutcome[]): Promise<void>;
 }
@@ -42,6 +45,10 @@ export interface OrchestratorServices {
   supervisor: TaskDispatcher;
   modules: ModuleDefinition[];
   defaultModule: string;
+  /** User-created agents; when present, unmatched steps try agent routing. */
+  agents?: { list(): AgentDefinition[] };
+  /** Supervisor self-execution path for steps with no matching agent. */
+  selfExecute?: (step: PlannedStep) => Promise<WorkerResult>;
   /** Interactive question channel; absent or empty answers skip clarification. */
   askUser?: (question: string) => Promise<string>;
   log: (line: string) => void;
@@ -217,14 +224,44 @@ export class Orchestrator {
     const outcomes: StepOutcome[] = [];
     for (const [index, layer] of layers.entries()) {
       this.services.log(`[主 agent] 执行第 ${index + 1}/${layers.length} 批（${layer.length} 个并行）。`);
-      let results: WorkerResult[] | undefined;
-      try {
-        results = await this.services.supervisor.dispatch(layer.map((step) => this.toTask(step, outcomes)));
-      } catch (error) {
-        for (const step of layer) outcomes.push({ step, error: errorMessage(error) });
-        continue;
+      const tasks: TaskEnvelope[] = [];
+      const selfSteps: PlannedStep[] = [];
+      for (const step of layer) {
+        const route = await this.routeStep(step);
+        if (route.kind === "self") {
+          selfSteps.push(step);
+          continue;
+        }
+        tasks.push(this.toTask(step, outcomes, route.target));
       }
-      layer.forEach((step, position) => outcomes.push({ step, result: results?.[position] }));
+      const selfResults = new Map<string, WorkerResult>();
+      for (const step of selfSteps) {
+        try {
+          selfResults.set(step.id, await this.services.selfExecute!(step));
+        } catch (error) {
+          outcomes.push({ step, error: errorMessage(error) });
+        }
+      }
+      let results: WorkerResult[] | undefined;
+      if (tasks.length > 0) {
+        try {
+          results = await this.services.supervisor.dispatch(tasks);
+        } catch (error) {
+          for (const task of tasks) {
+            const step = layer.find((candidate) => candidate.id === task.taskId)!;
+            outcomes.push({ step, error: errorMessage(error) });
+          }
+          results = undefined;
+        }
+      }
+      for (const step of layer) {
+        if (selfResults.has(step.id)) {
+          outcomes.push({ step, result: selfResults.get(step.id)! });
+          continue;
+        }
+        const position = tasks.findIndex((task) => task.taskId === step.id);
+        if (position >= 0) outcomes.push({ step, result: results?.[position] });
+      }
     }
     for (const outcome of outcomes) {
       if (outcome.error) this.services.log(`[主 agent] 步骤 ${outcome.step.id} 失败：${outcome.error}`);
@@ -235,12 +272,54 @@ export class Orchestrator {
     await this.summarize(goal, outcomes);
   }
 
-  private toTask(step: PlannedStep, outcomes: StepOutcome[]): TaskEnvelope {
-    const fallback = this.services.modules.find((module) => module.id === this.services.defaultModule)!;
-    const module = this.services.modules.find((candidate) => candidate.id === step.module) ?? fallback;
-    if (step.module && module.id !== step.module) {
-      this.services.log(`[主 agent] 步骤 ${step.id} 指定的模块 ${step.module} 不存在，改用 ${module.id}。`);
+  /** Resolves where a step runs: a registered module, a matched agent, or the supervisor itself. */
+  private async routeStep(step: PlannedStep): Promise<{ kind: "worker"; target: string } | { kind: "self" }> {
+    if (this.services.modules.some((module) => module.id === step.module)) {
+      return { kind: "worker", target: step.module };
     }
+    const agents = this.services.agents?.list() ?? [];
+    const matchAgent = this.services.agent?.matchAgent;
+    if (agents.length > 0 && matchAgent && this.services.selfExecute) {
+      let name: string | null = null;
+      try {
+        name = await matchAgent(step.goal, agents);
+      } catch {
+        name = null;
+      }
+      const agent = name ? agents.find((candidate) => candidate.name === name) : undefined;
+      if (agent) {
+        this.services.log(`[主 agent] 步骤 ${step.id} 匹配到 agent：${agent.name}。`);
+        return { kind: "worker", target: agent.name };
+      }
+      this.services.log(`[主 agent] 步骤 ${step.id} 无匹配 agent，由 supervisor 自行执行。`);
+      return { kind: "self" };
+    }
+    if (step.module) {
+      this.services.log(`[主 agent] 步骤 ${step.id} 指定的模块 ${step.module} 不存在，改用 ${this.services.defaultModule}。`);
+    }
+    return { kind: "worker", target: this.services.defaultModule };
+  }
+
+  private toTask(step: PlannedStep, outcomes: StepOutcome[], target?: string): TaskEnvelope {
+    const module = this.services.modules.find((candidate) => candidate.id === target);
+    if (target && !module) {
+      this.services.log(`[主 agent] 步骤 ${step.id} 路由到 ${target}。`);
+    }
+    if (!module && target) {
+      // Routed to a user-created agent: no module metadata, runs in its own session.
+      return {
+        taskId: step.id,
+        module: target,
+        goal: step.goal,
+        workingDirectory: process.cwd(),
+        contextFiles: [],
+        allowedPaths: [],
+        relatedModules: [],
+        requiredTests: []
+      };
+    }
+    const fallback = this.services.modules.find((module) => module.id === this.services.defaultModule)!;
+    const resolved = module ?? fallback;
     const prior = outcomes
       .filter((outcome) => step.dependsOn.includes(outcome.step.id))
       .map((outcome) =>
@@ -250,13 +329,13 @@ export class Orchestrator {
       );
     return {
       taskId: step.id,
-      module: module.id,
+      module: resolved.id,
       goal: prior.length > 0 ? `${step.goal}\n\n前序步骤结果：\n${prior.join("\n")}` : step.goal,
-      workingDirectory: module.path,
-      contextFiles: module.contextFiles,
-      allowedPaths: module.allowedPaths,
+      workingDirectory: resolved.path,
+      contextFiles: resolved.contextFiles,
+      allowedPaths: resolved.allowedPaths,
       relatedModules: [],
-      requiredTests: [module.testCommand, module.contractCommand]
+      requiredTests: [resolved.testCommand, resolved.contractCommand]
     };
   }
 

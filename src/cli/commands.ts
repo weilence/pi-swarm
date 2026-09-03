@@ -1,7 +1,8 @@
 import { THINKING_LEVELS } from "../core/worker.ts";
 import type { ConfigurableModuleWorker } from "../core/worker.ts";
-import type { ModuleDefinition } from "../protocol/contracts.ts";
-import { Orchestrator, type AgentBrain, type TaskDispatcher } from "../core/orchestrator.ts";
+import type { ModuleDefinition, WorkerResult } from "../protocol/contracts.ts";
+import type { AgentDefinition } from "../core/agent-format.ts";
+import { Orchestrator, type AgentBrain, type PlannedStep, type TaskDispatcher } from "../core/orchestrator.ts";
 import {
   PI_API_TYPES,
   inferPiApi,
@@ -50,6 +51,10 @@ export interface CommandServices {
   module?: ModuleDefinition;
   /** All registered modules offered to intent analysis and planning. */
   modules?: ModuleDefinition[];
+  /** User-created agents available for dynamic routing. */
+  agents?: { list(): AgentDefinition[] };
+  /** Supervisor self-execution path when no agent matches a step. */
+  selfExecute?: (step: PlannedStep) => Promise<WorkerResult>;
 }
 
 export interface CommandState {
@@ -294,6 +299,8 @@ async function dispatchTask(goal: string, services: CommandServices, _state: Com
     supervisor: services.supervisor,
     modules: services.modules,
     defaultModule: services.module.id,
+    agents: services.agents,
+    selfExecute: services.selfExecute,
     askUser: services.askUser,
     log: services.log
   });

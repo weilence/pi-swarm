@@ -16,22 +16,22 @@ npm run start
 
 `npm run start` uses `MockPiWorker` by default so it runs without model credentials. `PiSdkWorker` is wired to the pinned `@earendil-works/pi-coding-agent` package and is ready for a credentialed smoke test.
 
-The two registered modules are placeholders in `modules/user-service` and `modules/order-service`; replace them with links or checked-out directories for your real programs.
+The project ships with **zero pre-provisioned sub-agents**. Sub-agents are user-created Markdown definitions (YAML frontmatter + system-prompt body) loaded at startup from a global directory (`<user data>/pi-swarm/agents`) and a project directory (`.pi-swarm/agents`, project wins on name conflicts). The Supervisor's LLM routes each planned step to the best-matching agent, or executes the step itself when nothing fits — see `docs/agents.md`. Two sample agents live in `.pi-swarm/agents/` (`code-reviewer`, `test-writer`). The legacy module registry remains supported for code-module workflows but is optional now.
 
 ## Planned architecture
 
 ```text
 Supervisor (Node.js)
-  ├─ Module Registry
+  ├─ Agent Registry (global + project .md definitions)
+  ├─ Intent / Plan / Match (LLM)
   ├─ Task Dispatcher
+  │    ├─ matched user agent session
+  │    └─ supervisor self-execution fallback
   ├─ Context Builder
-  ├─ Event Bus
-  └─ Integration Gate
-       ├─ Pi Worker: user-service
-       └─ Pi Worker: order-service
+  └─ Event Bus
 ```
 
-Each module owns its `AGENT.md`, `CONTEXT.md`, contracts, decisions, and troubleshooting notes. The Supervisor owns cross-module task planning and integration; Workers own implementation inside their assigned worktree.
+Each user-created agent owns its own system prompt and tool grants. The Supervisor owns task planning, agent matching, and self-execution fallback; agents own implementation inside their granted scope.
 
 ## Current boundaries
 

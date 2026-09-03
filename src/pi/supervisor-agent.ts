@@ -1,6 +1,8 @@
 import { join } from "node:path";
 import { THINKING_LEVELS } from "../core/worker.ts";
-import type { ModuleDefinition } from "../protocol/contracts.ts";
+import type { ModuleDefinition, WorkerResult } from "../protocol/contracts.ts";
+import type { AgentDefinition } from "../core/agent-format.ts";
+import { buildMatchPrompt, parseMatchReply } from "../core/agent-dispatch.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-store.ts";
 import { getUserDataDir } from "../core/userdata.ts";
 import { dim } from "../core/ansi.ts";
@@ -203,6 +205,34 @@ export class SupervisorAgent {
     const steps = parsePlannedSteps(extractJson(reply));
     if (!steps) throw new Error(`规划结果无法解析：${reply.slice(0, 120)}`);
     return steps;
+  }
+
+  /** Picks the best user-created agent for a task; null when none fits. */
+  public async matchAgent(task: string, agents: AgentDefinition[]): Promise<string | null> {
+    const reply = await this.promptModel(buildMatchPrompt(task, agents));
+    const parsed = parseMatchReply(reply);
+    if (!parsed) throw new Error(`agent 匹配结果无法解析：${reply.slice(0, 120)}`);
+    return parsed.agent;
+  }
+
+  /** Self-execution path: runs the step in the supervisor's own session. */
+  public async executeTask(step: { id: string; goal: string }): Promise<WorkerResult> {
+    await this.promptModel(
+      [
+        "你是 pi-swarm Supervisor，当前没有匹配的子 agent，请直接执行该步骤并汇报结果。",
+        `步骤 ${step.id}：${step.goal}`
+      ].join("\n"),
+      { stream: true }
+    );
+    return {
+      taskId: step.id,
+      module: "supervisor",
+      status: "completed",
+      changedFiles: [],
+      tests: [],
+      risks: ["该步骤由 supervisor 会话直接执行，变更未结构化上报"],
+      messages: []
+    };
   }
 
   /** Streams a markdown summary of the finished steps to the user. */
