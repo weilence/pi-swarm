@@ -1,20 +1,21 @@
 import { join } from "node:path";
 import { THINKING_LEVELS } from "../core/thinking.ts";
-import type { StepResult } from "../protocol/contracts.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
-import { buildMatchPrompt, parseMatchReply } from "../core/agent-dispatch.ts";
-import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-store.ts";
+import { createTaskRun, type StepRecord } from "../core/task-run.ts";
+import type { StepJob } from "../core/supervisor.ts";
 import { getUserDataDir } from "../core/userdata.ts";
 import { dim } from "../core/ansi.ts";
 import { forwardAssistantEvent } from "./assistant-stream.ts";
-import { extractJson, parseIntentAnalysis, parsePlannedSteps, type IntentAnalysis, type PlannedStep, type StepOutcome } from "../core/orchestrator.ts";
+import { createDelegateTool, type DelegateState } from "./delegate-tool.ts";
+import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-store.ts";
 import {
   type AgentSession,
   createAgentSession,
   DefaultResourceLoader,
-  SessionManager,
+  SessionManager as PiSessionManager,
   ModelRuntime
 } from "@earendil-works/pi-coding-agent";
+import { SessionBusyError } from "../core/session/session-types.ts";
 
 /** Masks a key for logs and status lines: keeps a short head and tail. */
 function maskKey(key: string): string {
@@ -40,12 +41,34 @@ export interface SupervisorAgentOptions {
   onStreamEnd?: () => void;
   /** When provided, every successful configuration change is persisted. */
   configStore?: ConfigStore;
+  /**
+   * Injected Pi session (persistent JSONL or inMemory); defaults to inMemory.
+   * Switching sessions at runtime goes through rebind() — see the bind
+   * contract in docs/session-design.md.
+   */
+  sessionManager?: PiSessionManager;
+  /** Registered sub-agent catalog; drives the roster prompt and the delegate tool. */
+  agents?: { list(): AgentDefinition[] };
+  /** Executes a delegate step on its agent (Supervisor.run). */
+  stepExecutor?: { run(job: StepJob): Promise<StepRecord> };
+  /** Progress log for delegate batches and step lifecycles. */
+  log?: (line: string) => void;
 }
 
+/** Execution guidelines appended when the delegate tool is available. */
+const DELEGATE_GUIDELINES = [
+  "任务执行准则：",
+  "1. 收到用户任务后先判断：能一步自行完成的直接做；需要多个步骤或适合交给子 agent 的，用 delegate 派发。",
+  "2. delegate 一次最多 6 个步骤，无依赖的并行执行；步骤目标要具体、可独立验收。",
+  "3. 根据 delegate 返回的真实结果继续决策：再派下一批、换 agent 重做失败步骤，或自己补完剩余工作。",
+  "4. 全部完成后向用户输出 markdown 总结：完成了什么、关键变更、失败与风险、后续建议。"
+].join("\n");
+
 /**
- * The Supervisor's own model-backed agent: it owns a Pi AgentSession used for
- * task planning, and persists its provider/model/thinking configuration through
- * a ConfigStore so selections survive restarts.
+ * The Supervisor's own model-backed agent: its Pi session is the task's whole
+ * control flow — the model plans, delegates via the delegate tool, reacts to
+ * real step results, and summarizes. Configuration (provider/model/thinking)
+ * persists through a ConfigStore so selections survive restarts.
  */
 export class SupervisorAgent {
   private session?: AgentSession;
@@ -54,6 +77,9 @@ export class SupervisorAgent {
   private streamToUi = true;
   private snapshot: AgentConfigSnapshot = {};
   private modelRuntime?: ModelRuntime;
+  private piSession?: PiSessionManager;
+  /** Set while a prompt is streaming; rebind() rejects concurrent switches. */
+  private prompting = false;
   private providerConfig?: Parameters<ModelRuntime["registerProvider"]>[1];
   private providerId = "models-dev";
   private requestedModel?: string;
@@ -64,8 +90,12 @@ export class SupervisorAgent {
   private readonly onThinking: (delta: string) => void;
   private readonly onStreamEnd?: () => void;
   private readonly configStore?: ConfigStore;
+  private readonly options: SupervisorAgentOptions;
+  /** Holder the delegate tool reads; swapped per task in runTask(). */
+  private readonly delegateState: DelegateState = {};
 
   public constructor(options: SupervisorAgentOptions = {}) {
+    this.options = options;
     this.cwd = options.cwd ?? process.cwd();
     this.agentDir = options.agentDir ?? join(getUserDataDir(), "supervisor-agent");
     this.modelRuntime = options.modelRuntime;
@@ -73,6 +103,7 @@ export class SupervisorAgent {
     this.onThinking = options.onThinking ?? ((delta) => process.stdout.write(dim(delta)));
     this.onStreamEnd = options.onStreamEnd;
     this.configStore = options.configStore;
+    this.piSession = options.sessionManager;
   }
 
   /** Current global default model (provider/model) as configured via /model. */
@@ -121,23 +152,40 @@ export class SupervisorAgent {
 
     this.modelRuntime ??= await ModelRuntime.create({ refreshOnCreate: false });
     if (this.providerConfig) this.modelRuntime.registerProvider(this.providerId, this.providerConfig);
+    return await this.openSession(this.piSession ?? PiSessionManager.inMemory(this.cwd));
+  }
+
+  /**
+   * Releases the old AgentSession and binds the given Pi session as the
+   * current one; re-applies model/thinking afterwards (a failed model
+   * re-application does not block the switch — it stays pending).
+   */
+  private async openSession(sessionManager: PiSessionManager): Promise<AgentSession> {
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    this.session?.dispose();
+    this.session = undefined;
+    const delegateAvailable = this.delegateAvailable();
     const resourceLoader = new DefaultResourceLoader({
       cwd: this.cwd,
       agentDir: this.agentDir,
       appendSystemPromptOverride: (base) => [
         ...base,
         "You are the pi-swarm Supervisor agent coordinating user-defined sub-agents.",
-        "You plan, delegate, and answer; keep plans concise and actionable."
+        this.rosterPrompt(),
+        ...(delegateAvailable ? [DELEGATE_GUIDELINES] : [])
       ]
     });
     await resourceLoader.reload();
     const { session } = await createAgentSession({
       cwd: this.cwd,
       resourceLoader,
-      sessionManager: SessionManager.inMemory(),
-      modelRuntime: this.modelRuntime
+      sessionManager,
+      modelRuntime: this.modelRuntime!,
+      customTools: delegateAvailable ? [createDelegateTool(this.delegateServices(), this.delegateState)] : []
     });
     this.session = session;
+    this.piSession = sessionManager;
     this.unsubscribe = session.subscribe((event) => {
       forwardAssistantEvent(event, {
         appendText: (delta) => {
@@ -151,9 +199,30 @@ export class SupervisorAgent {
         }
       });
     });
-    if (this.requestedModel) await this.applyModel(this.requestedModel);
+    try {
+      if (this.requestedModel) await this.applyModel(this.requestedModel);
+    } catch {
+      // The model may be unavailable after a provider switch: keep it pending.
+    }
     if (this.requestedThinkingLevel) this.applyThinkingLevel(this.requestedThinkingLevel);
     return session;
+  }
+
+  /**
+   * Switches sessions: rebinds the AgentSession to the given Pi session.
+   * Throws SessionBusyError while a prompt is streaming (concurrency guard);
+   * returns a human-readable confirmation on success.
+   */
+  public async rebind(sessionManager: PiSessionManager): Promise<string> {
+    if (this.prompting) throw new SessionBusyError("会话正在输出，无法切换；请等待当前任务完成");
+    await this.openSession(sessionManager);
+    const name = sessionManager.getSessionName();
+    return `已切换会话：${name ?? sessionManager.getSessionId()}`;
+  }
+
+  /** Whether a prompt is currently streaming (session switches are rejected). */
+  public isBusy(): boolean {
+    return this.prompting;
   }
 
   /**
@@ -165,112 +234,60 @@ export class SupervisorAgent {
     const previous = this.streamToUi;
     this.streamToUi = options.stream === true;
     this.responseBuffer = "";
+    this.prompting = true;
     try {
       await session.prompt(prompt);
       const text = this.responseBuffer.trim();
       this.responseBuffer = "";
       return text;
     } finally {
+      this.prompting = false;
       this.streamToUi = previous;
       this.onStreamEnd?.();
     }
   }
 
+  /**
+   * Runs one user task through the supervisor session: the model owns the
+   * control flow (plan, delegate via the delegate tool, react to real step
+   * results, summarize); this method only swaps in a fresh TaskRun for the
+   * delegate tool's budget and record-keeping. Returns the final text.
+   */
+  public async runTask(goal: string): Promise<string> {
+    this.delegateState.taskRun = createTaskRun(goal);
+    try {
+      return await this.promptModel(goal, { stream: true });
+    } finally {
+      this.delegateState.taskRun = undefined;
+    }
+  }
+
+  private delegateAvailable(): boolean {
+    return (this.options.agents?.list().length ?? 0) > 0 && Boolean(this.options.stepExecutor);
+  }
+
+  private delegateServices() {
+    return {
+      agents: this.options.agents!,
+      runStep: (job: StepJob) => this.options.stepExecutor!.run(job),
+      log: (line: string) => this.options.log?.(line)
+    };
+  }
+
+  /** Roster section of the system prompt: who the model can delegate to. */
+  private rosterPrompt(): string {
+    const agents = this.options.agents?.list() ?? [];
+    if (agents.length === 0) return "当前没有注册任何子 agent：请直接自行完成用户的任务。";
+    return `可用子 agent（delegate 工具的 agent 字段只能取以下 name）：\n${this.agentBriefing(agents)}`;
+  }
+
   private agentBriefing(agents: AgentDefinition[]): string {
-    if (agents.length === 0) return "（当前没有注册任何子 agent，所有步骤由你自行执行。）";
     return agents
       .map((agent) => {
         const capabilities = agent.capabilities.length > 0 ? `；能力：${agent.capabilities.join("、")}` : "";
         return `- ${agent.name}：${agent.description}${capabilities}`;
       })
       .join("\n");
-  }
-
-  /** Classifies the user input: simple, complex, or unclear with questions. */
-  public async analyzeIntent(input: string, agents: AgentDefinition[], clarifications?: string): Promise<IntentAnalysis> {
-    const reply = await this.promptModel(
-      [
-        "你是 pi-swarm Supervisor 的意图分析器。分析用户输入并判定任务类型。",
-        `可用子 agent：\n${this.agentBriefing(agents)}`,
-        `用户输入：「${input}」`,
-        ...(clarifications ? [`用户已补充的信息：「${clarifications}」`] : []),
-        "判定标准：simple=一步即可完成且无歧义；complex=需要多个步骤或多个 agent 协作；unclear=缺少关键决策或信息，无法安全开始。",
-        '仅输出 JSON，不要输出其他内容：{"clarity":"simple|complex|unclear","task":"提炼后的任务描述（吸收补充信息）","questions":["仅 unclear 时：需要用户确认的问题"]}'
-      ].join("\n")
-    );
-    const analysis = parseIntentAnalysis(extractJson(reply));
-    if (!analysis) throw new Error(`意图分析结果无法解析：${reply.slice(0, 120)}`);
-    return analysis;
-  }
-
-  /** Splits a clear task into dependency-ordered steps for sub-agents. */
-  public async planSteps(goal: string, agents: AgentDefinition[], clarifications?: string): Promise<PlannedStep[]> {
-    const reply = await this.promptModel(
-      [
-        "你是 pi-swarm Supervisor 的规划器。把任务拆成可执行的步骤。",
-        `任务：${goal}`,
-        ...(clarifications ? [`用户补充信息：${clarifications}`] : []),
-        `可用子 agent（agent 只能取以下 name，留空则由运行时匹配或你自行执行）：\n${this.agentBriefing(agents)}`,
-        "要求：步骤不超过 6 个；每个步骤目标具体、可独立验收；无依赖关系的步骤不要设置 dependsOn，它们会并行执行。",
-        '仅输出 JSON：{"steps":[{"id":"s1","agent":"<agent name 或空>","goal":"步骤目标","dependsOn":["前置步骤id"]}]}'
-      ].join("\n")
-    );
-    const steps = parsePlannedSteps(extractJson(reply));
-    if (!steps) throw new Error(`规划结果无法解析：${reply.slice(0, 120)}`);
-    return steps;
-  }
-
-  /** Picks the best user-created agent for a task; null when none fits. */
-  public async matchAgent(task: string, agents: AgentDefinition[]): Promise<string | null> {
-    const reply = await this.promptModel(buildMatchPrompt(task, agents));
-    const parsed = parseMatchReply(reply);
-    if (!parsed) throw new Error(`agent 匹配结果无法解析：${reply.slice(0, 120)}`);
-    return parsed.agent;
-  }
-
-  /** Self-execution path: runs the step in the supervisor's own session. */
-  public async executeTask(step: { id: string; goal: string }): Promise<StepResult> {
-    await this.promptModel(
-      [
-        "你是 pi-swarm Supervisor，当前没有匹配的子 agent，请直接执行该步骤并汇报结果。",
-        `步骤 ${step.id}：${step.goal}`
-      ].join("\n"),
-      { stream: true }
-    );
-    return {
-      taskId: step.id,
-      agent: "supervisor",
-      status: "completed",
-      changedFiles: [],
-      tests: [],
-      risks: ["该步骤由 supervisor 会话直接执行，变更未结构化上报"],
-      messages: []
-    };
-  }
-
-  /** Streams a markdown summary of the finished steps to the user. */
-  public async summarize(goal: string, outcomes: StepOutcome[]): Promise<void> {
-    await this.promptModel(
-      [
-        "你是 pi-swarm Supervisor。所有步骤已执行完毕，请用 markdown 向用户输出简洁总结。",
-        `原始目标：${goal}`,
-        "步骤结果（JSON）：",
-        JSON.stringify(
-          outcomes.map(({ step, result, error }) => ({
-            step: step.id,
-            agent: result?.agent ?? step.agent ?? "supervisor",
-            goal: step.goal,
-            status: error ? "failed" : (result?.status ?? "unknown"),
-            changedFiles: result?.changedFiles ?? [],
-            risks: result?.risks ?? []
-          })),
-          null,
-          2
-        ),
-        "内容：完成了什么、关键变更、失败或风险、后续建议。保持简洁。"
-      ].join("\n"),
-      { stream: true }
-    );
   }
 
   public async configureProvider(providerId: string, config: unknown, modelId?: string): Promise<string> {
@@ -376,6 +393,7 @@ export class SupervisorAgent {
     this.unsubscribe = undefined;
     this.session?.dispose();
     this.session = undefined;
+    this.piSession = undefined;
     this.responseBuffer = "";
     this.modelRuntime = undefined;
     this.providerConfig = undefined;

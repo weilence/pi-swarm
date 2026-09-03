@@ -3,7 +3,6 @@ import { test } from "node:test";
 import { executeCommand, type AgentController, type CommandServices, type CommandState } from "../src/cli/commands.ts";
 import { THINKING_LEVELS } from "../src/core/thinking.ts";
 import type { ModelsDevProvider } from "../src/cli/../models-dev/catalog.ts";
-import type { StepResult } from "../src/protocol/contracts.ts";
 
 function makeProviders(): ModelsDevProvider[] {
   return [
@@ -217,81 +216,47 @@ test("/status reports supervisor state and /exit wins over other commands", asyn
 
 const noAgents = { list: () => [] };
 
-function makeSelfExecute(): { selfExecuted: { id: string; goal: string }[]; selfExecute: (step: { id: string; goal: string }) => Promise<StepResult> } {
-  const selfExecuted: { id: string; goal: string }[] = [];
-  return {
-    selfExecuted,
-    selfExecute: async (step) => {
-      selfExecuted.push({ id: step.id, goal: step.goal });
-      return {
-        taskId: step.id,
-        agent: "supervisor",
-        status: "completed",
-        changedFiles: [],
-        tests: [],
-        risks: [],
-        messages: []
-      };
-    }
-  };
-}
-
-test("simple intents execute one condensed step and stream a summary", async () => {
+test("task input runs through the supervisor's runTask", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  services.supervisor = { async dispatch() { return []; } };
   services.agents = noAgents;
-  const self = makeSelfExecute();
-  services.selfExecute = self.selfExecute;
-  const summarized: string[] = [];
-  let planned = 0;
+  const ran: string[] = [];
   services.agent = {
     ...makeAgent(recording),
-    async analyzeIntent() {
-      return { clarity: "simple", task: "提炼后的登录任务", questions: [] };
-    },
-    async planSteps() {
-      planned += 1;
-      return [];
-    },
-    async summarize(goal: string) {
-      summarized.push(goal);
+    async runTask(goal: string) {
+      ran.push(goal);
+      return "任务完成";
     }
   };
   await executeCommand("实现登录", services, {});
-  assert.deepEqual(self.selfExecuted, [{ id: "s1", goal: "提炼后的登录任务" }]);
-  assert.equal(planned, 0, "simple intents skip planning");
-  assert.deepEqual(summarized, ["实现登录"]);
-  assert.match(services.logs.join("\n"), /意图分析：简单任务，直接执行/);
+  assert.deepEqual(ran, ["实现登录"]);
 });
 
-test("analysis failure falls back to direct self-execution", async () => {
+test("task input is rejected while the supervisor is busy", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  services.supervisor = { async dispatch() { return []; } };
-  services.agents = noAgents;
-  const self = makeSelfExecute();
-  services.selfExecute = self.selfExecute;
   services.agent = {
     ...makeAgent(recording),
-    async analyzeIntent() {
+    isBusy: () => true,
+    async runTask() {
+      throw new Error("should not run");
+    }
+  };
+  await executeCommand("实现登录", services, {});
+  assert.match(services.logs.join("\n"), /已有任务正在执行/);
+});
+
+test("runTask failures surface as a task error log", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  services.agent = {
+    ...makeAgent(recording),
+    async runTask() {
       throw new Error("no model configured");
     }
   };
   await executeCommand("实现登录", services, {});
-  assert.deepEqual(self.selfExecuted.map((step) => step.goal), ["实现登录"]);
-  assert.match(services.logs.join("\n"), /supervisor 模型不可用，跳过意图分析直接执行：no model configured/);
-});
-
-test("dispatch without an agent brain self-executes the goal as-is", async () => {
-  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
-  const services = makeServices(recording);
-  services.supervisor = { async dispatch() { return []; } };
-  services.agents = noAgents;
-  const self = makeSelfExecute();
-  services.selfExecute = self.selfExecute;
-  await executeCommand("实现登录", services, {});
-  assert.deepEqual(self.selfExecuted.map((step) => step.goal), ["实现登录"]);
+  assert.match(services.logs.join("\n"), /任务执行失败：no model configured/);
 });
 
 test("/status lists the loaded agents", async () => {

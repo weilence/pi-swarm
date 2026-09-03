@@ -1,7 +1,8 @@
 import { THINKING_LEVELS } from "../core/thinking.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
-import { Orchestrator, type AgentBrain, type TaskDispatcher } from "../core/orchestrator.ts";
-import type { StepResult } from "../protocol/contracts.ts";
+import type { SessionManager } from "../core/session/session-manager.ts";
+import { SessionBusyError, SessionClosedError, SessionNotFoundError } from "../core/session/session-types.ts";
+import type { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
 import {
   PI_API_TYPES,
   inferPiApi,
@@ -26,14 +27,21 @@ export interface ProviderCatalog {
 
 /**
  * Runtime-configurable, model-backed supervisor agent: target of
- * /provider /model /thinking /apikey and the orchestrator's model brain.
+ * /provider /model /thinking /apikey; runs user tasks through its own
+ * model-driven loop (runTask).
  */
-export interface AgentController extends AgentBrain {
+export interface AgentController {
   configureProvider?(providerId: string, config: unknown, modelId?: string): Promise<string>;
   setModel?(specifier: string): Promise<string>;
   setThinkingLevel?(level: string): Promise<string>;
   setApiKey?(key: string): Promise<string>;
   status?(): string;
+  /** 把 AgentSession 重绑到指定 Pi 会话（/new、/switch 使用）。 */
+  rebind?(sessionManager: PiSessionManager): Promise<string>;
+  /** prompt 流式输出进行中（此时拒绝切换会话）。 */
+  isBusy?(): boolean;
+  /** Runs one user task through the supervisor's model-driven loop. */
+  runTask?(goal: string): Promise<string>;
 }
 
 export interface CommandServices {
@@ -42,14 +50,11 @@ export interface CommandServices {
   log: (line: string) => void;
   /** Interactive selection; resolves to undefined when cancelled or unavailable. */
   pick: <T>(title: string, options: readonly PickerOption<T>[]) => Promise<T | undefined>;
-  /** Interactive clarification channel used by the orchestrator. */
-  askUser?: (question: string) => Promise<string>;
   interactive: boolean;
-  supervisor?: TaskDispatcher;
-  /** User-created agents available for dynamic routing. */
+  /** User-created agents available for delegation. */
   agents?: { list(): AgentDefinition[] };
-  /** Supervisor self-execution path when no agent matches a step. */
-  selfExecute?: (step: { id: string; goal: string }) => Promise<StepResult>;
+  /** 会话管理；提供后启用 /new /sessions /switch /close。 */
+  sessions?: SessionManager;
 }
 
 export interface CommandState {
@@ -65,6 +70,14 @@ export async function executeCommand(line: string, services: CommandServices, st
   if (goal === "/exit" || goal === "/quit") return "exit";
   if (goal === "/status") {
     services.log(`[主 agent] supervisor：${services.agent?.status?.() ?? "状态不可用"}`);
+    if (services.sessions) {
+      const currentSession = services.sessions.current();
+      services.log(
+        currentSession
+          ? `[主 agent] 当前会话：${currentSession.name ?? currentSession.id}（${currentSession.id}）`
+          : "[主 agent] 当前会话：无（输入任务将自动新建）"
+      );
+    }
     const agents = services.agents?.list() ?? [];
     services.log(
       agents.length > 0
@@ -96,6 +109,22 @@ export async function executeCommand(line: string, services: CommandServices, st
   }
   if (goal === "/apikey" || goal.startsWith("/apikey ")) {
     await commandApiKey(goal.slice("/apikey".length).trim(), services, state);
+    return "continue";
+  }
+  if (goal === "/new" || goal.startsWith("/new ")) {
+    await commandNew(goal.slice("/new".length).trim(), services);
+    return "continue";
+  }
+  if (goal === "/sessions" || goal === "/ls") {
+    await commandSessions(services);
+    return "continue";
+  }
+  if (goal === "/switch" || goal.startsWith("/switch ")) {
+    await commandSwitch(goal.slice("/switch".length).trim(), services);
+    return "continue";
+  }
+  if (goal === "/close" || goal.startsWith("/close ")) {
+    await commandClose(goal.slice("/close".length).trim(), services);
     return "continue";
   }
   await dispatchTask(goal, services, state);
@@ -287,18 +316,165 @@ async function commandThinking(level: string | undefined, services: CommandServi
   }
 }
 
-async function dispatchTask(goal: string, services: CommandServices, _state: CommandState): Promise<void> {
-  if (!services.supervisor || !services.agents || !services.selfExecute) {
-    services.log("[主 agent] 任务派发未配置。");
+/** 解析 <id|序号> 引用：先按 id 精确匹配，再按 /sessions 的 1 基序号。 */
+async function resolveSessionRef(
+  ref: string,
+  sessions: SessionManager
+): Promise<{ id: string; name?: string } | undefined> {
+  const direct = sessions.get(ref);
+  if (direct) return direct;
+  const index = Number.parseInt(ref, 10);
+  if (Number.isInteger(index) && index >= 1) {
+    const list = await sessions.list();
+    const target = list[index - 1];
+    if (target) return { id: target.id, name: target.name };
+  }
+  return undefined;
+}
+
+function sessionCommandError(error: unknown): string {
+  if (error instanceof SessionBusyError) return error.message;
+  if (error instanceof SessionClosedError) return error.message;
+  if (error instanceof SessionNotFoundError) return error.message;
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function commandNew(name: string, services: CommandServices): Promise<void> {
+  const sessions = services.sessions;
+  if (!sessions) {
+    services.log("[主 agent] 会话管理未配置。");
     return;
   }
-  const orchestrator = new Orchestrator({
-    agent: services.agent,
-    supervisor: services.supervisor,
-    agents: services.agents,
-    selfExecute: services.selfExecute,
-    askUser: services.askUser,
-    log: services.log
-  });
-  await orchestrator.run(goal);
+  if (services.agent?.isBusy?.()) {
+    services.log("[主 agent] 会话正在输出，无法切换；请等待当前任务完成。");
+    return;
+  }
+  const previous = sessions.current();
+  try {
+    const record = await sessions.create({ name });
+    const pi = await sessions.bind(record.id);
+    services.log(
+      `[主 agent] ${await services.agent?.rebind?.(pi) ?? `已新建会话（agent 不支持运行时切换，仅更新指针）：${record.name ?? record.id}`}`
+    );
+  } catch (error) {
+    // 指针可能已前移而 agent 未切换：尽力回滚到原会话
+    const now = sessions.current();
+    if (previous && now && now.id !== previous.id) await sessions.switch(previous.id).catch(() => undefined);
+    services.log(`[主 agent] 新建会话失败：${sessionCommandError(error)}`);
+  }
+}
+
+async function commandSessions(services: CommandServices): Promise<void> {
+  const sessions = services.sessions;
+  if (!sessions) {
+    services.log("[主 agent] 会话管理未配置。");
+    return;
+  }
+  const list = await sessions.list();
+  if (list.length === 0) {
+    services.log("[主 agent] 暂无会话；输入任务或 /new <名称> 新建。");
+    return;
+  }
+  services.log("[主 agent] 会话列表（/switch <id|序号> 切换，/close <id|序号> 关闭）：");
+  for (const [index, session] of list.entries()) {
+    const flags = session.status === "closed" ? "已关闭" : "活跃";
+    const current = session.current ? "，当前" : "";
+    services.log(`  ${index + 1}. ${session.name}（${flags}${current}，消息 ${session.messageCount}，更新 ${session.updatedAt}）${session.id}`);
+  }
+}
+
+async function commandSwitch(ref: string, services: CommandServices): Promise<void> {
+  const sessions = services.sessions;
+  if (!sessions) {
+    services.log("[主 agent] 会话管理未配置。");
+    return;
+  }
+  if (!ref) {
+    services.log("[主 agent] 用法：/switch <id|序号>（序号见 /sessions）。");
+    return;
+  }
+  if (services.agent?.isBusy?.()) {
+    services.log("[主 agent] 会话正在输出，无法切换；请等待当前任务完成。");
+    return;
+  }
+  const target = await resolveSessionRef(ref, sessions);
+  if (!target) {
+    services.log(`[主 agent] 找不到会话：${ref}（可用 /sessions 查看）`);
+    return;
+  }
+  const previous = sessions.current();
+  try {
+    // 先 bind（校验存在/未关闭并取得 Pi 实例），再移动指针，最后重绑 agent；
+    // 失败时尽力把指针回滚到原会话，避免指针与实际会话脱节。
+    const pi = await sessions.bind(target.id);
+    await sessions.switch(target.id);
+    services.log(
+      `[主 agent] ${await services.agent?.rebind?.(pi) ?? `已切换会话（agent 不支持运行时切换，仅更新指针）：${target.name ?? target.id}`}`
+    );
+  } catch (error) {
+    const now = sessions.current();
+    if (previous && now && now.id !== previous.id) await sessions.switch(previous.id).catch(() => undefined);
+    services.log(`[主 agent] 切换失败：${sessionCommandError(error)}`);
+  }
+}
+
+async function commandClose(ref: string, services: CommandServices): Promise<void> {
+  const sessions = services.sessions;
+  if (!sessions) {
+    services.log("[主 agent] 会话管理未配置。");
+    return;
+  }
+  const target = ref ? await resolveSessionRef(ref, sessions) : sessions.current();
+  if (!target) {
+    services.log(ref ? `[主 agent] 找不到会话：${ref}（可用 /sessions 查看）` : "[主 agent] 没有当前会话可关闭。");
+    return;
+  }
+  const wasCurrent = sessions.current()?.id === target.id;
+  try {
+    const closed = await sessions.close(target.id);
+    services.log(
+      `[主 agent] 已关闭会话：${closed.name ?? closed.id}${wasCurrent ? "（原当前会话；输入任务将自动新建，或 /switch 切换）" : ""}`
+    );
+  } catch (error) {
+    services.log(`[主 agent] 关闭失败：${sessionCommandError(error)}`);
+  }
+}
+
+async function dispatchTask(goal: string, services: CommandServices, _state: CommandState): Promise<void> {
+  if (!services.agent?.runTask) {
+    services.log("[主 agent] 任务执行未配置。");
+    return;
+  }
+  if (services.agent.isBusy?.()) {
+    services.log("[主 agent] 已有任务正在执行，请等待完成后再输入。");
+    return;
+  }
+  // 当前会话不存在（已关闭或从未创建）时自动新建承接，保证无缝体验
+  let sessionId = services.sessions?.current()?.id;
+  if (!sessionId && services.sessions) {
+    const fresh = await services.sessions.create().catch(() => undefined);
+    if (!fresh) {
+      services.log("[主 agent] 自动新建会话失败，任务将在无会话状态下执行。");
+    } else {
+      try {
+        const pi = await services.sessions.bind(fresh.id);
+        services.log(`[主 agent] ${await services.agent?.rebind?.(pi) ?? "已自动新建会话"}`);
+        sessionId = fresh.id;
+      } catch (error) {
+        // 新建的会话未被 agent 使用：关闭它，避免指针与实际会话脱节、touch 错误记账
+        await services.sessions.close(fresh.id).catch(() => undefined);
+        services.log(`[主 agent] 自动新建会话失败：${sessionCommandError(error)}`);
+      }
+    }
+  }
+  try {
+    await services.agent.runTask(goal);
+  } catch (error) {
+    services.log(`[主 agent] 任务执行失败：${sessionCommandError(error)}`);
+  } finally {
+    // 一轮任务 ≈ 一条用户消息 + 一条回复；touch 失败不影响任务结果
+    if (sessionId && services.sessions) {
+      await services.sessions.touch(sessionId, { messages: 2 }).catch(() => undefined);
+    }
+  }
 }

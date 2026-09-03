@@ -7,6 +7,8 @@ import { Supervisor } from "../core/supervisor.ts";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { ModelsDevCatalog, type ModelsDevProvider } from "../models-dev/catalog.ts";
 import { JsonFileConfigStore } from "../core/config/json-file-config-store.ts";
+import { JsonFileSessionStore } from "../core/session/json-file-session-store.ts";
+import { SessionManager } from "../core/session/session-manager.ts";
 import { dim } from "../core/ansi.ts";
 import { SupervisorAgent } from "../pi/supervisor-agent.ts";
 import { SubAgent } from "../pi/sub-agent.ts";
@@ -58,16 +60,44 @@ const agentRegistry = await AgentRegistry.load(defaultAgentDirs(), (warning) =>
 
 const events = new EventBus();
 const configStore = new JsonFileConfigStore();
-const supervisorAgent = new SupervisorAgent({
+// Session management: persistent JSONL conversations under the user data dir;
+// startup resumes the most recent active session (conversation context included)
+// or creates a fresh one.
+const sessionStore = new JsonFileSessionStore();
+const sessionManager = new SessionManager({ cwd: process.cwd(), store: sessionStore });
+await sessionManager.initialize();
+// Startup resumes the most recent active session (conversation context included)
+// or creates a fresh one; a corrupt/unreadable JSONL degrades to a new session
+// instead of crashing the CLI.
+const resumedSession = sessionManager.current();
+let startupSession: Awaited<ReturnType<typeof sessionManager.bind>>;
+try {
+  startupSession = await sessionManager.bind((resumedSession ?? (await sessionManager.create())).id);
+  if (resumedSession) {
+    log(`[主 agent] 已恢复会话：${resumedSession.name ?? resumedSession.id}（${resumedSession.id}）`);
+  }
+} catch (error) {
+  const record = await sessionManager.create();
+  startupSession = await sessionManager.bind(record.id);
+  log(`[主 agent] 会话恢复失败（${error instanceof Error ? error.message : String(error)}），已新建会话：${record.id}`);
+}
+// Sub-agent sessions are created lazily on first dispatch and reused after;
+// the supervisor and supervisor-agent reference each other lazily, so both
+// bindings carry explicit types.
+const subAgents = new Map<string, SubAgent>();
+const supervisorAgent: SupervisorAgent = new SupervisorAgent({
   modelRuntime: sharedRuntime,
   onText: streamText,
   onThinking: streamThinking,
   onStreamEnd: endStream,
-  configStore
+  configStore,
+  sessionManager: startupSession,
+  agents: agentRegistry,
+  // Forwarder: `supervisor` is declared right after; run() only fires on dispatch.
+  stepExecutor: { run: (job) => supervisor.run(job) },
+  log
 });
-// Sub-agent sessions are created lazily on first dispatch and reused after.
-const subAgents = new Map<string, SubAgent>();
-const supervisor = new Supervisor((name) => {
+const supervisor: Supervisor = new Supervisor((name) => {
   let agent = subAgents.get(name);
   if (!agent) {
     const definition = agentRegistry.get(name);
@@ -104,8 +134,8 @@ const loadedAgents = agentRegistry.list();
 console.log(loadedAgents.length > 0 ? `已加载子 agent：${loadedAgents.map((agent) => agent.name).join(", ")}` : "未加载任何子 agent，所有任务由 supervisor 自执行。");
 console.log(
   interactive
-    ? "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/status 查看状态，或 /exit 退出。\n"
-    : "输入任务，/provider <id> [接口类型]，/model [模型]，/thinking level，/apikey <key>，/status，或输入 /exit 退出。\n"
+    ? "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close 管理会话，/status 查看状态，或 /exit 退出。\n"
+    : "输入任务，/provider <id> [接口类型]，/model [模型]，/thinking level，/apikey <key>，/new [名称]，/sessions，/switch <id|序号>，/close，/status，或输入 /exit 退出。\n"
 );
 
 log(`[主 agent] ${await supervisorAgent.restore()}`);
@@ -118,9 +148,8 @@ const commandState: CommandState = {
 const sharedServices = {
   agent: supervisorAgent,
   catalog: modelsCatalog,
-  supervisor,
   agents: agentRegistry,
-  selfExecute: (step: { id: string; goal: string }) => supervisorAgent.executeTask(step)
+  sessions: sessionManager
 };
 
 if (interactive) {
@@ -132,8 +161,7 @@ if (interactive) {
     ...sharedServices,
     interactive: true,
     log,
-    pick: (title, options) => repl!.pick(title, options),
-    askUser: (question) => repl!.askQuestion(question)
+    pick: (title, options) => repl!.pick(title, options)
   };
   repl = new TuiRepl({
     onSubmit: async (line) => {

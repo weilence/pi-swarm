@@ -1,4 +1,21 @@
-import type { EventEnvelope } from "../protocol/contracts.ts";
+export type EventType =
+  | "task.started"
+  | "task.completed"
+  | "task.blocked"
+  | "contract.changed"
+  | "test.failed"
+  | "integration.blocked";
+
+export interface EventEnvelope {
+  eventId: string;
+  taskId: string;
+  type: EventType;
+  /** Agent name that produced the event. */
+  source: string;
+  target: string[];
+  summary: string;
+  artifacts: string[];
+}
 
 export class EventBus {
   private readonly events: EventEnvelope[] = [];

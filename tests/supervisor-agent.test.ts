@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
 import { SupervisorAgent } from "../src/pi/supervisor-agent.ts";
+import { SessionBusyError } from "../src/core/session/session-types.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../src/core/config/config-store.ts";
 
 /** In-memory ConfigStore recording every save; load() returns the latest snapshot. */
@@ -149,4 +151,13 @@ test("restore without saved config reports an empty state", async () => {
   const agent = makeAgent(makeStore());
   assert.equal(await agent.restore(), "无已保存的配置");
   assert.match(agent.status(), /会话尚未建立，未配置模型/);
+});
+
+test("rebind refuses to switch while a prompt is streaming", async () => {
+  const agent = makeAgent(makeStore());
+  assert.equal(agent.isBusy(), false);
+  // Enter the busy state directly: only promptModel can set it at runtime.
+  (agent as unknown as { prompting: boolean }).prompting = true;
+  assert.equal(agent.isBusy(), true);
+  await assert.rejects(agent.rebind(PiSessionManager.inMemory()), SessionBusyError);
 });
