@@ -19,9 +19,18 @@ function makeStore(): ConfigStore & { saved: AgentConfigSnapshot[] } {
   };
 }
 
+/** No-op stream sinks: these tests never open a Pi session, nothing streams. */
+const silentSinks = {
+  onText: () => undefined,
+  onThinking: () => undefined,
+  onStreamEnd: () => undefined,
+  onToolStart: () => undefined,
+  onToolEnd: () => undefined
+};
+
 /** A SupervisorAgent wired to the fake store; the Pi session is never created in these tests. */
 function makeAgent(store: ConfigStore): SupervisorAgent {
-  return new SupervisorAgent({ configStore: store, cwd: process.cwd(), agentDir: "not-created-in-tests" });
+  return new SupervisorAgent({ ...silentSinks, configStore: store, cwd: process.cwd(), agentDir: "not-created-in-tests" });
 }
 
 test("configureProvider persists the provider without opening a session", async () => {
@@ -57,6 +66,7 @@ test("invalid thinking levels throw and persist nothing", async () => {
 
 test("persistence failures propagate to the caller", async () => {
   const agent = new SupervisorAgent({
+    ...silentSinks,
     cwd: process.cwd(),
     agentDir: "not-created-in-tests",
     configStore: {

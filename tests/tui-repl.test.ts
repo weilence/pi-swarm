@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Component } from "@earendil-works/pi-tui";
 import { Container, Markdown, stripTerminalSequences, Text } from "@earendil-works/pi-tui";
-import { splitMarkdownBlocks, TuiRepl } from "../src/cli/tui-repl.ts";
+import { splitMarkdownBlocks, summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
 
 test("splitMarkdownBlocks cuts on blank lines outside code fences", () => {
   assert.deepEqual(splitMarkdownBlocks("para1\n\npara2"), { blocks: ["para1"], rest: "para2" });
@@ -112,6 +112,95 @@ test("endStream flushes the remaining partial block as markdown", () => {
   assert.equal(log.children.length, 1);
   assert.ok(log.children[0] instanceof Markdown);
   assert.equal(stream.children.length, 0, "tail clears after the stream ends");
+});
+
+test("interleaved text and thinking commits in arrival order", () => {
+  const { repl, log, stream } = makeRepl();
+  repl.streamText("答案一");
+  repl.streamThinking("推理一");
+  repl.streamText("答案二");
+  repl.streamThinking("推理二");
+  repl.endStream();
+
+  assert.equal(log.children.length, 4, "text1, thinking1, text2, thinking2 all landed");
+  assert.ok(log.children[0] instanceof Markdown, "first text run is plain markdown");
+  assert.ok((log.children[0] as Markdown).render(80).join("\n").includes("答案一"));
+  assert.ok(!(log.children[1] instanceof Markdown), "first thinking run is collapsible");
+  assert.ok(log.children[1].render(80).join("\n").includes("pi-swarm://think/1"));
+  assert.ok(log.children[2] instanceof Markdown, "second text run is plain markdown");
+  assert.ok((log.children[2] as Markdown).render(80).join("\n").includes("答案二"));
+  assert.ok(!(log.children[3] instanceof Markdown), "second thinking run is collapsible");
+  assert.ok(log.children[3].render(80).join("\n").includes("pi-swarm://think/2"));
+  assert.equal(stream.children.length, 0, "tail clears after the stream ends");
+});
+
+/** A log line arriving mid-stream commits the pending tail before itself. */
+test("appendLine between stream chunks keeps arrival order", () => {
+  const { repl, log } = makeRepl();
+  repl.streamText("先输出的文字");
+  repl.appendLine("[主 agent] 工具调用中");
+  repl.streamText("后输出的文字");
+  repl.endStream();
+
+  assert.equal(log.children.length, 3);
+  assert.ok(log.children[0] instanceof Markdown, "pending tail committed before the log line");
+  assert.ok((log.children[0] as Markdown).render(80).join("\n").includes("先输出的文字"));
+  assert.ok(log.children[1] instanceof Text);
+  assert.ok(log.children[1].render(80).join("\n").includes("工具调用中"));
+  assert.ok(log.children[2] instanceof Markdown);
+  assert.ok((log.children[2] as Markdown).render(80).join("\n").includes("后输出的文字"));
+});
+
+test("tool calls render as running lines and flip to results in place", () => {
+  const { repl, log } = makeRepl();
+  repl.toolStart("supervisor", "t1", "bash", { command: "npm test" });
+  assert.equal(log.children.length, 1);
+  const running = stripTerminalSequences(log.children[0].render(80).join("\n"));
+  assert.ok(running.includes("⏳") && running.includes("bash") && running.includes("npm test"));
+
+  repl.toolEnd("supervisor", "t1", false);
+  const done = stripTerminalSequences(log.children[0].render(80).join("\n"));
+  assert.ok(done.includes("✔") && done.includes("bash"), "success flips the same line to ✔");
+  assert.ok(!done.includes("⏳"), "spinner replaced by the result mark");
+});
+
+test("failed tool calls flip to ✘", () => {
+  const { repl, log } = makeRepl();
+  repl.toolStart("supervisor", "t2", "read", { path: "missing.ts" });
+  repl.toolEnd("supervisor", "t2", true);
+  const line = stripTerminalSequences(log.children[0].render(80).join("\n"));
+  assert.ok(line.includes("✘") && line.includes("missing.ts"));
+});
+
+test("toolStart commits the pending stream tail first, keeping arrival order", () => {
+  const { repl, log } = makeRepl();
+  repl.streamText("调用工具前的说明");
+  repl.toolStart("supervisor", "t3", "edit", { path: "src/a.ts" });
+  repl.toolEnd("supervisor", "t3", false);
+  repl.endStream();
+
+  assert.equal(log.children.length, 2, "text tail then the tool line");
+  assert.ok(log.children[0] instanceof Markdown, "pending text committed before the tool line");
+  assert.ok((log.children[0] as Markdown).render(80).join("\n").includes("调用工具前的说明"));
+  assert.ok(log.children[1].render(80).join("\n").includes("src/a.ts"));
+});
+
+test("endStream finalizes tool lines still marked running as interrupted", () => {
+  const { repl, log } = makeRepl();
+  repl.toolStart("supervisor", "t4", "bash", { command: "sleep 100" });
+  repl.endStream();
+  const line = stripTerminalSequences(log.children[0].render(80).join("\n"));
+  assert.ok(line.includes("✘"), "aborted call is not left spinning");
+});
+
+test("summarizeToolArgs prefers known keys and flattens to one line", () => {
+  assert.equal(summarizeToolArgs({ command: "npm\n  test" }), "npm test");
+  assert.equal(summarizeToolArgs({ path: "src/a.ts", other: "x" }), "src/a.ts");
+  assert.equal(summarizeToolArgs({ unknown: "值", more: true }), "值");
+  assert.equal(summarizeToolArgs({ nested: { a: 1 } }), "");
+  assert.equal(summarizeToolArgs(undefined), "");
+  const long = summarizeToolArgs({ command: "x".repeat(100) });
+  assert.ok(long.length <= 80 && long.endsWith("…"));
 });
 
 test("appendLine adds a plain text row", () => {

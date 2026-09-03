@@ -2,7 +2,6 @@ import { join } from "node:path";
 import type { AgentDefinition } from "../core/agent-format.ts";
 import { ToolObservationCollector, type ToolObservation } from "../core/tool-observation.ts";
 import { getUserDataDir } from "../core/userdata.ts";
-import { dim } from "../core/ansi.ts";
 import { forwardAssistantEvent } from "./assistant-stream.ts";
 import {
   BUDGET_LIMITS,
@@ -27,9 +26,16 @@ export interface SubAgentOptions {
   cwd?: string;
   /** Returns the current global default model (provider/model) when one is configured. */
   resolveModel?: () => string | undefined;
-  onText?: (delta: string, agent: string) => void;
-  onThinking?: (delta: string, agent: string) => void;
-  onStreamEnd?: (agent: string) => void;
+  /** Streams assistant text (the model's answer), labeled with the agent name. */
+  onText: (delta: string, agent: string) => void;
+  /** Streams reasoning/thinking deltas, labeled with the agent name. */
+  onThinking: (delta: string, agent: string) => void;
+  /** Called when a streaming response finishes (or fails) to flush UI tails. */
+  onStreamEnd: (agent: string) => void;
+  /** A tool call started in this agent's session (args as delivered). */
+  onToolStart: (toolCallId: string, toolName: string, args: unknown, agent: string) => void;
+  /** A tool call finished; isError marks failed calls. */
+  onToolEnd: (toolCallId: string, toolName: string, isError: boolean, agent: string) => void;
   /** Per-attempt wall-clock limit; the session is aborted when it fires. */
   timeoutMs?: number;
 }
@@ -119,7 +125,7 @@ export class SubAgent {
       clearTimeout(timer);
       // Flush the streaming tail on success, timeout, and failure alike — same
       // semantics as SupervisorAgent.promptModel; keeps retries residue-free.
-      this.options.onStreamEnd?.(this.options.definition.name);
+      this.options.onStreamEnd(this.options.definition.name);
     }
   }
 
@@ -150,11 +156,12 @@ export class SubAgent {
       this.collector?.handle(event);
       forwardAssistantEvent(event, {
         appendText: () => undefined,
-        onText: (delta) => this.options.onText?.(delta, definition.name),
-        onThinking: (delta) => {
-          if (this.options.onThinking) this.options.onThinking(delta, definition.name);
-          else process.stdout.write(dim(delta));
-        }
+        onText: (delta) => this.options.onText(delta, definition.name),
+        onThinking: (delta) => this.options.onThinking(delta, definition.name),
+        onToolStart: (toolCallId, toolName, args) =>
+          this.options.onToolStart(toolCallId, toolName, args, definition.name),
+        onToolEnd: (toolCallId, toolName, isError) =>
+          this.options.onToolEnd(toolCallId, toolName, isError, definition.name)
       });
     });
     const model = this.options.resolveModel?.();

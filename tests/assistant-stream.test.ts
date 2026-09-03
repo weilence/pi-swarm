@@ -31,6 +31,41 @@ test("thinking deltas reach only the thinking sink and other events are ignored"
   assert.deepEqual(text, []);
 });
 
+test("tool lifecycle events reach the tool sinks with ids, names, and args", () => {
+  const starts: Array<[string, string, unknown]> = [];
+  const ends: Array<[string, string, boolean]> = [];
+  const sinks = {
+    appendText: () => undefined,
+    onToolStart: (id: string, name: string, args: unknown) => starts.push([id, name, args]),
+    onToolEnd: (id: string, name: string, isError: boolean) => ends.push([id, name, isError])
+  };
+  forwardAssistantEvent(
+    { type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "npm test" } } as never,
+    sinks
+  );
+  forwardAssistantEvent(
+    { type: "tool_execution_update", toolCallId: "t1", toolName: "bash", args: {}, partialResult: "..." } as never,
+    sinks
+  );
+  forwardAssistantEvent(
+    { type: "tool_execution_end", toolCallId: "t1", toolName: "bash", result: "ok", isError: true } as never,
+    sinks
+  );
+  assert.deepEqual(starts, [["t1", "bash", { command: "npm test" }]]);
+  assert.deepEqual(ends, [["t1", "bash", true]]);
+});
+
+test("missing tool sinks are simply skipped", () => {
+  forwardAssistantEvent(
+    { type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "a.ts" } } as never,
+    { appendText: () => undefined }
+  );
+  forwardAssistantEvent(
+    { type: "tool_execution_end", toolCallId: "t1", toolName: "read", result: "", isError: false } as never,
+    { appendText: () => undefined }
+  );
+});
+
 test("dim wraps text in faint escapes", () => {
   assert.equal(dim("x"), "\x1b[2mx\x1b[22m");
 });

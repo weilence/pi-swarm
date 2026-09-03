@@ -72,6 +72,8 @@ interface AgentTranscript {
   container: Container;
   log: Container;
   stream: Container;
+  /** Kind of the live tail: text or thinking; undefined when nothing streams. */
+  streamKind?: "text" | "thinking";
   thinkingBuffer: string;
   partialBlock: string;
   unread: boolean;
@@ -135,6 +137,59 @@ class CollapsibleReasoning {
   public invalidate(): void {
     this.body.invalidate();
   }
+}
+
+/** Preferred arg keys for the one-line tool summary, in priority order. */
+const TOOL_SUMMARY_KEYS = ["command", "path", "file_path", "url", "pattern", "query", "name", "skill", "agent"];
+
+/** Flattens whitespace and truncates to a single short line. */
+function oneLine(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > 80 ? `${flat.slice(0, 79)}…` : flat;
+}
+
+/**
+ * One-line human summary of a tool call's arguments: the first meaningful
+ * string among known keys (command, path, …), else the first string value.
+ */
+export function summarizeToolArgs(args: unknown): string {
+  if (args == null) return "";
+  if (typeof args !== "object") return oneLine(String(args));
+  const record = args as Record<string, unknown>;
+  for (const key of TOOL_SUMMARY_KEYS) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return oneLine(value);
+  }
+  for (const value of Object.values(record)) {
+    if (typeof value === "string" && value.trim()) return oneLine(value);
+  }
+  return "";
+}
+
+/**
+ * One tool call in a transcript: a dim running line that mutates in place into
+ * ✔/✘ when the call finishes (pi-tui re-renders components each frame).
+ */
+class ToolCallLine {
+  private state: "running" | "ok" | "error" = "running";
+
+  public constructor(
+    private readonly toolName: string,
+    private readonly summary: string
+  ) {}
+
+  public finish(isError: boolean): void {
+    this.state = isError ? "error" : "ok";
+  }
+
+  public render(_width: number): string[] {
+    const label = `${this.toolName}${this.summary ? ` ${this.summary}` : ""}`;
+    if (this.state === "running") return [dim(`⏳ ${label} …`)];
+    const mark = this.state === "ok" ? dim("✔") : "\x1b[31m✘\x1b[0m";
+    return [`${mark}${dim(` ${label}`)}`];
+  }
+
+  public invalidate(): void {}
 }
 
 /** Overlay picker: title, type-to-filter input, fuzzy-filtered select list. */
@@ -210,6 +265,8 @@ export class TuiRepl {
   private activeAgent = DEFAULT_AGENT;
   private thinkSeq = 0;
   private readonly collapsibles = new Map<number, CollapsibleReasoning>();
+  /** Live tool calls by "agent/toolCallId"; removed when the call finishes. */
+  private readonly toolLines = new Map<string, ToolCallLine>();
   private readonly tabBar: AgentTabBar;
   private readonly tabBarOverlay?: OverlayHandle;
   private pendingAnswer?: (answer: string) => void;
@@ -272,7 +329,15 @@ export class TuiRepl {
     const container = new Container();
     container.addChild(log);
     container.addChild(stream);
-    this.tabs.set(name, { name, container, log, stream, thinkingBuffer: "", partialBlock: "", unread: false });
+    this.tabs.set(name, {
+      name,
+      container,
+      log,
+      stream,
+      thinkingBuffer: "",
+      partialBlock: "",
+      unread: false
+    });
     if (this.tabs.size === 1) {
       this.activeAgent = name;
       const index = this.ui.children.indexOf(this.inputArea);
@@ -313,6 +378,9 @@ export class TuiRepl {
 
   public appendLine(line: string, agent: string = DEFAULT_AGENT): void {
     const tab = this.tabFor(agent);
+    // A log line between stream chunks is later content: commit the live tail
+    // first so the transcript order matches arrival order.
+    this.flushStream(tab);
     tab.log.addChild(new Text(line, 0, 0));
     this.markUnread(tab, agent);
     this.ui.requestRender();
@@ -320,6 +388,10 @@ export class TuiRepl {
 
   public streamThinking(delta: string, agent: string = DEFAULT_AGENT): void {
     const tab = this.tabFor(agent);
+    // Text → thinking switch: the pending text tail is finished content, commit
+    // it so the transcript keeps the model's real interleaved order.
+    if (tab.streamKind === "text") this.flushStream(tab);
+    tab.streamKind = "thinking";
     tab.thinkingBuffer += delta;
     this.markUnread(tab, agent);
     this.refreshStreamArea();
@@ -327,13 +399,11 @@ export class TuiRepl {
 
   public streamText(delta: string, agent: string = DEFAULT_AGENT): void {
     const tab = this.tabFor(agent);
-    if (tab.thinkingBuffer) {
-      // thinking that arrived before the answer folds into the transcript, collapsed
-      tab.log.addChild(this.newReasoning(tab.thinkingBuffer));
-      tab.thinkingBuffer = "";
-    }
+    // Thinking → text switch: fold the thinking run into the transcript, collapsed.
+    if (tab.streamKind === "thinking") this.flushStream(tab);
+    tab.streamKind = "text";
     const { blocks, rest } = splitMarkdownBlocks(tab.partialBlock + delta);
-    for (const block of blocks) this.appendMarkdown(block, agent);
+    for (const block of blocks) this.addMarkdown(tab, block);
     tab.partialBlock = rest;
     this.markUnread(tab, agent);
     this.refreshStreamArea();
@@ -341,14 +411,40 @@ export class TuiRepl {
 
   public endStream(agent: string = DEFAULT_AGENT): void {
     const tab = this.tabFor(agent);
-    if (tab.thinkingBuffer.trim()) {
-      tab.log.addChild(this.newReasoning(tab.thinkingBuffer));
+    this.flushStream(tab);
+    // Safety net: calls still marked running (e.g. after an abort without an
+    // end event) are shown as interrupted instead of spinning forever.
+    for (const [key, line] of this.toolLines) {
+      if (key.startsWith(`${agent}/`)) {
+        line.finish(true);
+        this.toolLines.delete(key);
+      }
     }
-    this.appendMarkdown(tab.partialBlock, agent);
-    tab.partialBlock = "";
-    tab.thinkingBuffer = "";
     this.markUnread(tab, agent);
     this.refreshStreamArea();
+  }
+
+  /** A tool call started: commits the pending stream tail, shows a running line. */
+  public toolStart(agent: string, toolCallId: string, toolName: string, args: unknown): void {
+    const tab = this.tabFor(agent);
+    // Tools run between text segments: commit the live tail first so the
+    // transcript order matches what the model actually did.
+    this.flushStream(tab);
+    this.toolLines.set(`${agent}/${toolCallId}`, new ToolCallLine(toolName, summarizeToolArgs(args)));
+    tab.log.addChild(this.toolLines.get(`${agent}/${toolCallId}`)!);
+    this.markUnread(tab, agent);
+    this.ui.requestRender();
+  }
+
+  /** A tool call finished: flip its line to ✔/✘ in place. */
+  public toolEnd(agent: string, toolCallId: string, isError: boolean): void {
+    this.toolLines.get(`${agent}/${toolCallId}`)?.finish(isError);
+    this.toolLines.delete(`${agent}/${toolCallId}`);
+    const tab = this.tabs.get(agent);
+    if (tab) {
+      this.markUnread(tab, agent);
+      this.ui.requestRender();
+    }
   }
 
   public async pick<T>(title: string, options: readonly PickerOption<T>[]): Promise<T | undefined> {
@@ -385,8 +481,27 @@ export class TuiRepl {
   public appendMarkdown(markdown: string, agent: string = DEFAULT_AGENT): void {
     if (!markdown.trim()) return;
     const tab = this.tabFor(agent);
+    this.flushStream(tab);
+    this.addMarkdown(tab, markdown);
+  }
+
+  /** Commits the live tail (thinking run or partial text) into the log. */
+  private flushStream(tab: AgentTranscript): void {
+    if (tab.streamKind === "thinking") {
+      if (tab.thinkingBuffer.trim()) tab.log.addChild(this.newReasoning(tab.thinkingBuffer));
+      tab.thinkingBuffer = "";
+    } else if (tab.streamKind === "text") {
+      this.addMarkdown(tab, tab.partialBlock);
+      tab.partialBlock = "";
+    }
+    tab.streamKind = undefined;
+  }
+
+  /** Adds one finalized markdown block to the transcript (no stream flush). */
+  private addMarkdown(tab: AgentTranscript, markdown: string): void {
+    if (!markdown.trim()) return;
     tab.log.addChild(new Markdown(markdown, 0, 0, this.markdownTheme));
-    this.markUnread(tab, agent);
+    this.markUnread(tab, tab.name);
     this.ui.requestRender();
   }
 

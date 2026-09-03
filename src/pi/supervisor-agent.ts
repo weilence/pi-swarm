@@ -4,7 +4,6 @@ import type { AgentDefinition } from "../core/agent-format.ts";
 import { createTaskRun, type StepRecord } from "../core/task-run.ts";
 import type { StepJob } from "../core/supervisor.ts";
 import { getUserDataDir } from "../core/userdata.ts";
-import { dim } from "../core/ansi.ts";
 import { forwardAssistantEvent } from "./assistant-stream.ts";
 import { createDelegateTool, type DelegateState } from "./delegate-tool.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-store.ts";
@@ -33,12 +32,16 @@ export interface SupervisorAgentOptions {
    * omitted; main.ts shares one instance across all sessions.
    */
   modelRuntime?: ModelRuntime;
-  /** Streams assistant text; defaults to plain stdout. */
-  onText?: (delta: string, agent: string) => void;
-  /** Streams reasoning/thinking deltas; defaults to dimmed stdout. */
-  onThinking?: (delta: string, agent: string) => void;
+  /** Streams assistant text (the model's answer), labeled with the agent name. */
+  onText: (delta: string, agent: string) => void;
+  /** Streams reasoning/thinking deltas, labeled with the agent name. */
+  onThinking: (delta: string, agent: string) => void;
   /** Called when a streaming response finishes (or fails) to flush UI tails. */
-  onStreamEnd?: (agent: string) => void;
+  onStreamEnd: (agent: string) => void;
+  /** A tool call started in the supervisor session (args as delivered). */
+  onToolStart: (toolCallId: string, toolName: string, args: unknown, agent: string) => void;
+  /** A supervisor tool call finished; isError marks failed calls. */
+  onToolEnd: (toolCallId: string, toolName: string, isError: boolean, agent: string) => void;
   /** When provided, every successful configuration change is persisted. */
   configStore?: ConfigStore;
   /**
@@ -88,20 +91,24 @@ export class SupervisorAgent {
   private readonly agentDir: string;
   private readonly onText: (delta: string, agent: string) => void;
   private readonly onThinking: (delta: string, agent: string) => void;
-  private readonly onStreamEnd?: (agent: string) => void;
+  private readonly onStreamEnd: (agent: string) => void;
+  private readonly onToolStart: (toolCallId: string, toolName: string, args: unknown, agent: string) => void;
+  private readonly onToolEnd: (toolCallId: string, toolName: string, isError: boolean, agent: string) => void;
   private readonly configStore?: ConfigStore;
   private readonly options: SupervisorAgentOptions;
   /** Holder the delegate tool reads; swapped per task in runTask(). */
   private readonly delegateState: DelegateState = {};
 
-  public constructor(options: SupervisorAgentOptions = {}) {
+  public constructor(options: SupervisorAgentOptions) {
     this.options = options;
     this.cwd = options.cwd ?? process.cwd();
     this.agentDir = options.agentDir ?? join(getUserDataDir(), "supervisor-agent");
     this.modelRuntime = options.modelRuntime;
-    this.onText = options.onText ?? ((delta) => process.stdout.write(delta));
-    this.onThinking = options.onThinking ?? ((delta) => process.stdout.write(dim(delta)));
+    this.onText = options.onText;
+    this.onThinking = options.onThinking;
     this.onStreamEnd = options.onStreamEnd;
+    this.onToolStart = options.onToolStart;
+    this.onToolEnd = options.onToolEnd;
     this.configStore = options.configStore;
     this.piSession = options.sessionManager;
   }
@@ -196,6 +203,12 @@ export class SupervisorAgent {
         },
         onThinking: (delta) => {
           if (this.streamToUi) this.onThinking(delta, "supervisor");
+        },
+        onToolStart: (toolCallId, toolName, args) => {
+          if (this.streamToUi) this.onToolStart(toolCallId, toolName, args, "supervisor");
+        },
+        onToolEnd: (toolCallId, toolName, isError) => {
+          if (this.streamToUi) this.onToolEnd(toolCallId, toolName, isError, "supervisor");
         }
       });
     });
@@ -243,7 +256,7 @@ export class SupervisorAgent {
     } finally {
       this.prompting = false;
       this.streamToUi = previous;
-      this.onStreamEnd?.("supervisor");
+      this.onStreamEnd("supervisor");
     }
   }
 

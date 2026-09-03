@@ -9,7 +9,7 @@
 
 ## 2. 目标
 
-1. supervisor 会话默认持久化，重启后可恢复（continueRecent）。
+1. supervisor 会话默认持久化（JSONL 落盘）；但启动总是新建会话，旧会话经 /sessions + /switch 手动恢复。
 2. 支持多会话：创建、命名、列出、切换、关闭。
 3. 生命周期与过期策略：active 会话永不过期；closed 会话按 TTL 从索引清理（文件保留）。
 4. 存储抽象：会话索引可替换（内存实现便于测试，JSON 文件实现用于生产）。
@@ -136,7 +136,7 @@ export class SessionManager {
 | active | `create` / `switch` 恢复 | prompt、switch 目标、close | 永不过期 |
 | closed | `close` | get/list 可见（标 closed） | `closedAt + cleanupTtlMs` 后由 `cleanup()` 从索引移除；JSONL 文件保留 |
 
-- `initialize()` 时执行一次 `cleanup()`；启动恢复顺序：索引最新 active 会话 → 若其文件存在则 `PiSessionManager.open`，否则退化为 `continueRecent` / 新建。
+- `initialize()` 时执行一次 `cleanup()`，并把 current 指针恢复为索引最新的 active 会话；但 CLI 启动流程不使用该指针恢复会话，而是总是 `create()` 新建。旧会话的恢复是显式动作：用户经 /sessions + /switch 触发，此时才 `PiSessionManager.open` 打开旧 JSONL。
 
 ### 错误处理矩阵
 

@@ -12,7 +12,7 @@ import { SessionManager } from "../core/session/session-manager.ts";
 import { dim } from "../core/ansi.ts";
 import { SupervisorAgent } from "../pi/supervisor-agent.ts";
 import { SubAgent } from "../pi/sub-agent.ts";
-import { TuiRepl } from "./tui-repl.ts";
+import { TuiRepl, summarizeToolArgs } from "./tui-repl.ts";
 import { AgentRegistry, defaultAgentDirs } from "../core/agent-registry.ts";
 import { executeCommand, type CommandServices, type CommandState } from "./commands.ts";
 
@@ -40,6 +40,23 @@ const streamThinking = (delta: string, agent = "supervisor"): void => {
   else process.stdout.write(dim(delta));
 };
 const endStream = (agent = "supervisor"): void => repl?.endStream(agent);
+// Tool calls: interactive mode renders live lines in the transcript; pipe mode
+// logs start/end lines to stdout.
+const toolStart = (id: string, name: string, args: unknown, agent: string): void => {
+  if (repl) {
+    repl.toolStart(agent, id, name, args);
+    return;
+  }
+  const summary = summarizeToolArgs(args);
+  log(`[${agent}] 🔧 ${name}${summary ? ` ${summary}` : ""} …`, agent);
+};
+const toolEnd = (id: string, _name: string, isError: boolean, agent: string): void => {
+  if (repl) {
+    repl.toolEnd(agent, id, isError);
+    return;
+  }
+  log(`[${agent}] ${isError ? "✘" : "✔"} 工具调用结束`, agent);
+};
 
 // One shared runtime: /provider and /model register once and apply to the
 // supervisor session and every sub-agent session alike.
@@ -61,26 +78,16 @@ const agentRegistry = await AgentRegistry.load(defaultAgentDirs(), (warning) =>
 const events = new EventBus();
 const configStore = new JsonFileConfigStore();
 // Session management: persistent JSONL conversations under the user data dir;
-// startup resumes the most recent active session (conversation context included)
-// or creates a fresh one.
+// initialize() still loads the index (needed by /sessions), then startup always
+// creates a fresh session — old ones remain switchable via /sessions + /switch.
 const sessionStore = new JsonFileSessionStore();
 const sessionManager = new SessionManager({ cwd: process.cwd(), store: sessionStore });
 await sessionManager.initialize();
-// Startup resumes the most recent active session (conversation context included)
-// or creates a fresh one; a corrupt/unreadable JSONL degrades to a new session
-// instead of crashing the CLI.
-const resumedSession = sessionManager.current();
-let startupSession: Awaited<ReturnType<typeof sessionManager.bind>>;
-try {
-  startupSession = await sessionManager.bind((resumedSession ?? (await sessionManager.create())).id);
-  if (resumedSession) {
-    log(`[主 agent] 已恢复会话：${resumedSession.name ?? resumedSession.id}（${resumedSession.id}）`);
-  }
-} catch (error) {
-  const record = await sessionManager.create();
-  startupSession = await sessionManager.bind(record.id);
-  log(`[主 agent] 会话恢复失败（${error instanceof Error ? error.message : String(error)}），已新建会话：${record.id}`);
-}
+const startupRecord = await sessionManager.create();
+const startupSession: Awaited<ReturnType<typeof sessionManager.bind>> = await sessionManager.bind(
+  startupRecord.id
+);
+log(`[主 agent] 已新建会话：${startupRecord.name ?? startupRecord.id}（${startupRecord.id}）`);
 // Sub-agent sessions are created lazily on first dispatch and reused after;
 // the supervisor and supervisor-agent reference each other lazily, so both
 // bindings carry explicit types.
@@ -90,6 +97,8 @@ const supervisorAgent: SupervisorAgent = new SupervisorAgent({
   onText: streamText,
   onThinking: streamThinking,
   onStreamEnd: endStream,
+  onToolStart: toolStart,
+  onToolEnd: toolEnd,
   configStore,
   sessionManager: startupSession,
   agents: agentRegistry,
@@ -108,7 +117,9 @@ const supervisor: Supervisor = new Supervisor((name) => {
       resolveModel: () => supervisorAgent.currentModel,
       onText: streamText,
       onThinking: streamThinking,
-      onStreamEnd: endStream
+      onStreamEnd: endStream,
+      onToolStart: toolStart,
+      onToolEnd: toolEnd
     });
     // Lazy dispatch: make sure the sub-agent has a tab in the TUI.
     repl?.registerAgent(name);
