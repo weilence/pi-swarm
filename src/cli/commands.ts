@@ -9,7 +9,14 @@ import {
   type KnownApi,
   type ModelsDevProvider
 } from "../models-dev/catalog.ts";
-import type { PickerOption } from "./picker-logic.ts";
+/** One selectable row in an interactive picker. */
+export interface PickerOption<T> {
+  value: T;
+  label: string;
+  hint?: string;
+  /** Extra searchable text, e.g. aliases. */
+  keywords?: string;
+}
 
 /** Minimal catalog surface so tests can stub out models.dev. */
 export interface ProviderCatalog {

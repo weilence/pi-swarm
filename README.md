@@ -53,9 +53,11 @@ npm run start
 它会启动一个 Supervisor、一个接入真实模型的 supervisor agent，以及一个持续复用的
 work agent。每行输入一个任务，supervisor agent 先用真实模型生成执行规划（规划过程
 实时流式输出），再把带规划要点的任务交给 work agent；supervisor 模型不可用（未配置
-或缺少凭据）时自动跳过规划直接派发。在交互式终端（TTY）下，REPL 由 [Ink](https://github.com/vadimdemes/ink) 渲染：
+或缺少凭据）时自动跳过规划直接派发。在交互式终端（TTY）下，REPL 由 Pi 同源的
+[pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Markdown 按块流式渲染、多行编辑器
+带历史记录、模型输出与思考流分色显示）：
 直接输入 `/provider`、`/model` 或 `/thinking`（不带参数）会弹出选择列表，
-支持 `↑↓` 移动、输入即过滤、`Enter` 确认、`Esc` 取消；`/provider` 选中后还会依次弹出
+支持 `↑↓` 移动、输入即模糊过滤、`Enter` 确认、`Esc` 取消；`/provider` 选中后还会依次弹出
 接口类型与模型选择。`/status` 查看当前配置；输入 `/exit` 或 `/quit` 才会结束进程。
 非交互环境（管道/CI）自动回退到纯文本模式，此时可用
 `/provider <id> [接口类型]`、`/model <id>`、`/thinking level` 等带参数形式。

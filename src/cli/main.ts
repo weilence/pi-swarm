@@ -3,8 +3,6 @@ import { stdin as input, stdout as output } from "node:process";
 import { loadEnvFile } from "node:process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { createElement } from "react";
-import { render } from "ink";
 import { EventBus } from "../core/event-bus.ts";
 import { ModuleRegistry } from "../core/module-registry.ts";
 import { Supervisor } from "../core/supervisor.ts";
@@ -16,8 +14,7 @@ import { ModelsDevCatalog, type ModelsDevProvider } from "../models-dev/catalog.
 import { JsonFileConfigStore } from "../core/config/json-file-config-store.ts";
 import { dim } from "../core/ansi.ts";
 import { SupervisorAgent } from "../pi/supervisor-agent.ts";
-import { InkApp } from "./ink-app.tsx";
-import { LogStore } from "./log-store.ts";
+import { TuiRepl } from "./tui-repl.ts";
 import { moduleRegistryFile } from "../core/userdata.ts";
 import { executeCommand, type CommandServices, type CommandState } from "./commands.ts";
 
@@ -35,23 +32,27 @@ const events = new EventBus();
 const module = registry.get(process.env.PI_SWARM_MODULE ?? registry.list()[0].id);
 const workerMode = process.env.PI_SWARM_WORKER ?? "mock";
 const interactive = input.isTTY === true;
-const store = new LogStore();
+
+// Streams and log lines route into the interactive REPL once it exists; before
+// that (and in pipe mode) they fall back to plain stdout.
+let repl: TuiRepl | undefined;
 const log = (line: string): void => {
-  if (interactive) store.append(line);
+  if (repl) repl.appendLine(line);
   else console.log(line);
 };
 const streamText = (delta: string): void => {
-  if (interactive) store.appendStream(delta);
+  if (repl) repl.streamText(delta);
   else process.stdout.write(delta);
 };
 const streamThinking = (delta: string): void => {
-  const styled = dim(delta);
-  if (interactive) store.appendStream(styled);
-  else process.stdout.write(styled);
+  if (repl) repl.streamThinking(delta);
+  else process.stdout.write(dim(delta));
 };
+const endStream = (): void => repl?.endStream();
+
 const worker: ConfigurableModuleWorker =
   workerMode === "pi"
-    ? new PiSdkWorker(`${module.id} manager`, streamText, streamThinking)
+    ? new PiSdkWorker(`${module.id} manager`, streamText, streamThinking, endStream)
     : new MockPiWorker();
 const modelsCatalog = new ModelsDevCatalog({
   onUpdate: (info) => {
@@ -65,6 +66,7 @@ const configStore = new JsonFileConfigStore();
 const supervisorAgent = new SupervisorAgent({
   onText: streamText,
   onThinking: streamThinking,
+  onStreamEnd: endStream,
   configStore
 });
 const savedConfig = await configStore.load();
@@ -93,46 +95,50 @@ await supervisor.start();
 log(`[主 agent] ${await supervisorAgent.restore()}`);
 void modelsCatalog.prefetch();
 
+const commandState: CommandState = {
+  taskNumber: 0,
+  selectedProvider: restoredProvider,
+  selectedModelId: restoredModelId
+};
+const sharedServices = {
+  agent: supervisorAgent,
+  worker,
+  catalog: modelsCatalog,
+  supervisor,
+  module
+};
+
 if (interactive) {
   let settleExit!: () => void;
   const exited = new Promise<void>((settle) => {
     settleExit = settle;
   });
-  const instance = render(
-    createElement(
-      InkApp,
-      {
-        store,
-        agent: supervisorAgent,
-        worker,
-        catalog: modelsCatalog,
-        supervisor,
-        module,
-        initialProvider: restoredProvider,
-        initialModelId: restoredModelId,
-        onExit: settleExit
-      }
-    ),
-    { exitOnCtrlC: false }
-  );
+  const services: CommandServices = {
+    ...sharedServices,
+    interactive: true,
+    log,
+    pick: (title, options) => repl!.pick(title, options)
+  };
+  repl = new TuiRepl({
+    onSubmit: async (line) => {
+      await executeCommand(line, services, commandState);
+    },
+    onExit: settleExit
+  });
+  repl.start();
   await exited;
-  instance.unmount();
+  repl.stop();
 } else {
   const rl = createInterface({ input, output, terminal: true });
-  const state: CommandState = { taskNumber: 0, selectedProvider: restoredProvider, selectedModelId: restoredModelId };
   const services: CommandServices = {
-    agent: supervisorAgent,
-    worker,
-    catalog: modelsCatalog,
+    ...sharedServices,
     interactive: false,
     log,
-    pick: async () => undefined,
-    supervisor,
-    module
+    pick: async () => undefined
   };
   try {
     for await (const line of rl) {
-      if ((await executeCommand(line, services, state)) === "exit") break;
+      if ((await executeCommand(line, services, commandState)) === "exit") break;
     }
   } finally {
     rl.close();

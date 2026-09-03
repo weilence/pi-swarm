@@ -27,7 +27,8 @@ export class PiSdkWorker implements ConfigurableModuleWorker {
   public constructor(
     private readonly workerName: string,
     private readonly onText: (text: string) => void = (text) => process.stdout.write(text),
-    private readonly onThinking: (text: string) => void = (text) => process.stdout.write(dim(text))
+    private readonly onThinking: (text: string) => void = (text) => process.stdout.write(dim(text)),
+    private readonly onStreamEnd?: () => void
   ) {}
 
   public async start(): Promise<void> {
@@ -138,11 +139,15 @@ export class PiSdkWorker implements ConfigurableModuleWorker {
 
   public async run(task: TaskEnvelope): Promise<WorkerResult> {
     const session = await this.ensureSession(task);
-    await session.prompt([
-      `Task ${task.taskId}: ${task.goal}`,
-      `Related modules: ${task.relatedModules.join(", ") || "none"}`,
-      `Required tests: ${task.requiredTests.join(", ")}`
-    ].join("\n"));
+    try {
+      await session.prompt([
+        `Task ${task.taskId}: ${task.goal}`,
+        `Related modules: ${task.relatedModules.join(", ") || "none"}`,
+        `Required tests: ${task.requiredTests.join(", ")}`
+      ].join("\n"));
+    } finally {
+      this.onStreamEnd?.();
+    }
 
     return {
       taskId: task.taskId,

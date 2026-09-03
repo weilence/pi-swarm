@@ -27,6 +27,8 @@ export interface SupervisorAgentOptions {
   onText?: (delta: string) => void;
   /** Streams reasoning/thinking deltas; defaults to dimmed stdout. */
   onThinking?: (delta: string) => void;
+  /** Called when a streaming response finishes (or fails) to flush UI tails. */
+  onStreamEnd?: () => void;
   /** When provided, every successful configuration change is persisted. */
   configStore?: ConfigStore;
 }
@@ -50,6 +52,7 @@ export class SupervisorAgent {
   private readonly agentDir: string;
   private readonly onText: (delta: string) => void;
   private readonly onThinking: (delta: string) => void;
+  private readonly onStreamEnd?: () => void;
   private readonly configStore?: ConfigStore;
 
   public constructor(options: SupervisorAgentOptions = {}) {
@@ -57,6 +60,7 @@ export class SupervisorAgent {
     this.agentDir = options.agentDir ?? join(getUserDataDir(), "supervisor-agent");
     this.onText = options.onText ?? ((delta) => process.stdout.write(delta));
     this.onThinking = options.onThinking ?? ((delta) => process.stdout.write(dim(delta)));
+    this.onStreamEnd = options.onStreamEnd;
     this.configStore = options.configStore;
   }
 
@@ -139,23 +143,27 @@ export class SupervisorAgent {
   public async plan(goal: string, module: ModuleDefinition, context?: { knowledgeCutoff?: string }): Promise<string> {
     const session = await this.ensureSession();
     this.responseBuffer = "";
-    await session.prompt(
-      [
-        "为以下任务制定执行计划，交给模块 worker 执行。",
-        `用户目标：${goal}`,
-        `目标模块：${module.id}（工作目录 ${module.path}）`,
-        `模块上下文文件：${module.contextFiles.join(", ") || "无"}`,
-        `允许修改的路径：${module.allowedPaths.join(", ") || "无"}`,
-        `必须通过的测试：${[module.testCommand, module.contractCommand].filter(Boolean).join(", ") || "无"}`,
-        ...(context?.knowledgeCutoff
-          ? [`注意：你的知识截止于 ${context.knowledgeCutoff}，涉及更新的库版本或 API 时在计划中标注“需查证”。`]
-          : []),
-        "输出：1) 步骤拆解 2) 每步涉及的文件 3) 风险与跨模块注意点。保持简洁。"
-      ].join("\n")
-    );
-    const plan = this.responseBuffer.trim();
-    this.responseBuffer = "";
-    return plan;
+    try {
+      await session.prompt(
+        [
+          "为以下任务制定执行计划，交给模块 worker 执行。",
+          `用户目标：${goal}`,
+          `目标模块：${module.id}（工作目录 ${module.path}）`,
+          `模块上下文文件：${module.contextFiles.join(", ") || "无"}`,
+          `允许修改的路径：${module.allowedPaths.join(", ") || "无"}`,
+          `必须通过的测试：${[module.testCommand, module.contractCommand].filter(Boolean).join(", ") || "无"}`,
+          ...(context?.knowledgeCutoff
+            ? [`注意：你的知识截止于 ${context.knowledgeCutoff}，涉及更新的库版本或 API 时在计划中标注“需查证”。`]
+            : []),
+          "输出：1) 步骤拆解 2) 每步涉及的文件 3) 风险与跨模块注意点。保持简洁。"
+        ].join("\n")
+      );
+      const plan = this.responseBuffer.trim();
+      this.responseBuffer = "";
+      return plan;
+    } finally {
+      this.onStreamEnd?.();
+    }
   }
 
   public async configureProvider(providerId: string, config: unknown, modelId?: string): Promise<string> {
