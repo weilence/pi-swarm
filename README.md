@@ -62,7 +62,8 @@ npm run start
 所有步骤完成后，supervisor 用**流式 markdown** 输出总结（变更、风险、后续建议）。
 模型不可用或结构化输出解析失败时逐级降级，不阻塞基本可用性。在交互式终端（TTY）下，
 REPL 由 Pi 同源的 [pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Markdown 按块
-流式渲染、多行编辑器带历史记录、模型输出与思考流分色显示、执行中可弹出澄清提问）：
+流式渲染、多行编辑器带历史记录、模型输出与思考流分色显示、执行中可弹出澄清提问、
+用户输入以「▸ 你」块回显进 transcript，与 /switch 历史回放同格式）：
 直接输入 `/provider`、`/model` 或 `/thinking`（不带参数）会弹出选择列表，
 支持 `↑↓` 移动、输入即模糊过滤、`Enter` 确认、`Esc` 取消；`/provider` 选中后还会依次弹出
 接口类型与模型选择。`/status` 查看当前配置与已加载 agent；输入 `/exit` 或 `/quit` 才会结束进程。

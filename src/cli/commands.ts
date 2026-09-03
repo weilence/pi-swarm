@@ -2,7 +2,7 @@ import { THINKING_LEVELS } from "../core/thinking.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
 import type { SessionManager } from "../core/session/session-manager.ts";
 import { SessionBusyError, SessionClosedError, SessionNotFoundError } from "../core/session/session-types.ts";
-import { renderSessionHistory } from "../core/session-history.ts";
+import { renderSessionHistory, renderUserMessage } from "../core/session-history.ts";
 import type { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
 import {
   PI_API_TYPES,
@@ -470,6 +470,9 @@ async function dispatchTask(goal: string, services: CommandServices, _state: Com
     services.log("[主 agent] 已有任务正在执行，请等待完成后再输入。");
     return;
   }
+  // 用户输入是聊天内容：先回显进 transcript（与历史回放的「▸ 你」格式一致），
+  // 任务输出才有上下文可对照；斜杠命令是 UI 操作且可能含密钥（/apikey），不回显。
+  (services.logMarkdown ?? services.log)(renderUserMessage(goal));
   // 当前会话不存在（已关闭或从未创建）时自动新建承接，保证无缝体验
   let sessionId = services.sessions?.current()?.id;
   if (!sessionId && services.sessions) {

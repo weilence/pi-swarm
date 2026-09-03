@@ -31,6 +31,11 @@ function clampText(text: string, maxMessageChars: number): string {
   return text.length > maxMessageChars ? text.slice(0, maxMessageChars) + "……（截断）" : text;
 }
 
+/** 单条用户消息 → markdown 块；实时回显与历史回放共用，保证两处格式一致。 */
+export function renderUserMessage(text: string): string {
+  return `**▸ 你**\n\n${text}`;
+}
+
 /** 单个会话条目 → markdown 块；返回 undefined 表示该条目不回显。 */
 function renderEntry(entry: SessionEntry, maxMessageChars: number): string | undefined {
   if (entry.type === "compaction") return "> 📦 此前历史已压缩为摘要";
@@ -43,7 +48,7 @@ function renderEntry(entry: SessionEntry, maxMessageChars: number): string | und
   switch (message.role) {
     case "user": {
       const text = clampText(messageText(message.content), maxMessageChars);
-      return text ? `**▸ 你**\n\n${text}` : undefined;
+      return text ? renderUserMessage(text) : undefined;
     }
     case "assistant": {
       if (message.stopReason === "error") {

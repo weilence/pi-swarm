@@ -232,6 +232,39 @@ test("task input runs through the supervisor's runTask", async () => {
   assert.deepEqual(ran, ["实现登录"]);
 });
 
+test("task input is echoed into the transcript before the task runs", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  services.agents = noAgents;
+  const timeline: string[] = [];
+  // logMarkdown 未提供时回落 log：回显与日志同通道，顺序可断言
+  services.log = (line) => timeline.push(line);
+  services.agent = {
+    ...makeAgent(recording),
+    async runTask(goal: string) {
+      timeline.push(`[runTask] ${goal}`);
+      return "任务完成";
+    }
+  };
+  await executeCommand("实现登录", services, {});
+  assert.deepEqual(timeline, ["**▸ 你**\n\n实现登录", "[runTask] 实现登录"]);
+});
+
+test("rejected dispatch (busy) leaves the input out of the transcript", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  services.agent = {
+    ...makeAgent(recording),
+    isBusy: () => true,
+    async runTask() {
+      throw new Error("should not run");
+    }
+  };
+  await executeCommand("实现登录", services, {});
+  assert.match(services.logs.join("\n"), /已有任务正在执行/);
+  assert.ok(!services.logs.includes("**▸ 你**\n\n实现登录"), "busy dispatch must not echo");
+});
+
 test("task input is rejected while the supervisor is busy", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
