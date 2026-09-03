@@ -55,6 +55,59 @@ test("toPiProviderConfig attaches the generated thinking level map to models", (
   assert.equal(glm46?.thinkingLevelMap, undefined);
 });
 
+test("per-model provider overrides switch api and baseUrl for aggregator routes", () => {
+  const provider: ModelsDevProvider = {
+    id: "openrouter",
+    npm: "@openrouter/ai-sdk-provider",
+    api: "https://openrouter.ai/api/v1",
+    models: {
+      plain: { id: "plain" },
+      routed: { id: "routed", provider: { npm: "@ai-sdk/anthropic", api: "https://agentrouter.org/v1" } }
+    }
+  };
+  const config = toPiProviderConfig(provider);
+  const plain = config.models.find((model) => model.id === "plain");
+  const routed = config.models.find((model) => model.id === "routed");
+  assert.equal(plain?.api, "openai-completions");
+  assert.equal(plain?.baseUrl, undefined);
+  assert.equal(routed?.api, "anthropic-messages");
+  assert.equal(routed?.baseUrl, "https://agentrouter.org/v1");
+});
+
+test("models without text output are not registered", () => {
+  const provider: ModelsDevProvider = {
+    id: "x",
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      chat: { id: "chat", modalities: { input: ["text"], output: ["text"] } },
+      "image-gen": { id: "image-gen", modalities: { input: ["text"], output: ["image"] } }
+    }
+  };
+  const config = toPiProviderConfig(provider);
+  assert.deepEqual(config.models.map((model) => model.id), ["chat"]);
+});
+
+test("interleaved reasoning_content maps to a replay compat flag for openai-completions only", () => {
+  const provider: ModelsDevProvider = {
+    id: "x",
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      deepthink: { id: "deepthink", interleaved: { field: "reasoning_content" } },
+      plain: { id: "plain", interleaved: true },
+      details: { id: "details", interleaved: { field: "reasoning_details" } }
+    }
+  };
+  const config = toPiProviderConfig(provider);
+  assert.deepEqual(config.models.find((model) => model.id === "deepthink")?.compat, {
+    requiresReasoningContentOnAssistantMessages: true
+  });
+  assert.equal(config.models.find((model) => model.id === "plain")?.compat, undefined);
+  assert.equal(config.models.find((model) => model.id === "details")?.compat, undefined);
+
+  const anthropicStyle = toPiProviderConfig({ id: "y", npm: "@ai-sdk/openai-compatible", models: { deepthink: { id: "deepthink", interleaved: { field: "reasoning_content" } } } }, "anthropic-messages");
+  assert.equal(anthropicStyle.models[0]?.compat, undefined);
+});
+
 test("models.dev npm packages map to KnownApi by exact package name", () => {
   const provider = (npm?: string): ModelsDevProvider =>
     ({ id: "x", npm, models: {} }) as ModelsDevProvider;

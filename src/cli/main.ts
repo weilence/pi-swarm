@@ -65,6 +65,10 @@ if (savedConfig.providerId) {
     // catalog unavailable: the agent still restores from providerConfig; /model will ask for /provider again
   }
 }
+const restoredModelId =
+  restoredProvider && savedConfig.model?.startsWith(`${restoredProvider.id}/`)
+    ? savedConfig.model.slice(restoredProvider.id.length + 1)
+    : undefined;
 
 console.log("pi-swarm 主 agent 已启动。管理/开发 work agent 将持续复用同一会话。");
 console.log(`当前 work agent: ${module.id} (${workerMode})`);
@@ -86,7 +90,17 @@ if (interactive) {
   const instance = render(
     createElement(
       InkApp,
-      { store, agent: supervisorAgent, worker, catalog: modelsCatalog, supervisor, module, initialProvider: restoredProvider, onExit: settleExit }
+      {
+        store,
+        agent: supervisorAgent,
+        worker,
+        catalog: modelsCatalog,
+        supervisor,
+        module,
+        initialProvider: restoredProvider,
+        initialModelId: restoredModelId,
+        onExit: settleExit
+      }
     ),
     { exitOnCtrlC: false }
   );
@@ -94,7 +108,7 @@ if (interactive) {
   instance.unmount();
 } else {
   const rl = createInterface({ input, output, terminal: true });
-  const state: CommandState = { taskNumber: 0, selectedProvider: restoredProvider };
+  const state: CommandState = { taskNumber: 0, selectedProvider: restoredProvider, selectedModelId: restoredModelId };
   const services: CommandServices = {
     agent: supervisorAgent,
     worker,

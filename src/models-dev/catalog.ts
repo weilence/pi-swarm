@@ -20,11 +20,22 @@ export interface ModelsDevReasoningOption {
 export interface ModelsDevModel {
   id: string;
   name?: string;
+  description?: string;
+  family?: string;
   reasoning?: boolean;
   reasoning_options?: ModelsDevReasoningOption[];
-  modalities?: { input?: string[] };
+  /** Where interleaved reasoning arrives; pi-ai reads all known fields natively. */
+  interleaved?: boolean | { field?: string };
+  tool_call?: boolean;
+  status?: string;
+  experimental?: boolean;
+  knowledge?: string;
+  release_date?: string;
+  modalities?: { input?: string[]; output?: string[] };
   limit?: { context?: number; output?: number };
   cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
+  /** Per-model routing override used by aggregators. */
+  provider?: { npm?: string; api?: string };
 }
 
 export interface ModelsDevProvider {
@@ -33,6 +44,7 @@ export interface ModelsDevProvider {
   api?: string;
   npm?: string;
   env?: string[];
+  doc?: string;
   models: Record<string, ModelsDevModel>;
 }
 
@@ -246,7 +258,11 @@ export function toThinkingLevelMap(model: ModelsDevModel): ThinkingLevelMap | un
 
 export function inferPiApi(provider: ModelsDevProvider, override?: KnownApi): KnownApi {
   if (override) return override;
-  return NPM_API_RULES[provider.npm ?? ""] ?? DEFAULT_API;
+  return npmToApi(provider.npm);
+}
+
+function npmToApi(npm?: string): KnownApi {
+  return NPM_API_RULES[npm ?? ""] ?? DEFAULT_API;
 }
 
 /** Validates the API type given to `/provider <id> <api>`: exact KnownApi id or nothing. */
@@ -257,6 +273,19 @@ export function parsePiApi(value?: string): KnownApi | undefined {
   return parsed;
 }
 
+/**
+ * models.dev interleaved reasoning → Pi compat flags. pi-ai already reads all
+ * known reasoning delta fields natively, so only the replay side needs a flag:
+ * endpoints emitting reasoning_content (deepseek/zai style) require replayed
+ * assistant messages to carry an empty reasoning_content field.
+ */
+function toModelCompat(model: ModelsDevModel, api: KnownApi): Record<string, unknown> | undefined {
+  if (api !== "openai-completions") return undefined;
+  return typeof model.interleaved === "object" && model.interleaved.field === "reasoning_content"
+    ? { requiresReasoningContentOnAssistantMessages: true }
+    : undefined;
+}
+
 export function toPiProviderConfig(provider: ModelsDevProvider, api?: KnownApi) {
   const selectedApi = inferPiApi(provider, api);
   const envKey = provider.env?.[0];
@@ -265,21 +294,32 @@ export function toPiProviderConfig(provider: ModelsDevProvider, api?: KnownApi) 
     baseUrl: provider.api,
     api: selectedApi,
     ...(envKey ? { apiKey: `$${envKey}` } : {}),
-    models: Object.values(provider.models).map((model) => ({
-      id: model.id,
-      name: model.name ?? model.id,
-      api: selectedApi,
-      reasoning: model.reasoning ?? false,
-      input: (model.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
-      contextWindow: model.limit?.context ?? 128000,
-      maxTokens: model.limit?.output ?? 16384,
-      thinkingLevelMap: toThinkingLevelMap(model),
-      cost: {
-        input: model.cost?.input ?? 0,
-        output: model.cost?.output ?? 0,
-        cacheRead: model.cost?.cache_read ?? 0,
-        cacheWrite: model.cost?.cache_write ?? 0
-      }
-    }))
+    models: Object.values(provider.models)
+      .filter((model) => !model.modalities?.output || model.modalities.output.includes("text"))
+      .map((model) => {
+        // Aggregator models may route to a different protocol/endpoint than
+        // their parent provider (models.dev per-model provider override).
+        const overrideApi = model.provider?.npm ? npmToApi(model.provider.npm) : undefined;
+        const modelApi = overrideApi ?? selectedApi;
+        const compat = toModelCompat(model, modelApi);
+        return {
+          id: model.id,
+          name: model.name ?? model.id,
+          api: modelApi,
+          ...(model.provider?.api ? { baseUrl: model.provider.api } : {}),
+          reasoning: model.reasoning ?? false,
+          input: (model.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+          contextWindow: model.limit?.context ?? 128000,
+          maxTokens: model.limit?.output ?? 16384,
+          thinkingLevelMap: toThinkingLevelMap(model),
+          ...(compat ? { compat } : {}),
+          cost: {
+            input: model.cost?.input ?? 0,
+            output: model.cost?.output ?? 0,
+            cacheRead: model.cost?.cache_read ?? 0,
+            cacheWrite: model.cost?.cache_write ?? 0
+          }
+        };
+      })
   } satisfies Parameters<ModelRuntime["registerProvider"]>[1];
 }

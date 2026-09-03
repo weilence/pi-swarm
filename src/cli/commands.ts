@@ -32,7 +32,12 @@ export interface AgentController {
   setApiKey?(key: string): Promise<string>;
   status?(): string;
   /** Real-model planning hook invoked before a task is dispatched. */
-  plan?(goal: string, module: ModuleDefinition): Promise<string>;
+  plan?(goal: string, module: ModuleDefinition, context?: PlanningContext): Promise<string>;
+}
+
+/** Extra facts about the selected model, fed into supervisor planning. */
+export interface PlanningContext {
+  knowledgeCutoff?: string;
 }
 
 export interface CommandServices {
@@ -49,6 +54,7 @@ export interface CommandServices {
 
 export interface CommandState {
   selectedProvider?: ModelsDevProvider;
+  selectedModelId?: string;
   taskNumber: number;
 }
 
@@ -110,7 +116,7 @@ async function commandProvider(
             value: provider.id,
             label: provider.id,
             hint: provider.name,
-            keywords: provider.npm
+            keywords: [provider.npm, provider.doc].filter(Boolean).join(" ")
           }))
         );
         if (picked === undefined) {
@@ -147,7 +153,14 @@ async function commandProvider(
       else services.log("[主 agent] 已跳过模型选择，可用 /model 随时切换。");
       return;
     }
-    services.log(`[主 agent] 可用模型：${Object.values(provider.models).map((model) => model.id).join(", ")}`);
+    services.log(
+      `[主 agent] 可用模型：${selectableModels(provider)
+        .map((model) => {
+          const badges = modelBadges(model);
+          return badges.length > 0 ? `${model.id}（${badges.join("，")}）` : model.id;
+        })
+        .join(", ")}`
+    );
   } catch (error) {
     services.log(`[主 agent] provider 配置失败：${error instanceof Error ? error.message : String(error)}`);
   }
@@ -168,21 +181,46 @@ async function commandModel(modelId: string | undefined, services: CommandServic
       await applyModel(picked, services, state);
       return;
     }
-    services.log(`[主 agent] ${Object.values(state.selectedProvider.models).map((model) => `${model.id} (${model.name ?? model.id})`).join(", ")}`);
+    services.log(
+      `[主 agent] ${selectableModels(state.selectedProvider)
+        .map((model) => {
+          const badges = modelBadges(model);
+          return badges.length > 0 ? `${model.id} (${model.name ?? model.id}；${badges.join("，")})` : `${model.id} (${model.name ?? model.id})`;
+        })
+        .join(", ")}`
+    );
     return;
   }
   await applyModel(modelId, services, state);
 }
 
+/** models.dev status/lifecycle shown next to the model id. */
+function modelBadges(model: ModelsDevProvider["models"][string]): string[] {
+  const badges: string[] = [];
+  if (model.experimental) badges.push("experimental");
+  if (model.tool_call === false) badges.push("无工具调用");
+  if (model.knowledge) badges.push(`知识截止 ${model.knowledge}`);
+  return badges;
+}
+
+function selectableModels(provider: ModelsDevProvider): ModelsDevProvider["models"][string][] {
+  return Object.values(provider.models).filter((model) => model.status !== "deprecated");
+}
+
 async function pickModel(provider: ModelsDevProvider, services: CommandServices): Promise<string | undefined> {
   return await services.pick(
     `选择模型（${provider.id}）`,
-    Object.values(provider.models).map((model) => ({
-      value: model.id,
-      label: model.id,
-      hint: model.name,
-      keywords: model.reasoning ? "reasoning" : undefined
-    }))
+    selectableModels(provider).map((model) => {
+      const badges = modelBadges(model);
+      return {
+        value: model.id,
+        label: model.id,
+        hint: [model.name, ...badges].filter(Boolean).join(" · "),
+        keywords: [model.description, model.family, model.release_date, ...(model.reasoning ? ["reasoning"] : [])]
+          .filter(Boolean)
+          .join(" ")
+      };
+    })
   );
 }
 
@@ -192,6 +230,7 @@ async function applyModel(modelId: string, services: CommandServices, state: Com
       services.log(`[主 agent] provider ${state.selectedProvider.id} 没有模型：${modelId}`);
       return;
     }
+    state.selectedModelId = modelId;
     try {
       services.log(`[主 agent] ${await services.agent?.setModel?.(`${state.selectedProvider.id}/${modelId}`) ?? "当前 supervisor agent 不支持模型切换"}`);
     } catch (error) {
@@ -199,6 +238,7 @@ async function applyModel(modelId: string, services: CommandServices, state: Com
     }
     return;
   }
+  state.selectedModelId = undefined;
   try {
     services.log(`[主 agent] ${await services.agent?.setModel?.(modelId) ?? "当前 supervisor agent 不支持运行时模型切换"}`);
   } catch (error) {
@@ -254,7 +294,8 @@ async function dispatchTask(goal: string, services: CommandServices, state: Comm
   let effectiveGoal = goal;
   if (services.agent?.plan) {
     try {
-      const plan = await services.agent.plan(goal, services.module);
+      const selectedModel = state.selectedProvider && state.selectedModelId ? state.selectedProvider.models[state.selectedModelId] : undefined;
+      const plan = await services.agent.plan(goal, services.module, { knowledgeCutoff: selectedModel?.knowledge });
       if (plan) {
         services.log("[主 agent] supervisor 规划完成，任务已交给 worker。");
         effectiveGoal = `${goal}\n\nSupervisor 规划要点：\n${plan}`;

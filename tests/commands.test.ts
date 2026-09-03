@@ -14,7 +14,9 @@ function makeProviders(): ModelsDevProvider[] {
       env: ["ANTHROPIC_API_KEY"],
       models: {
         "claude-sonnet-4": { id: "claude-sonnet-4", name: "Claude Sonnet 4", reasoning: true },
-        "claude-haiku-4": { id: "claude-haiku-4", name: "Claude Haiku 4" }
+        "claude-haiku-4": { id: "claude-haiku-4", name: "Claude Haiku 4" },
+        "claude-old": { id: "claude-old", name: "Claude Old", status: "deprecated" },
+        "claude-lab": { id: "claude-lab", name: "Claude Lab", experimental: true, tool_call: false, knowledge: "2026-01", description: "实验通道", family: "claude" }
       }
     },
     {
@@ -281,7 +283,7 @@ test("dispatch falls back to direct delegation when the supervisor model is unav
 });
 
 test("dispatch without a planning agent delegates the goal as-is", async () => {
-  const recording = { providerConfigs: [], models: [], thinkingLevels: [] };
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
   const { dispatched, supervisor } = makeDispatchRecording();
   services.supervisor = supervisor;
@@ -289,4 +291,40 @@ test("dispatch without a planning agent delegates the goal as-is", async () => {
   await executeCommand("实现登录", services, { taskNumber: 0 });
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].goal, "实现登录");
+});
+
+test("deprecated models are hidden and badges annotate the model listings", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  const state: CommandState = { taskNumber: 0 };
+  await executeCommand("/provider anthropic", services, state);
+  const listed = services.logs.join("\n");
+  assert.doesNotMatch(listed, /claude-old/);
+  assert.match(listed, /claude-lab（experimental，无工具调用，知识截止 2026-01）/);
+
+  await executeCommand("/model", services, state);
+  const models = services.logs.join("\n");
+  assert.doesNotMatch(models, /claude-old/);
+  assert.match(models, /claude-lab \(Claude Lab；experimental，无工具调用，知识截止 2026-01\)/);
+});
+
+test("planning receives the selected model's knowledge cutoff", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  const { supervisor } = makeDispatchRecording();
+  services.supervisor = supervisor;
+  services.module = testModule;
+  const contexts: (undefined | { knowledgeCutoff?: string })[] = [];
+  services.agent = {
+    ...makeAgent(recording),
+    async plan(_goal: string, _module: unknown, context?: { knowledgeCutoff?: string }) {
+      contexts.push(context);
+      return "1. 拆解";
+    }
+  };
+  const state: CommandState = { taskNumber: 0 };
+  await executeCommand("/provider anthropic", services, state);
+  await executeCommand("/model claude-lab", services, state);
+  await executeCommand("实现登录", services, state);
+  assert.deepEqual(contexts, [{ knowledgeCutoff: "2026-01" }]);
 });

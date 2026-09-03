@@ -24,13 +24,15 @@ export interface InkAppProps {
   module: ModuleDefinition;
   /** Provider restored from persisted config, so /model works right after startup. */
   initialProvider?: ModelsDevProvider;
+  /** Model id restored from persisted config (bare id within initialProvider). */
+  initialModelId?: string;
   onExit: () => void;
 }
 
 /** REPL shell: streaming log above, prompt at the bottom, picker popup on demand. */
-export function InkApp({ store, agent, worker, catalog, supervisor, module, initialProvider, onExit }: InkAppProps) {
+export function InkApp({ store, agent, worker, catalog, supervisor, module, initialProvider, initialModelId, onExit }: InkAppProps) {
   const snapshot = useLogStore(store);
-  const commandState = useRef<CommandState>({ taskNumber: 0, selectedProvider: initialProvider });
+  const commandState = useRef<CommandState>({ taskNumber: 0, selectedProvider: initialProvider, selectedModelId: initialModelId });
   const [pick, setPick] = useState<ActivePick | null>(null);
   const [busy, setBusy] = useState(false);
 
