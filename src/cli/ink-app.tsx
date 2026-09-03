@@ -3,10 +3,11 @@ import { Box, Static, Text, useInput } from "ink";
 import { TextInput } from "./text-input.tsx";
 import { Picker } from "./picker.tsx";
 import { useLogStore, type LogStore } from "./log-store.ts";
-import { executeCommand, type CommandServices, type CommandState, type ProviderCatalog, type TaskDispatcher } from "./commands.ts";
+import { executeCommand, type AgentController, type CommandServices, type CommandState, type ProviderCatalog, type TaskDispatcher } from "./commands.ts";
 import type { PickerOption } from "./picker-logic.ts";
 import type { ConfigurableModuleWorker } from "../core/worker.ts";
 import type { ModuleDefinition } from "../protocol/contracts.ts";
+import type { ModelsDevProvider } from "../models-dev/catalog.ts";
 
 interface ActivePick {
   title: string;
@@ -16,17 +17,20 @@ interface ActivePick {
 
 export interface InkAppProps {
   store: LogStore;
-  worker: ConfigurableModuleWorker;
+  agent: AgentController;
+  worker?: ConfigurableModuleWorker;
   catalog: ProviderCatalog;
   supervisor: TaskDispatcher;
   module: ModuleDefinition;
+  /** Provider restored from persisted config, so /model works right after startup. */
+  initialProvider?: ModelsDevProvider;
   onExit: () => void;
 }
 
 /** REPL shell: streaming log above, prompt at the bottom, picker popup on demand. */
-export function InkApp({ store, worker, catalog, supervisor, module, onExit }: InkAppProps) {
+export function InkApp({ store, agent, worker, catalog, supervisor, module, initialProvider, onExit }: InkAppProps) {
   const snapshot = useLogStore(store);
-  const commandState = useRef<CommandState>({ taskNumber: 0 });
+  const commandState = useRef<CommandState>({ taskNumber: 0, selectedProvider: initialProvider });
   const [pick, setPick] = useState<ActivePick | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -48,6 +52,7 @@ export function InkApp({ store, worker, catalog, supervisor, module, onExit }: I
 
   const services = useMemo<CommandServices>(
     () => ({
+      agent,
       worker,
       catalog,
       supervisor,
@@ -56,7 +61,7 @@ export function InkApp({ store, worker, catalog, supervisor, module, onExit }: I
       log: (line: string) => store.append(line),
       pick: pickValue
     }),
-    [worker, catalog, supervisor, module, store, pickValue]
+    [agent, worker, catalog, supervisor, module, store, pickValue]
   );
 
   const handleSubmit = useCallback(

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { executeCommand, type CommandServices, type CommandState } from "../src/cli/commands.ts";
-import type { ConfigurableModuleWorker } from "../src/core/worker.ts";
+import { executeCommand, type AgentController, type CommandServices, type CommandState } from "../src/cli/commands.ts";
 import { THINKING_LEVELS } from "../src/core/worker.ts";
 import type { ModelsDevProvider } from "../src/cli/../models-dev/catalog.ts";
+import type { ModuleDefinition, TaskEnvelope, WorkerResult } from "../src/protocol/contracts.ts";
 
 function makeProviders(): ModelsDevProvider[] {
   return [
@@ -31,9 +31,10 @@ interface Recording {
   providerConfigs: Array<{ providerId: string; api: string; modelId?: string }>;
   models: string[];
   thinkingLevels: string[];
+  apiKeys?: string[];
 }
 
-function makeWorker(recording: Recording): ConfigurableModuleWorker {
+function makeAgent(recording: Recording): AgentController {
   return {
     async configureProvider(providerId: string, config: { api?: string }, modelId?: string) {
       recording.providerConfigs.push({ providerId, api: config.api ?? "?", modelId });
@@ -48,11 +49,12 @@ function makeWorker(recording: Recording): ConfigurableModuleWorker {
       recording.thinkingLevels.push(level);
       return `当前 thinking level：${level}`;
     },
+    async setApiKey(key: string) {
+      (recording.apiKeys ??= []).push(key);
+      return `API key 已配置并持久化（***）`;
+    },
     status() {
       return "模型：未选择；thinking：off";
-    },
-    async run() {
-      throw new Error("not used in these tests");
     }
   };
 }
@@ -65,7 +67,7 @@ function makeServices(
   const logs: string[] = [];
   const pickQueue = [...picks];
   return {
-    worker: makeWorker(recording),
+    agent: makeAgent(recording),
     catalog: { load: async () => makeProviders() },
     log: (line: string) => logs.push(line),
     pick: async <T,>(_title: string, options: readonly { value: T }[]) => {
@@ -160,6 +162,33 @@ test("/model rejects unknown models for the selected provider but passes raw spe
   assert.deepEqual(recording.models, ["models-dev/custom-model"]);
 });
 
+test("/apikey sets the key through the agent and reports usage with env hints", async () => {
+  const recording: Recording = { providerConfigs: [], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  await executeCommand("/apikey sk-secret-1234", services, { taskNumber: 0 });
+  assert.deepEqual(recording.apiKeys, ["sk-secret-1234"]);
+  assert.match(services.logs.join("\n"), /API key 已配置并持久化/);
+
+  const state: CommandState = { taskNumber: 0 };
+  await executeCommand("/provider anthropic", services, state);
+  await executeCommand("/apikey", services, state);
+  assert.match(services.logs.join("\n"), /环境变量 ANTHROPIC_API_KEY 读取密钥/);
+  assert.match(services.logs.join("\n"), /\/apikey <key>/);
+});
+
+test("/apikey failures surface the agent error", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  services.agent = {
+    ...makeAgent(recording),
+    async setApiKey() {
+      throw new Error("请先使用 /provider 选择 provider");
+    }
+  };
+  await executeCommand("/apikey sk-secret", services, { taskNumber: 0 });
+  assert.match(services.logs.join("\n"), /API key 配置失败：请先使用 \/provider 选择 provider/);
+});
+
 test("/thinking validates levels and bare form lists or picks them", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
@@ -182,4 +211,82 @@ test("/status reports worker state and /exit wins over other commands", async ()
   assert.match(services.logs.join("\n"), /模型：未选择；thinking：off/);
   assert.equal(await executeCommand("/exit", services, { taskNumber: 0 }), "exit");
   assert.equal(await executeCommand("/quit", services, { taskNumber: 0 }), "exit");
+});
+
+const testModule: ModuleDefinition = {
+  id: "user-service",
+  path: ".temp/modules/user-service",
+  contextFiles: ["AGENT.md"],
+  allowedPaths: ["src/**"],
+  testCommand: "npm test",
+  contractCommand: "npm run contract-test"
+};
+
+function makeDispatchRecording(): { dispatched: TaskEnvelope[]; supervisor: { dispatch(tasks: TaskEnvelope[]): Promise<WorkerResult[]> } } {
+  const dispatched: TaskEnvelope[] = [];
+  return {
+    dispatched,
+    supervisor: {
+      async dispatch(tasks) {
+        dispatched.push(...tasks);
+        return tasks.map((task) => ({
+          taskId: task.taskId,
+          module: task.module,
+          status: "completed",
+          changedFiles: [],
+          tests: [],
+          risks: [],
+          messages: []
+        }));
+      }
+    }
+  };
+}
+
+test("task dispatch plans through the supervisor agent before delegating", async () => {
+  const recording = { providerConfigs: [], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  const { dispatched, supervisor } = makeDispatchRecording();
+  services.supervisor = supervisor;
+  services.module = testModule;
+  services.agent = {
+    ...makeAgent(recording),
+    async plan(goal: string) {
+      return `1. 拆解 ${goal}`;
+    }
+  };
+  await executeCommand("实现登录", services, { taskNumber: 0 });
+  assert.equal(dispatched.length, 1);
+  assert.match(dispatched[0].goal, /^实现登录/);
+  assert.match(dispatched[0].goal, /Supervisor 规划要点：\n1\. 拆解 实现登录$/);
+  assert.match(services.logs.join("\n"), /supervisor 规划完成，任务已交给 worker/);
+});
+
+test("dispatch falls back to direct delegation when the supervisor model is unavailable", async () => {
+  const recording = { providerConfigs: [], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  const { dispatched, supervisor } = makeDispatchRecording();
+  services.supervisor = supervisor;
+  services.module = testModule;
+  services.agent = {
+    ...makeAgent(recording),
+    async plan() {
+      throw new Error("no model configured");
+    }
+  };
+  await executeCommand("实现登录", services, { taskNumber: 0 });
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].goal, "实现登录");
+  assert.match(services.logs.join("\n"), /supervisor 模型不可用，跳过规划直接派发：no model configured/);
+});
+
+test("dispatch without a planning agent delegates the goal as-is", async () => {
+  const recording = { providerConfigs: [], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  const { dispatched, supervisor } = makeDispatchRecording();
+  services.supervisor = supervisor;
+  services.module = testModule;
+  await executeCommand("实现登录", services, { taskNumber: 0 });
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].goal, "实现登录");
 });

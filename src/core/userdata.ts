@@ -9,8 +9,12 @@ const APP_NAME = "pi-swarm";
  * - win32: %APPDATA%\pi-swarm
  * - darwin: ~/Library/Application Support/pi-swarm
  * - linux and others: $XDG_CONFIG_HOME/pi-swarm, defaulting to ~/.config/pi-swarm
+ *
+ * PI_SWARM_USERDATA overrides everything (used by tests to stay hermetic).
  */
 export function getUserDataDir(): string {
+  const override = process.env.PI_SWARM_USERDATA;
+  if (override) return resolve(override);
   if (process.platform === "win32") {
     return resolve(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), APP_NAME);
   }

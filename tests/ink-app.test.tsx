@@ -4,7 +4,7 @@ import { render } from "ink-testing-library";
 import { createElement } from "react";
 import { InkApp } from "../src/cli/ink-app.tsx";
 import { LogStore } from "../src/cli/log-store.ts";
-import type { ConfigurableModuleWorker } from "../src/core/worker.ts";
+import type { AgentController } from "../src/cli/commands.ts";
 import type { ModelsDevProvider } from "../src/models-dev/catalog.ts";
 import type { TaskEnvelope, WorkerResult } from "../src/protocol/contracts.ts";
 
@@ -29,7 +29,7 @@ interface Recording {
 
 function makeHarness() {
   const recording: Recording = { providerConfigs: [], models: [], thinkingLevels: [] };
-  const worker: ConfigurableModuleWorker = {
+  const agent: AgentController = {
     async configureProvider(providerId: string, config: { api?: string }) {
       recording.providerConfigs.push({ providerId, api: config.api });
       return `provider 已配置，接口：${config.api ?? "默认"}`;
@@ -42,15 +42,12 @@ function makeHarness() {
       recording.thinkingLevels.push(level);
       return `当前 thinking level：${level}`;
     },
-    status: () => "模型：未选择；thinking：off",
-    async run(): Promise<WorkerResult> {
-      throw new Error("not used");
-    }
+    status: () => "模型：未选择；thinking：off"
   };
   const harness = render(
     createElement(InkApp, {
       store: new LogStore(),
-      worker,
+      agent,
       catalog: { load: async () => providers },
       supervisor: {
         async dispatch(tasks: TaskEnvelope[]): Promise<WorkerResult[]> {
@@ -140,6 +137,6 @@ test("/status logs into the static history", async () => {
   await sleep(60);
   harness.stdin.write("\r");
   await sleep(80);
-  assert.ok(harness.lastFrame()?.includes("[主 agent] 模型：未选择；thinking：off"));
+  assert.ok(harness.lastFrame()?.includes("[主 agent] supervisor：模型：未选择；thinking：off"));
   harness.unmount();
 });

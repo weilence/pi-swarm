@@ -50,8 +50,10 @@ See [docs/quick-validation-plan.md](docs/quick-validation-plan.md) and [docs/arc
 npm run start
 ```
 
-它会启动一个 Supervisor 和一个持续复用的 work agent。每行输入一个任务，主 agent
-会把任务交给 work agent。在交互式终端（TTY）下，REPL 由 [Ink](https://github.com/vadimdemes/ink) 渲染：
+它会启动一个 Supervisor、一个接入真实模型的 supervisor agent，以及一个持续复用的
+work agent。每行输入一个任务，supervisor agent 先用真实模型生成执行规划（规划过程
+实时流式输出），再把带规划要点的任务交给 work agent；supervisor 模型不可用（未配置
+或缺少凭据）时自动跳过规划直接派发。在交互式终端（TTY）下，REPL 由 [Ink](https://github.com/vadimdemes/ink) 渲染：
 直接输入 `/provider`、`/model` 或 `/thinking`（不带参数）会弹出选择列表，
 支持 `↑↓` 移动、输入即过滤、`Enter` 确认、`Esc` 取消；`/provider` 选中后还会依次弹出
 接口类型与模型选择。`/status` 查看当前配置；输入 `/exit` 或 `/quit` 才会结束进程。
@@ -59,6 +61,20 @@ npm run start
 `/provider <id> [接口类型]`、`/model <id>`、`/thinking level` 等带参数形式。
 默认使用 `MockPiWorker`（同样支持 provider/模型/thinking 运行时切换，仅不调用真实模型），
 设置 `PI_SWARM_WORKER=pi` 可切换为 `PiSdkWorker`。
+
+`/provider`、`/model`、`/thinking` 配置的是 supervisor agent 的模型（基于 Pi SDK 的
+独立会话，工作目录为仓库根）。参数通过 `ConfigStore` 抽象持久化，当前实现
+`JsonFileConfigStore` 写入用户数据目录下的 `config.json`（原子写入），重启后自动
+恢复——快照中同时保存 models.dev 解析后的 provider 配置，目录缓存缺失时也能离线
+恢复；`/status` 同时显示 supervisor 与 worker 两级状态。用户数据目录可用环境变量
+`PI_SWARM_USERDATA` 重定向到任意路径（单测借此隔离真实用户数据）。work agent 的
+真实模型接入是下一步计划。
+
+模型调用需要 API key，两种方式任选：`/apikey <key>` 直接配置（明文持久化到上述
+`config.json`，日志与 `/status` 中仅显示掩码），或沿用环境变量——provider 配置中的
+`$ENV_VAR` 引用由 Pi 在请求时插值（如 `$ANTHROPIC_API_KEY`，可在 `.env` 或系统环境
+变量中设置）。注意密钥值以 `$` 或 `!` 开头时会被 Pi 当作环境变量引用或命令执行，
+此类密钥请改用环境变量方式。
 
 程序启动时会自动读取项目根目录的 `.env`（已存在的系统环境变量优先）。例如：
 

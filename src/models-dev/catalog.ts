@@ -1,5 +1,5 @@
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { KnownApi } from "@earendil-works/pi-ai";
+import type { KnownApi, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { getApiProviders } from "@earendil-works/pi-ai/compat";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -10,10 +10,18 @@ export type { KnownApi };
 /** API types offered in the picker, derived from Pi's runtime api registry. */
 export const PI_API_TYPES: readonly KnownApi[] = getApiProviders().map((provider) => provider.api as KnownApi);
 
+export interface ModelsDevReasoningOption {
+  type: string;
+  values?: (string | null)[];
+  min?: number;
+  max?: number;
+}
+
 export interface ModelsDevModel {
   id: string;
   name?: string;
   reasoning?: boolean;
+  reasoning_options?: ModelsDevReasoningOption[];
   modalities?: { input?: string[] };
   limit?: { context?: number; output?: number };
   cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
@@ -202,6 +210,40 @@ const NPM_API_RULES: Readonly<Record<string, KnownApi>> = {
 
 const DEFAULT_API: KnownApi = "openai-completions";
 
+/** models.dev effort value → Pi thinking level; "none" means reasoning off. */
+const EFFORT_TO_PI_LEVEL: Readonly<Record<string, keyof ThinkingLevelMap>> = {
+  none: "off",
+  minimal: "minimal",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max"
+};
+
+const PI_THINKING_LEVELS: readonly (keyof ThinkingLevelMap)[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Builds a Pi thinkingLevelMap from models.dev reasoning_options. Effort-style
+ * options pass their provider value through 1:1 (none → off); Pi levels the
+ * model does not list are marked null (unsupported). Toggle- or budget-token-
+ * only models return undefined so Pi provider defaults keep applying.
+ */
+export function toThinkingLevelMap(model: ModelsDevModel): ThinkingLevelMap | undefined {
+  const effort = model.reasoning_options?.find((option) => option.type === "effort");
+  const values = effort?.values ?? [];
+  const map: ThinkingLevelMap = {};
+  for (const value of values) {
+    const level = value === null ? undefined : EFFORT_TO_PI_LEVEL[value];
+    if (level) map[level] = value;
+  }
+  if (Object.keys(map).length === 0) return undefined;
+  for (const level of PI_THINKING_LEVELS) {
+    if (map[level] === undefined) map[level] = null;
+  }
+  return map;
+}
+
 export function inferPiApi(provider: ModelsDevProvider, override?: KnownApi): KnownApi {
   if (override) return override;
   return NPM_API_RULES[provider.npm ?? ""] ?? DEFAULT_API;
@@ -231,6 +273,7 @@ export function toPiProviderConfig(provider: ModelsDevProvider, api?: KnownApi) 
       input: (model.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
       contextWindow: model.limit?.context ?? 128000,
       maxTokens: model.limit?.output ?? 16384,
+      thinkingLevelMap: toThinkingLevelMap(model),
       cost: {
         input: model.cost?.input ?? 0,
         output: model.cost?.output ?? 0,

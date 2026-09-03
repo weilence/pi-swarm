@@ -4,7 +4,56 @@ import { createServer } from "node:http";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelsDevCatalog, inferPiApi, type CatalogUpdateInfo, type ModelsDevProvider } from "../src/models-dev/catalog.ts";
+import { ModelsDevCatalog, inferPiApi, toThinkingLevelMap, toPiProviderConfig, type CatalogUpdateInfo, type ModelsDevProvider } from "../src/models-dev/catalog.ts";
+
+test("toThinkingLevelMap generates a level map from effort reasoning_options", () => {
+  const model = { id: "m", reasoning_options: [{ type: "effort", values: ["none", "low", "high", "max"] }] };
+  assert.deepEqual(toThinkingLevelMap(model), {
+    off: "none",
+    low: "low",
+    high: "high",
+    max: "max",
+    minimal: null,
+    medium: null,
+    xhigh: null
+  });
+});
+
+test("toThinkingLevelMap skips unknown effort values and noise", () => {
+  const model = { id: "m", reasoning_options: [{ type: "effort", values: ["default", null, "medium"] }] };
+  assert.deepEqual(toThinkingLevelMap(model), {
+    medium: "medium",
+    off: null,
+    minimal: null,
+    low: null,
+    high: null,
+    xhigh: null,
+    max: null
+  });
+});
+
+test("toThinkingLevelMap omits the map for toggle, budget-token, and missing options", () => {
+  assert.equal(toThinkingLevelMap({ id: "m", reasoning_options: [{ type: "toggle" }] }), undefined);
+  assert.equal(toThinkingLevelMap({ id: "m", reasoning_options: [{ type: "budget_tokens", min: 1024 }] }), undefined);
+  assert.equal(toThinkingLevelMap({ id: "m", reasoning_options: [{ type: "effort", values: [] }] }), undefined);
+  assert.equal(toThinkingLevelMap({ id: "m" }), undefined);
+});
+
+test("toPiProviderConfig attaches the generated thinking level map to models", () => {
+  const provider: ModelsDevProvider = {
+    id: "zhipuai",
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      "glm-5.3": { id: "glm-5.3", reasoning: true, reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] },
+      "glm-4.6v": { id: "glm-4.6v", reasoning: true, reasoning_options: [{ type: "toggle" }] }
+    }
+  };
+  const config = toPiProviderConfig(provider);
+  const glm53 = config.models.find((model) => model.id === "glm-5.3");
+  const glm46 = config.models.find((model) => model.id === "glm-4.6v");
+  assert.deepEqual(glm53?.thinkingLevelMap, { low: "low", high: "high", max: "max", off: null, minimal: null, medium: null, xhigh: null });
+  assert.equal(glm46?.thinkingLevelMap, undefined);
+});
 
 test("models.dev npm packages map to KnownApi by exact package name", () => {
   const provider = (npm?: string): ModelsDevProvider =>

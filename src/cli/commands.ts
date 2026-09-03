@@ -21,8 +21,23 @@ export interface TaskDispatcher {
   dispatch(tasks: TaskEnvelope[]): Promise<WorkerResult[]>;
 }
 
+/**
+ * Runtime-configurable, model-backed supervisor agent: target of
+ * /provider /model /thinking and of task planning before dispatch.
+ */
+export interface AgentController {
+  configureProvider?(providerId: string, config: unknown, modelId?: string): Promise<string>;
+  setModel?(specifier: string): Promise<string>;
+  setThinkingLevel?(level: string): Promise<string>;
+  setApiKey?(key: string): Promise<string>;
+  status?(): string;
+  /** Real-model planning hook invoked before a task is dispatched. */
+  plan?(goal: string, module: ModuleDefinition): Promise<string>;
+}
+
 export interface CommandServices {
-  worker: ConfigurableModuleWorker;
+  agent?: AgentController;
+  worker?: ConfigurableModuleWorker;
   catalog: ProviderCatalog;
   log: (line: string) => void;
   /** Interactive selection; resolves to undefined when cancelled or unavailable. */
@@ -44,7 +59,10 @@ export async function executeCommand(line: string, services: CommandServices, st
   if (!goal) return "continue";
   if (goal === "/exit" || goal === "/quit") return "exit";
   if (goal === "/status") {
-    services.log(`[主 agent] ${services.worker.status?.() ?? "当前 Worker 不支持运行时状态查询"}`);
+    services.log(`[主 agent] supervisor：${services.agent?.status?.() ?? "状态不可用"}`);
+    if (services.worker) {
+      services.log(`[主 agent] worker：${services.worker.status?.() ?? "当前 Worker 不支持运行时状态查询"}`);
+    }
     return "continue";
   }
   if (goal === "/provider" || goal.startsWith("/provider ")) {
@@ -66,6 +84,10 @@ export async function executeCommand(line: string, services: CommandServices, st
   }
   if (goal.startsWith("/thinking ")) {
     await commandThinking(goal.slice("/thinking ".length), services);
+    return "continue";
+  }
+  if (goal === "/apikey" || goal.startsWith("/apikey ")) {
+    await commandApiKey(goal.slice("/apikey".length).trim(), services, state);
     return "continue";
   }
   await dispatchTask(goal, services, state);
@@ -116,7 +138,7 @@ async function commandProvider(
     }
 
     const config = toPiProviderConfig(provider, api);
-    services.log(`[主 agent] ${await services.worker.configureProvider?.(provider.id, config) ?? "当前 Worker 不支持 provider 配置"}`);
+    services.log(`[主 agent] ${await services.agent?.configureProvider?.(provider.id, config) ?? "当前 supervisor agent 不支持 provider 配置"}`);
     state.selectedProvider = provider;
 
     if (services.interactive) {
@@ -171,16 +193,34 @@ async function applyModel(modelId: string, services: CommandServices, state: Com
       return;
     }
     try {
-      services.log(`[主 agent] ${await services.worker.setModel?.(`${state.selectedProvider.id}/${modelId}`) ?? "当前 Worker 不支持模型切换"}`);
+      services.log(`[主 agent] ${await services.agent?.setModel?.(`${state.selectedProvider.id}/${modelId}`) ?? "当前 supervisor agent 不支持模型切换"}`);
     } catch (error) {
       services.log(`[主 agent] 模型切换失败：${error instanceof Error ? error.message : String(error)}`);
     }
     return;
   }
   try {
-    services.log(`[主 agent] ${await services.worker.setModel?.(modelId) ?? "当前 Worker 不支持运行时模型切换"}`);
+    services.log(`[主 agent] ${await services.agent?.setModel?.(modelId) ?? "当前 supervisor agent 不支持运行时模型切换"}`);
   } catch (error) {
     services.log(`[主 agent] 模型切换失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function commandApiKey(key: string | undefined, services: CommandServices, state: CommandState): Promise<void> {
+  if (!key) {
+    const provider = state.selectedProvider;
+    const envHint = provider?.env?.[0]
+      ? `provider ${provider.id} 默认从环境变量 ${provider.env[0]} 读取密钥；`
+      : provider
+        ? `provider ${provider.id} 在 models.dev 未登记环境变量；`
+        : "";
+    services.log(`[主 agent] ${envHint}用法：/apikey <key>。密钥以明文保存在用户数据目录的 config.json。`);
+    return;
+  }
+  try {
+    services.log(`[主 agent] ${await services.agent?.setApiKey?.(key) ?? "当前 supervisor agent 不支持 API key 配置"}`);
+  } catch (error) {
+    services.log(`[主 agent] API key 配置失败：${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -199,7 +239,7 @@ async function commandThinking(level: string | undefined, services: CommandServi
     }
   }
   try {
-    services.log(`[主 agent] ${await services.worker.setThinkingLevel?.(level) ?? "当前 Worker 不支持运行时 thinking 切换"}`);
+    services.log(`[主 agent] ${await services.agent?.setThinkingLevel?.(level) ?? "当前 supervisor agent 不支持运行时 thinking 切换"}`);
   } catch (error) {
     services.log(`[主 agent] thinking 切换失败：${error instanceof Error ? error.message : String(error)}`);
   }
@@ -211,10 +251,22 @@ async function dispatchTask(goal: string, services: CommandServices, state: Comm
     return;
   }
   state.taskNumber += 1;
+  let effectiveGoal = goal;
+  if (services.agent?.plan) {
+    try {
+      const plan = await services.agent.plan(goal, services.module);
+      if (plan) {
+        services.log("[主 agent] supervisor 规划完成，任务已交给 worker。");
+        effectiveGoal = `${goal}\n\nSupervisor 规划要点：\n${plan}`;
+      }
+    } catch (error) {
+      services.log(`[主 agent] supervisor 模型不可用，跳过规划直接派发：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   const task: TaskEnvelope = {
     taskId: `T-${String(state.taskNumber).padStart(3, "0")}`,
     module: services.module.id,
-    goal,
+    goal: effectiveGoal,
     workingDirectory: services.module.path,
     contextFiles: services.module.contextFiles,
     allowedPaths: services.module.allowedPaths,
