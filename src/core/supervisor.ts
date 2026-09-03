@@ -1,56 +1,63 @@
 import { EventBus } from "./event-bus.ts";
-import { ModuleRegistry } from "./module-registry.ts";
-import type { StatefulModuleWorker } from "./worker.ts";
-import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.ts";
+import type { StepRequest, StepResult } from "../protocol/contracts.ts";
 
+/** Anything that can execute a step: today the Pi-backed SubAgent. */
+export interface StepRunner {
+  run(request: StepRequest): Promise<StepResult>;
+  close?(): Promise<void> | void;
+}
+
+/**
+ * Thin dispatcher over lazily resolved agent runners: runs each step's agent
+ * session in parallel and publishes task lifecycle events. Routing decisions
+ * (which agent, or supervisor self-execution) live in the Orchestrator.
+ */
 export class Supervisor {
+  private readonly runners = new Map<string, StepRunner>();
+
   public constructor(
-    private readonly registry: ModuleRegistry,
-    private readonly workers: Map<string, StatefulModuleWorker>,
+    private readonly resolveRunner: (agent: string) => StepRunner,
     private readonly events: EventBus
   ) {}
 
-  public async start(): Promise<void> {
-    await Promise.all([...this.workers.values()].map((worker) => worker.start?.()));
-  }
-
-  public async close(): Promise<void> {
-    await Promise.all([...this.workers.values()].map((worker) => worker.close?.()));
-  }
-
-  public async dispatch(tasks: TaskEnvelope[]): Promise<WorkerResult[]> {
-    for (const task of tasks) {
-      this.registry.get(task.module);
-      if (!this.workers.has(task.module)) {
-        throw new Error(`No worker registered for module: ${task.module}`);
-      }
-    }
-
-    const results = await Promise.all(
-      tasks.map(async (task) => {
+  public async dispatch(requests: StepRequest[]): Promise<StepResult[]> {
+    const resolved = requests.map((request) => ({ request, runner: this.runnerFor(request.agent) }));
+    return await Promise.all(
+      resolved.map(async ({ request, runner }) => {
         this.events.publish({
-          eventId: `${task.taskId}:started`,
-          taskId: task.taskId,
+          eventId: `${request.taskId}:started`,
+          taskId: request.taskId,
           type: "task.started",
-          sourceModule: task.module,
-          targetModules: task.relatedModules,
-          summary: task.goal,
+          source: request.agent,
+          target: [],
+          summary: request.goal,
           artifacts: []
         });
-        const result = await this.workers.get(task.module)!.run(task);
+        const result = await runner.run(request);
         this.events.publish({
-          eventId: `${task.taskId}:completed`,
-          taskId: task.taskId,
+          eventId: `${request.taskId}:completed`,
+          taskId: request.taskId,
           type: result.status === "completed" ? "task.completed" : "task.blocked",
-          sourceModule: task.module,
-          targetModules: task.relatedModules,
+          source: request.agent,
+          target: [],
           summary: `${result.status}; ${result.changedFiles.length} file(s) changed`,
           artifacts: result.changedFiles
         });
         return result;
       })
     );
+  }
 
-    return results;
+  private runnerFor(agent: string): StepRunner {
+    const existing = this.runners.get(agent);
+    if (existing) return existing;
+    const runner = this.resolveRunner(agent);
+    this.runners.set(agent, runner);
+    return runner;
+  }
+
+  public async close(): Promise<void> {
+    await Promise.all([...this.runners.values()].map((runner) => runner.close?.()));
+    this.runners.clear();
   }
 }

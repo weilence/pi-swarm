@@ -1,6 +1,6 @@
 import { join } from "node:path";
-import { THINKING_LEVELS } from "../core/worker.ts";
-import type { ModuleDefinition, WorkerResult } from "../protocol/contracts.ts";
+import { THINKING_LEVELS } from "../core/thinking.ts";
+import type { StepResult } from "../protocol/contracts.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
 import { buildMatchPrompt, parseMatchReply } from "../core/agent-dispatch.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-store.ts";
@@ -26,6 +26,12 @@ export interface SupervisorAgentOptions {
   cwd?: string;
   /** Pi agent directory; defaults to a folder under the user data dir to keep the repo clean. */
   agentDir?: string;
+  /**
+   * Shared ModelRuntime: providers registered via /provider become visible to
+   * the supervisor session and every sub-agent session. Created lazily when
+   * omitted; main.ts shares one instance across all sessions.
+   */
+  modelRuntime?: ModelRuntime;
   /** Streams assistant text; defaults to plain stdout. */
   onText?: (delta: string) => void;
   /** Streams reasoning/thinking deltas; defaults to dimmed stdout. */
@@ -62,10 +68,16 @@ export class SupervisorAgent {
   public constructor(options: SupervisorAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
     this.agentDir = options.agentDir ?? join(getUserDataDir(), "supervisor-agent");
+    this.modelRuntime = options.modelRuntime;
     this.onText = options.onText ?? ((delta) => process.stdout.write(delta));
     this.onThinking = options.onThinking ?? ((delta) => process.stdout.write(dim(delta)));
     this.onStreamEnd = options.onStreamEnd;
     this.configStore = options.configStore;
+  }
+
+  /** Current global default model (provider/model) as configured via /model. */
+  public get currentModel(): string | undefined {
+    return this.requestedModel;
   }
 
   /** Applies a previously persisted snapshot; returns a human-readable summary. */
@@ -107,15 +119,15 @@ export class SupervisorAgent {
   private async ensureSession(): Promise<AgentSession> {
     if (this.session) return this.session;
 
-    this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    this.modelRuntime ??= await ModelRuntime.create({ refreshOnCreate: false });
     if (this.providerConfig) this.modelRuntime.registerProvider(this.providerId, this.providerConfig);
     const resourceLoader = new DefaultResourceLoader({
       cwd: this.cwd,
       agentDir: this.agentDir,
       appendSystemPromptOverride: (base) => [
         ...base,
-        "You are the pi-swarm Supervisor agent coordinating module workers.",
-        "You plan and delegate; you do not edit module files yourself. Keep plans concise and actionable."
+        "You are the pi-swarm Supervisor agent coordinating user-defined sub-agents.",
+        "You plan, delegate, and answer; keep plans concise and actionable."
       ]
     });
     await resourceLoader.reload();
@@ -164,24 +176,25 @@ export class SupervisorAgent {
     }
   }
 
-  private moduleBriefing(modules: ModuleDefinition[]): string {
-    return modules
-      .map((module) => {
-        const tests = [module.testCommand, module.contractCommand].filter(Boolean).join(", ") || "无";
-        return `- ${module.id}（目录 ${module.path}；上下文：${module.contextFiles.join(", ") || "无"}；可改：${module.allowedPaths.join(", ") || "无"}；测试：${tests}）`;
+  private agentBriefing(agents: AgentDefinition[]): string {
+    if (agents.length === 0) return "（当前没有注册任何子 agent，所有步骤由你自行执行。）";
+    return agents
+      .map((agent) => {
+        const capabilities = agent.capabilities.length > 0 ? `；能力：${agent.capabilities.join("、")}` : "";
+        return `- ${agent.name}：${agent.description}${capabilities}`;
       })
       .join("\n");
   }
 
   /** Classifies the user input: simple, complex, or unclear with questions. */
-  public async analyzeIntent(input: string, modules: ModuleDefinition[], clarifications?: string): Promise<IntentAnalysis> {
+  public async analyzeIntent(input: string, agents: AgentDefinition[], clarifications?: string): Promise<IntentAnalysis> {
     const reply = await this.promptModel(
       [
         "你是 pi-swarm Supervisor 的意图分析器。分析用户输入并判定任务类型。",
-        `可用模块：\n${this.moduleBriefing(modules)}`,
+        `可用子 agent：\n${this.agentBriefing(agents)}`,
         `用户输入：「${input}」`,
         ...(clarifications ? [`用户已补充的信息：「${clarifications}」`] : []),
-        "判定标准：simple=一步即可完成且无歧义；complex=需要多个步骤或多个模块协作；unclear=缺少关键决策或信息，无法安全开始。",
+        "判定标准：simple=一步即可完成且无歧义；complex=需要多个步骤或多个 agent 协作；unclear=缺少关键决策或信息，无法安全开始。",
         '仅输出 JSON，不要输出其他内容：{"clarity":"simple|complex|unclear","task":"提炼后的任务描述（吸收补充信息）","questions":["仅 unclear 时：需要用户确认的问题"]}'
       ].join("\n")
     );
@@ -190,16 +203,16 @@ export class SupervisorAgent {
     return analysis;
   }
 
-  /** Splits a clear task into dependency-ordered steps for module workers. */
-  public async planSteps(goal: string, modules: ModuleDefinition[], clarifications?: string): Promise<PlannedStep[]> {
+  /** Splits a clear task into dependency-ordered steps for sub-agents. */
+  public async planSteps(goal: string, agents: AgentDefinition[], clarifications?: string): Promise<PlannedStep[]> {
     const reply = await this.promptModel(
       [
-        "你是 pi-swarm Supervisor 的规划器。把任务拆成模块 worker 可执行的步骤。",
+        "你是 pi-swarm Supervisor 的规划器。把任务拆成可执行的步骤。",
         `任务：${goal}`,
         ...(clarifications ? [`用户补充信息：${clarifications}`] : []),
-        `可用模块（module 只能取以下 id）：\n${this.moduleBriefing(modules)}`,
+        `可用子 agent（agent 只能取以下 name，留空则由运行时匹配或你自行执行）：\n${this.agentBriefing(agents)}`,
         "要求：步骤不超过 6 个；每个步骤目标具体、可独立验收；无依赖关系的步骤不要设置 dependsOn，它们会并行执行。",
-        '仅输出 JSON：{"steps":[{"id":"s1","module":"<模块id>","goal":"步骤目标","dependsOn":["前置步骤id"]}]}'
+        '仅输出 JSON：{"steps":[{"id":"s1","agent":"<agent name 或空>","goal":"步骤目标","dependsOn":["前置步骤id"]}]}'
       ].join("\n")
     );
     const steps = parsePlannedSteps(extractJson(reply));
@@ -216,7 +229,7 @@ export class SupervisorAgent {
   }
 
   /** Self-execution path: runs the step in the supervisor's own session. */
-  public async executeTask(step: { id: string; goal: string }): Promise<WorkerResult> {
+  public async executeTask(step: { id: string; goal: string }): Promise<StepResult> {
     await this.promptModel(
       [
         "你是 pi-swarm Supervisor，当前没有匹配的子 agent，请直接执行该步骤并汇报结果。",
@@ -226,7 +239,7 @@ export class SupervisorAgent {
     );
     return {
       taskId: step.id,
-      module: "supervisor",
+      agent: "supervisor",
       status: "completed",
       changedFiles: [],
       tests: [],
@@ -245,7 +258,7 @@ export class SupervisorAgent {
         JSON.stringify(
           outcomes.map(({ step, result, error }) => ({
             step: step.id,
-            module: step.module,
+            agent: result?.agent ?? step.agent ?? "supervisor",
             goal: step.goal,
             status: error ? "failed" : (result?.status ?? "unknown"),
             changedFiles: result?.changedFiles ?? [],
@@ -269,9 +282,9 @@ export class SupervisorAgent {
     }
     const specifier = modelId ? `${providerId}/${modelId}` : undefined;
     if (specifier) this.requestedModel = specifier;
-    if (this.session) {
-      this.modelRuntime!.registerProvider(providerId, this.providerConfig);
-      if (specifier) await this.applyModel(specifier);
+    if (this.modelRuntime) {
+      this.modelRuntime.registerProvider(providerId, this.providerConfig);
+      if (specifier && this.session) await this.applyModel(specifier);
     }
     const update: Partial<AgentConfigSnapshot> = { providerId, providerConfig: config };
     if (specifier) update.model = specifier;

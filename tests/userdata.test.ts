@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { getUserDataDir, moduleRegistryFile } from "../src/core/userdata.ts";
+import { getUserDataDir } from "../src/core/userdata.ts";
 
 test("PI_SWARM_USERDATA overrides the platform user data dir", () => {
   const previous = process.env.PI_SWARM_USERDATA;
@@ -10,7 +10,6 @@ test("PI_SWARM_USERDATA overrides the platform user data dir", () => {
     const override = join(tmpdir(), "userdata-override-test");
     process.env.PI_SWARM_USERDATA = override;
     assert.equal(getUserDataDir(), resolve(override));
-    assert.equal(moduleRegistryFile(), join(resolve(override), "module-registry.json"));
   } finally {
     if (previous === undefined) delete process.env.PI_SWARM_USERDATA;
     else process.env.PI_SWARM_USERDATA = previous;

@@ -38,28 +38,33 @@ tags: [review]               # 可选，分组标签
 
 ## 任务分发流程
 
-1. 意图分析 → 规划步骤（`src/core/orchestrator.ts`）。
-2. 每个步骤路由（`routeStep`）：
-   - 步骤指定了已注册模块 → 走模块 worker（向后兼容旧流程）；
+1. 意图分析 → 规划步骤（`src/core/orchestrator.ts`）。规划提示词会列出全部已注册 agent，planner 可直接为步骤指定 `agent`。
+2. 每个步骤路由（`routeStep`），规则唯一：
+   - planner 指定的 agent 已注册 → 直用（省一次匹配调用）；
    - 否则把步骤目标 + 各 agent 的 description/capabilities 交给 LLM 匹配（`src/core/agent-dispatch.ts`）；
-   - 匹配到 agent → 以该 agent 名义派发（PiSdkWorker 会注入 agent 的 system prompt）；
+   - 匹配到 agent → 派发给该 agent 的 `SubAgent` 会话（懒创建、长驻复用，注入 agent 的 system prompt）；
    - 无匹配 / 注册表为空 / 匹配输出非法 → **Supervisor 自执行**（`SupervisorAgent.executeTask`，在主会话中流式完成）。
 
+supervisor 会话与所有 SubAgent 会话共享同一个 `ModelRuntime`：`/provider`、`/model`、`/apikey`
+配置的是全局默认模型，注册一次对全部会话生效；会话之间互相隔离。
 匹配提示词要求 LLM 仅输出 `{"agent": "<name>" | null}`，解析失败一律降级为自执行，永不阻塞任务。
+frontmatter 的 `model:`、`tools:` 为预留字段，当前未生效。
 
 ## 实现落点
 
 - `src/core/agent-format.ts` — 定义解析与校验（parser/validator）
 - `src/core/agent-registry.ts` — 双目录注册表（项目覆盖全局、损坏容错、list/get）
 - `src/core/agent-dispatch.ts` — 匹配提示词构建、回复解析、降级决策
+- `src/core/orchestrator.ts` — 意图分析/澄清/规划/分层并发/总结的编排与路由
 - `src/pi/supervisor-agent.ts` — `matchAgent`（LLM 匹配）与 `executeTask`（自执行）
-- `src/cli/main.ts` — 启动时加载 agent 注册表并创建各 agent 的 worker
+- `src/pi/sub-agent.ts` — `SubAgent`：按定义懒创建的 Pi 会话执行器
+- `src/cli/main.ts` — 启动时加载 agent 注册表，按需懒创建 SubAgent
 - 示例：`.pi-swarm/agents/code-reviewer.md`、`.pi-swarm/agents/test-writer.md`
-- 测试：`tests/agent-format.test.ts`、`tests/agent-registry.test.ts`、`tests/agent-dispatch.test.ts`
+- 测试：`tests/agent-format.test.ts`、`tests/agent-registry.test.ts`、`tests/agent-dispatch.test.ts`、`tests/orchestrator.test.ts`
 
 ## 端到端冒烟记录（2025-09-03）
 
-- 全新用户数据目录启动 CLI：0 个预置 agent，回退 supervisor 模块，正常进入 REPL ✅
+- 全新用户数据目录启动 CLI：0 个预置 agent，所有步骤由 supervisor 自执行，正常进入 REPL ✅
 - 注册表加载项目内 2 个示例 agent（code-reviewer、test-writer）✅
 - `dispatchTask("审查这个 PR 的改动", agents, matcher)`（LLM 以脚本回执模拟）→ `{mode: "agent", agent: code-reviewer}` ✅
 - 同注册表对“帮我订咖啡”类任务返回 `{"agent": null}` → `{mode: "supervisor"}` ✅

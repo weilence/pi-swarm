@@ -23,8 +23,3 @@ export function getUserDataDir(): string {
   }
   return resolve(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), APP_NAME);
 }
-
-/** Location of the module registry shared by the CLI entrypoints. */
-export function moduleRegistryFile(): string {
-  return join(getUserDataDir(), "module-registry.json");
-}

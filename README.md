@@ -1,10 +1,10 @@
 # pi-swarm
 
-> Prototype: a pure Node.js/TypeScript Supervisor that dispatches focused module Workers built around Pi SDK.
+> Prototype: a Node.js/TypeScript Supervisor that orchestrates user-defined sub-agents built around Pi SDK.
 
 This repository is intentionally a small, throwaway validation scaffold. It answers one question:
 
-> Can one Supervisor coordinate multiple module-specific Pi Workers, exchange structured events, and finish with an integration gate?
+> Can one Supervisor coordinate user-defined sub-agents, exchange structured events, and finish with a streamed summary?
 
 ## Run
 
@@ -14,9 +14,7 @@ npm run typecheck
 npm run start
 ```
 
-`npm run start` uses `MockPiWorker` by default so it runs without model credentials. `PiSdkWorker` is wired to the pinned `@earendil-works/pi-coding-agent` package and is ready for a credentialed smoke test.
-
-The project ships with **zero pre-provisioned sub-agents**. Sub-agents are user-created Markdown definitions (YAML frontmatter + system-prompt body) loaded at startup from a global directory (`<user data>/pi-swarm/agents`) and a project directory (`.pi-swarm/agents`, project wins on name conflicts). The Supervisor's LLM routes each planned step to the best-matching agent, or executes the step itself when nothing fits — see `docs/agents.md`. Two sample agents live in `.pi-swarm/agents/` (`code-reviewer`, `test-writer`). The legacy module registry remains supported for code-module workflows but is optional now.
+`npm run start` boots a single-session REPL by default; with no model configured it degrades gracefully (every step is attempted and reported). Sub-agents are user-created Markdown definitions (YAML frontmatter + system-prompt body) loaded at startup from a global directory (`<user data>/pi-swarm/agents`) and a project directory (`.pi-swarm/agents`, project wins on name conflicts). The Supervisor's LLM routes each planned step to the best-matching agent, or executes the step itself when nothing fits — see `docs/agents.md`. Two sample agents live in `.pi-swarm/agents/` (`code-reviewer`, `test-writer`).
 
 ## Planned architecture
 
@@ -37,8 +35,8 @@ Each user-created agent owns its own system prompt and tool grants. The Supervis
 
 - No LangGraph or other orchestration framework.
 - No production database, message broker, web UI, or automatic merge.
-- No hidden long-term memory: durable module knowledge belongs in versioned files.
-- Pi SDK integration is isolated in `src/pi/pi-sdk-worker.ts`.
+- No hidden long-term memory: durable knowledge belongs in versioned files.
+- Pi SDK integration is isolated in `src/pi/` (SupervisorAgent + SubAgent on one shared ModelRuntime).
 
 See [docs/quick-validation-plan.md](docs/quick-validation-plan.md) and [docs/architecture.md](docs/architecture.md).
 
@@ -50,34 +48,34 @@ See [docs/quick-validation-plan.md](docs/quick-validation-plan.md) and [docs/arc
 npm run start
 ```
 
-它会启动一个 Supervisor、一个接入真实模型的 supervisor agent，以及每个模块一个
-持续复用的 work agent。用户输入先经 supervisor 模型做**意图分析**（静默）：
+它会启动一个 Supervisor（接入真实模型的 supervisor 会话）和一个子 agent 池（懒创建，
+每个 agent 首次被路由到时建立长驻会话）。用户输入先经 supervisor 模型做**意图分析**（静默）：
 
-- **简单任务**：提炼目标后直接派发给模块 worker；
+- **简单任务**：提炼目标后直接进入路由；
 - **不明确任务**：向用户提问收集关键决策（交互模式下 REPL 中作答，一轮为限；
   非交互模式按现有信息继续），随后重新分析；
 - **复杂任务**：规划器拆分步骤并标注依赖（JSON 结构化输出），按依赖分层
-  **并发执行**（同层任务由 Supervisor 并行派发，前序步骤结果自动注入后续步骤）。
+  **并发执行**（同层任务并行派发，前序步骤结果自动注入后续步骤）。
 
+每个步骤的路由规则唯一：planner 指定的 agent 已注册则直用 → 否则运行时 LLM 匹配
+（`agent-dispatch`）→ 无匹配/注册表为空/匹配失败 → **supervisor 自执行**。
 所有步骤完成后，supervisor 用**流式 markdown** 输出总结（变更、风险、后续建议）。
-模型不可用或结构化输出解析失败时逐级降级为直接派发。在交互式终端（TTY）下，REPL 由
-Pi 同源的 [pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Markdown 按块流式渲染、
-多行编辑器带历史记录、模型输出与思考流分色显示、执行中可弹出澄清提问）：
+模型不可用或结构化输出解析失败时逐级降级，不阻塞基本可用性。在交互式终端（TTY）下，
+REPL 由 Pi 同源的 [pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Markdown 按块
+流式渲染、多行编辑器带历史记录、模型输出与思考流分色显示、执行中可弹出澄清提问）：
 直接输入 `/provider`、`/model` 或 `/thinking`（不带参数）会弹出选择列表，
 支持 `↑↓` 移动、输入即模糊过滤、`Enter` 确认、`Esc` 取消；`/provider` 选中后还会依次弹出
-接口类型与模型选择。`/status` 查看当前配置；输入 `/exit` 或 `/quit` 才会结束进程。
+接口类型与模型选择。`/status` 查看当前配置与已加载 agent；输入 `/exit` 或 `/quit` 才会结束进程。
 非交互环境（管道/CI）自动回退到纯文本模式，此时可用
 `/provider <id> [接口类型]`、`/model <id>`、`/thinking level` 等带参数形式。
-默认使用 `MockPiWorker`（同样支持 provider/模型/thinking 运行时切换，仅不调用真实模型），
-设置 `PI_SWARM_WORKER=pi` 可切换为 `PiSdkWorker`。
 
-`/provider`、`/model`、`/thinking` 配置的是 supervisor agent 的模型（基于 Pi SDK 的
-独立会话，工作目录为仓库根）。参数通过 `ConfigStore` 抽象持久化，当前实现
+`/provider`、`/model`、`/thinking`、`/apikey` 配置的是**全局默认模型**：supervisor 会话与
+所有子 agent 会话共享同一个 `ModelRuntime`，注册一次全部生效（子 agent 会话本身互相隔离，
+懒创建时自动套用当前默认模型）。参数通过 `ConfigStore` 抽象持久化，当前实现
 `JsonFileConfigStore` 写入用户数据目录下的 `config.json`（原子写入），重启后自动
 恢复——快照中同时保存 models.dev 解析后的 provider 配置，目录缓存缺失时也能离线
-恢复；`/status` 同时显示 supervisor 与 worker 两级状态。用户数据目录可用环境变量
-`PI_SWARM_USERDATA` 重定向到任意路径（单测借此隔离真实用户数据）。work agent 的
-真实模型接入是下一步计划。
+恢复。用户数据目录可用环境变量 `PI_SWARM_USERDATA` 重定向到任意路径（单测借此
+隔离真实用户数据）。
 
 模型调用需要 API key，两种方式任选：`/apikey <key>` 直接配置（明文持久化到上述
 `config.json`，日志与 `/status` 中仅显示掩码），或沿用环境变量——provider 配置中的
@@ -89,7 +87,7 @@ Pi 同源的 [pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Markdown 按
 
 ```powershell
 Copy-Item .env.example .env
-# 编辑 .env，设置 PI_SWARM_WORKER=pi 和 OPENAI_API_KEY/ANTHROPIC_API_KEY 等
+# 编辑 .env，设置 OPENAI_API_KEY/ANTHROPIC_API_KEY 等，或启动后用 /apikey <key>
 npm run start
 ```
 

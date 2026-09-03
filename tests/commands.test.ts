@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { executeCommand, type AgentController, type CommandServices, type CommandState } from "../src/cli/commands.ts";
-import { THINKING_LEVELS } from "../src/core/worker.ts";
+import { THINKING_LEVELS } from "../src/core/thinking.ts";
 import type { ModelsDevProvider } from "../src/cli/../models-dev/catalog.ts";
-import type { ModuleDefinition, TaskEnvelope, WorkerResult } from "../src/protocol/contracts.ts";
+import type { StepResult } from "../src/protocol/contracts.ts";
 
 function makeProviders(): ModelsDevProvider[] {
   return [
@@ -90,7 +90,7 @@ test("bare /provider in non-interactive mode lists providers", async () => {
   assert.match(services.logs.join("\n"), /providers：anthropic \(Anthropic\), openai \(OpenAI\)/);
 });
 
-test("/provider <id> configures the worker and lists models", async () => {
+test("/provider <id> configures the agent and lists models", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
   await executeCommand("/provider anthropic", services, {});
@@ -207,7 +207,7 @@ test("/thinking validates levels and bare form lists or picks them", async () =>
   assert.deepEqual(recording.thinkingLevels, ["high", "xhigh"]);
 });
 
-test("/status reports worker state and /exit wins over other commands", async () => {
+test("/status reports supervisor state and /exit wins over other commands", async () => {
   const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
   assert.equal(await executeCommand("/status", services, {}), "continue");
   assert.match(services.logs.join("\n"), /模型：未选择；thinking：off/);
@@ -215,49 +215,40 @@ test("/status reports worker state and /exit wins over other commands", async ()
   assert.equal(await executeCommand("/quit", services, {}), "exit");
 });
 
-const testModule: ModuleDefinition = {
-  id: "user-service",
-  path: ".temp/modules/user-service",
-  contextFiles: ["AGENT.md"],
-  allowedPaths: ["src/**"],
-  testCommand: "npm test",
-  contractCommand: "npm run contract-test"
-};
+const noAgents = { list: () => [] };
 
-function makeDispatchRecording(): { dispatched: TaskEnvelope[]; supervisor: { dispatch(tasks: TaskEnvelope[]): Promise<WorkerResult[]> } } {
-  const dispatched: TaskEnvelope[] = [];
+function makeSelfExecute(): { selfExecuted: { id: string; goal: string }[]; selfExecute: (step: { id: string; goal: string }) => Promise<StepResult> } {
+  const selfExecuted: { id: string; goal: string }[] = [];
   return {
-    dispatched,
-    supervisor: {
-      async dispatch(tasks) {
-        dispatched.push(...tasks);
-        return tasks.map((task) => ({
-          taskId: task.taskId,
-          module: task.module,
-          status: "completed",
-          changedFiles: [],
-          tests: [],
-          risks: [],
-          messages: []
-        }));
-      }
+    selfExecuted,
+    selfExecute: async (step) => {
+      selfExecuted.push({ id: step.id, goal: step.goal });
+      return {
+        taskId: step.id,
+        agent: "supervisor",
+        status: "completed",
+        changedFiles: [],
+        tests: [],
+        risks: [],
+        messages: []
+      };
     }
   };
 }
 
-test("simple intents dispatch one condensed task and stream a summary", async () => {
+test("simple intents execute one condensed step and stream a summary", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  const { dispatched, supervisor } = makeDispatchRecording();
-  services.supervisor = supervisor;
-  services.module = testModule;
-  services.modules = [testModule];
+  services.supervisor = { async dispatch() { return []; } };
+  services.agents = noAgents;
+  const self = makeSelfExecute();
+  services.selfExecute = self.selfExecute;
   const summarized: string[] = [];
   let planned = 0;
   services.agent = {
     ...makeAgent(recording),
     async analyzeIntent() {
-      return { clarity: "simple", task: "在 user-service 实现登录", questions: [] };
+      return { clarity: "simple", task: "提炼后的登录任务", questions: [] };
     },
     async planSteps() {
       planned += 1;
@@ -268,20 +259,19 @@ test("simple intents dispatch one condensed task and stream a summary", async ()
     }
   };
   await executeCommand("实现登录", services, {});
-  assert.equal(dispatched.length, 1);
-  assert.equal(dispatched[0].goal, "在 user-service 实现登录");
+  assert.deepEqual(self.selfExecuted, [{ id: "s1", goal: "提炼后的登录任务" }]);
   assert.equal(planned, 0, "simple intents skip planning");
   assert.deepEqual(summarized, ["实现登录"]);
   assert.match(services.logs.join("\n"), /意图分析：简单任务，直接执行/);
 });
 
-test("analysis failure falls back to direct delegation", async () => {
+test("analysis failure falls back to direct self-execution", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  const { dispatched, supervisor } = makeDispatchRecording();
-  services.supervisor = supervisor;
-  services.module = testModule;
-  services.modules = [testModule];
+  services.supervisor = { async dispatch() { return []; } };
+  services.agents = noAgents;
+  const self = makeSelfExecute();
+  services.selfExecute = self.selfExecute;
   services.agent = {
     ...makeAgent(recording),
     async analyzeIntent() {
@@ -289,21 +279,36 @@ test("analysis failure falls back to direct delegation", async () => {
     }
   };
   await executeCommand("实现登录", services, {});
-  assert.equal(dispatched.length, 1);
-  assert.equal(dispatched[0].goal, "实现登录");
-  assert.match(services.logs.join("\n"), /supervisor 模型不可用，跳过意图分析直接派发：no model configured/);
+  assert.deepEqual(self.selfExecuted.map((step) => step.goal), ["实现登录"]);
+  assert.match(services.logs.join("\n"), /supervisor 模型不可用，跳过意图分析直接执行：no model configured/);
 });
 
-test("dispatch without an agent delegates the goal as-is", async () => {
+test("dispatch without an agent brain self-executes the goal as-is", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  const { dispatched, supervisor } = makeDispatchRecording();
-  services.supervisor = supervisor;
-  services.module = testModule;
-  services.modules = [testModule];
+  services.supervisor = { async dispatch() { return []; } };
+  services.agents = noAgents;
+  const self = makeSelfExecute();
+  services.selfExecute = self.selfExecute;
   await executeCommand("实现登录", services, {});
-  assert.equal(dispatched.length, 1);
-  assert.equal(dispatched[0].goal, "实现登录");
+  assert.deepEqual(self.selfExecuted.map((step) => step.goal), ["实现登录"]);
+});
+
+test("/status lists the loaded agents", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  services.agents = {
+    list: () => [
+      { name: "code-reviewer", description: "d", capabilities: [], tools: [], tags: [], systemPrompt: "s", sourceFile: "a.md" }
+    ]
+  };
+  await executeCommand("/status", services, {});
+  assert.match(services.logs.join("\n"), /已加载 agents：code-reviewer/);
+
+  const empty = makeServices(recording);
+  empty.agents = noAgents;
+  await executeCommand("/status", empty, {});
+  assert.match(empty.logs.join("\n"), /未加载任何子 agent，所有任务由 supervisor 自执行/);
 });
 
 test("deprecated models are hidden and badges annotate the model listings", async () => {

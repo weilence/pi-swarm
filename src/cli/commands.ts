@@ -1,8 +1,7 @@
-import { THINKING_LEVELS } from "../core/worker.ts";
-import type { ConfigurableModuleWorker } from "../core/worker.ts";
-import type { ModuleDefinition, WorkerResult } from "../protocol/contracts.ts";
+import { THINKING_LEVELS } from "../core/thinking.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
-import { Orchestrator, type AgentBrain, type PlannedStep, type TaskDispatcher } from "../core/orchestrator.ts";
+import { Orchestrator, type AgentBrain, type TaskDispatcher } from "../core/orchestrator.ts";
+import type { StepResult } from "../protocol/contracts.ts";
 import {
   PI_API_TYPES,
   inferPiApi,
@@ -39,7 +38,6 @@ export interface AgentController extends AgentBrain {
 
 export interface CommandServices {
   agent?: AgentController;
-  worker?: ConfigurableModuleWorker;
   catalog: ProviderCatalog;
   log: (line: string) => void;
   /** Interactive selection; resolves to undefined when cancelled or unavailable. */
@@ -48,13 +46,10 @@ export interface CommandServices {
   askUser?: (question: string) => Promise<string>;
   interactive: boolean;
   supervisor?: TaskDispatcher;
-  module?: ModuleDefinition;
-  /** All registered modules offered to intent analysis and planning. */
-  modules?: ModuleDefinition[];
   /** User-created agents available for dynamic routing. */
   agents?: { list(): AgentDefinition[] };
   /** Supervisor self-execution path when no agent matches a step. */
-  selfExecute?: (step: PlannedStep) => Promise<WorkerResult>;
+  selfExecute?: (step: { id: string; goal: string }) => Promise<StepResult>;
 }
 
 export interface CommandState {
@@ -70,9 +65,12 @@ export async function executeCommand(line: string, services: CommandServices, st
   if (goal === "/exit" || goal === "/quit") return "exit";
   if (goal === "/status") {
     services.log(`[主 agent] supervisor：${services.agent?.status?.() ?? "状态不可用"}`);
-    if (services.worker) {
-      services.log(`[主 agent] worker：${services.worker.status?.() ?? "当前 Worker 不支持运行时状态查询"}`);
-    }
+    const agents = services.agents?.list() ?? [];
+    services.log(
+      agents.length > 0
+        ? `[主 agent] 已加载 agents：${agents.map((agent) => agent.name).join(", ")}`
+        : "[主 agent] 未加载任何子 agent，所有任务由 supervisor 自执行。"
+    );
     return "continue";
   }
   if (goal === "/provider" || goal.startsWith("/provider ")) {
@@ -290,15 +288,13 @@ async function commandThinking(level: string | undefined, services: CommandServi
 }
 
 async function dispatchTask(goal: string, services: CommandServices, _state: CommandState): Promise<void> {
-  if (!services.supervisor || !services.module || !services.modules) {
+  if (!services.supervisor || !services.agents || !services.selfExecute) {
     services.log("[主 agent] 任务派发未配置。");
     return;
   }
   const orchestrator = new Orchestrator({
     agent: services.agent,
     supervisor: services.supervisor,
-    modules: services.modules,
-    defaultModule: services.module.id,
     agents: services.agents,
     selfExecute: services.selfExecute,
     askUser: services.askUser,

@@ -1,25 +1,3 @@
-export type ModuleId = string;
-
-export interface ModuleDefinition {
-  id: ModuleId;
-  path: string;
-  contextFiles: string[];
-  allowedPaths: string[];
-  testCommand: string;
-  contractCommand: string;
-}
-
-export interface TaskEnvelope {
-  taskId: string;
-  module: ModuleId;
-  goal: string;
-  workingDirectory: string;
-  contextFiles: string[];
-  allowedPaths: string[];
-  relatedModules: ModuleId[];
-  requiredTests: string[];
-}
-
 export type EventType =
   | "task.started"
   | "task.completed"
@@ -32,8 +10,9 @@ export interface EventEnvelope {
   eventId: string;
   taskId: string;
   type: EventType;
-  sourceModule: ModuleId;
-  targetModules: ModuleId[];
+  /** Agent name that produced the event. */
+  source: string;
+  target: string[];
   summary: string;
   artifacts: string[];
 }
@@ -44,9 +23,17 @@ export interface TestResult {
   output?: string;
 }
 
-export interface WorkerResult {
+/** One planned step handed to an agent session for execution. */
+export interface StepRequest {
   taskId: string;
-  module: ModuleId;
+  /** Agent name; "supervisor" marks supervisor self-execution. */
+  agent: string;
+  goal: string;
+}
+
+export interface StepResult {
+  taskId: string;
+  agent: string;
   status: "completed" | "blocked" | "failed";
   changedFiles: string[];
   tests: TestResult[];

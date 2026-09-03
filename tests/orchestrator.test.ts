@@ -11,19 +11,21 @@ import {
   type PlannedStep,
   type StepOutcome
 } from "../src/core/orchestrator.ts";
-import type { ModuleDefinition, TaskEnvelope, WorkerResult } from "../src/protocol/contracts.ts";
+import type { AgentDefinition } from "../src/core/agent-format.ts";
+import type { StepRequest, StepResult } from "../src/protocol/contracts.ts";
 
-const modules: ModuleDefinition[] = [
-  { id: "user-service", path: ".temp/modules/user-service", contextFiles: [], allowedPaths: [], testCommand: "npm test", contractCommand: "" },
-  { id: "order-service", path: ".temp/modules/order-service", contextFiles: [], allowedPaths: [], testCommand: "npm test", contractCommand: "" }
-];
+function makeDefinition(name: string): AgentDefinition {
+  return { name, description: `${name} agent`, capabilities: [], tools: [], tags: [], systemPrompt: "prompt", sourceFile: `${name}.md` };
+}
 
-function resultFor(task: TaskEnvelope): WorkerResult {
+const definitions = [makeDefinition("code-reviewer"), makeDefinition("test-writer")];
+
+function resultFor(request: StepRequest): StepResult {
   return {
-    taskId: task.taskId,
-    module: task.module,
+    taskId: request.taskId,
+    agent: request.agent,
     status: "completed",
-    changedFiles: task.taskId === "s1" ? ["a.ts"] : [],
+    changedFiles: request.taskId === "s1" ? ["a.ts"] : [],
     tests: [],
     risks: [],
     messages: []
@@ -32,22 +34,18 @@ function resultFor(task: TaskEnvelope): WorkerResult {
 
 interface Harness {
   orchestrator: Orchestrator;
-  dispatched: TaskEnvelope[][];
+  dispatched: StepRequest[];
+  selfExecuted: { id: string; goal: string }[];
   asked: string[];
   summaries: { goal: string; outcomes: StepOutcome[] }[];
   logs: string[];
-  brain: {
-    intent: IntentAnalysis[];
-    plan?: PlannedStep[];
-    failIntent?: boolean;
-    failPlan?: boolean;
-    clarifyAnswer?: string;
-  };
-  askUser(answer?: string): void;
+  matches: (string | null)[];
+  brain: { intent: IntentAnalysis[]; plan?: PlannedStep[]; failIntent?: boolean; failPlan?: boolean; clarifyAnswer?: string };
 }
 
-function makeHarness(initialIntent: IntentAnalysis[], plan?: PlannedStep[]): Harness {
-  const dispatched: TaskEnvelope[][] = [];
+function makeHarness(initialIntent: IntentAnalysis[], plan?: PlannedStep[], matches: (string | null)[] = []): Harness {
+  const dispatched: StepRequest[] = [];
+  const selfExecuted: { id: string; goal: string }[] = [];
   const asked: string[] = [];
   const summaries: { goal: string; outcomes: StepOutcome[] }[] = [];
   const logs: string[] = [];
@@ -55,16 +53,15 @@ function makeHarness(initialIntent: IntentAnalysis[], plan?: PlannedStep[]): Har
   const harness: Harness = {
     orchestrator: undefined as never,
     dispatched,
+    selfExecuted,
     asked,
     summaries,
     logs,
-    brain,
-    askUser(answer = "") {
-      brain.clarifyAnswer = answer;
-    }
+    matches: [...matches],
+    brain
   };
   const agent: AgentBrain = {
-    async analyzeIntent(_input: string, _modules: ModuleDefinition[], _clarifications?: string) {
+    async analyzeIntent() {
       if (brain.failIntent) throw new Error("no model configured");
       const next = brain.intent.shift();
       if (!next) throw new Error("no more canned analyses");
@@ -74,6 +71,10 @@ function makeHarness(initialIntent: IntentAnalysis[], plan?: PlannedStep[]): Har
       if (brain.failPlan || !brain.plan) throw new Error("plan unavailable");
       return brain.plan;
     },
+    async matchAgent() {
+      const next = harness.matches.shift();
+      return next === undefined ? null : next;
+    },
     async summarize(goal, outcomes) {
       summaries.push({ goal, outcomes });
     }
@@ -81,13 +82,16 @@ function makeHarness(initialIntent: IntentAnalysis[], plan?: PlannedStep[]): Har
   harness.orchestrator = new Orchestrator({
     agent,
     supervisor: {
-      async dispatch(tasks) {
-        dispatched.push(tasks);
-        return tasks.map(resultFor);
+      async dispatch(requests) {
+        dispatched.push(...requests);
+        return requests.map(resultFor);
       }
     },
-    modules,
-    defaultModule: "user-service",
+    agents: { list: () => definitions },
+    selfExecute: async (step) => {
+      selfExecuted.push(step);
+      return resultFor({ taskId: step.id, agent: "supervisor", goal: step.goal });
+    },
     askUser: async (question) => {
       asked.push(question);
       return brain.clarifyAnswer ?? "";
@@ -99,10 +103,10 @@ function makeHarness(initialIntent: IntentAnalysis[], plan?: PlannedStep[]): Har
 
 test("dependencyLayers groups diamond dependencies into parallel batches", () => {
   const steps: PlannedStep[] = [
-    { id: "s1", module: "user-service", goal: "a", dependsOn: [] },
-    { id: "s2", module: "order-service", goal: "b", dependsOn: ["s1"] },
-    { id: "s3", module: "user-service", goal: "c", dependsOn: ["s1"] },
-    { id: "s4", module: "order-service", goal: "d", dependsOn: ["s2", "s3"] }
+    { id: "s1", agent: "", goal: "a", dependsOn: [] },
+    { id: "s2", agent: "", goal: "b", dependsOn: ["s1"] },
+    { id: "s3", agent: "", goal: "c", dependsOn: ["s1"] },
+    { id: "s4", agent: "", goal: "d", dependsOn: ["s2", "s3"] }
   ];
   assert.deepEqual(
     dependencyLayers(steps).map((layer) => layer.map((step) => step.id)),
@@ -112,11 +116,11 @@ test("dependencyLayers groups diamond dependencies into parallel batches", () =>
 
 test("dependencyLayers degrades cycles and ignores unknown dependencies", () => {
   const cyclic: PlannedStep[] = [
-    { id: "s1", module: "user-service", goal: "a", dependsOn: ["s2"] },
-    { id: "s2", module: "user-service", goal: "b", dependsOn: ["s1"] }
+    { id: "s1", agent: "", goal: "a", dependsOn: ["s2"] },
+    { id: "s2", agent: "", goal: "b", dependsOn: ["s1"] }
   ];
   assert.equal(dependencyLayers(cyclic).length, 1, "cycles run together in one batch");
-  const unknown: PlannedStep[] = [{ id: "s1", module: "user-service", goal: "a", dependsOn: ["nope"] }];
+  const unknown: PlannedStep[] = [{ id: "s1", agent: "", goal: "a", dependsOn: ["nope"] }];
   assert.deepEqual(
     dependencyLayers(unknown).map((layer) => layer.map((step) => step.id)),
     [["s1"]]
@@ -136,97 +140,127 @@ test("extractJson and parsers tolerate fenced or noisy model output", () => {
   assert.equal(parseIntentAnalysis({ clarity: "wild" }), undefined);
 
   assert.deepEqual(
-    parsePlannedSteps({ steps: [{ id: " s1 ", module: 5, goal: "g", dependsOn: ["x", 3] }, { id: "", goal: "dropped" }] }),
-    [{ id: "s1", module: "", goal: "g", dependsOn: ["x"] }]
+    parsePlannedSteps({ steps: [{ id: " s1 ", agent: 5, goal: "g", dependsOn: ["x", 3] }, { id: "", goal: "dropped" }] }),
+    [{ id: "s1", agent: "", goal: "g", dependsOn: ["x"] }]
   );
   assert.equal(parsePlannedSteps({ steps: [] }), undefined);
 });
 
-test("simple intents run a single step and summarize", async () => {
-  const harness = makeHarness([{ clarity: "simple", task: "提炼后的任务", questions: [] }]);
+test("simple intents route through agent matching and summarize", async () => {
+  const harness = makeHarness([{ clarity: "simple", task: "提炼后的任务", questions: [] }], undefined, ["code-reviewer"]);
   await harness.orchestrator.run("原始输入");
   assert.equal(harness.dispatched.length, 1);
-  assert.equal(harness.dispatched[0].length, 1);
-  assert.equal(harness.dispatched[0][0].goal, "提炼后的任务");
-  assert.equal(harness.dispatched[0][0].module, "user-service");
+  assert.equal(harness.dispatched[0].agent, "code-reviewer");
+  assert.equal(harness.dispatched[0].goal, "提炼后的任务");
   assert.equal(harness.summaries.length, 1);
   assert.equal(harness.asked.length, 0);
 });
 
+test("unmatched simple intents self-execute", async () => {
+  const harness = makeHarness([{ clarity: "simple", task: "提炼", questions: [] }], undefined, [null]);
+  await harness.orchestrator.run("原始输入");
+  assert.equal(harness.dispatched.length, 0);
+  assert.deepEqual(
+    harness.selfExecuted.map(({ id, goal }) => ({ id, goal })),
+    [{ id: "s1", goal: "提炼" }]
+  );
+});
+
 test("unclear intents ask once, re-analyze with the answer, then execute", async () => {
-  const harness = makeHarness([
-    { clarity: "unclear", task: "", questions: ["用哪个数据库？", "要不要兼容旧接口？"] },
-    { clarity: "simple", task: "用 postgres 实现登录", questions: [] }
-  ]);
-  harness.askUser("用 postgres，不需要兼容");
+  const harness = makeHarness(
+    [
+      { clarity: "unclear", task: "", questions: ["用哪个数据库？", "要不要兼容旧接口？"] },
+      { clarity: "simple", task: "用 postgres 实现登录", questions: [] }
+    ],
+    undefined,
+    ["test-writer"]
+  );
+  harness.brain.clarifyAnswer = "用 postgres，不需要兼容";
   await harness.orchestrator.run("实现登录");
   assert.equal(harness.asked.length, 1);
   assert.match(harness.asked[0], /1\. 用哪个数据库/);
-  assert.equal(harness.dispatched[0][0].goal, "用 postgres 实现登录");
+  assert.equal(harness.dispatched[0].goal, "用 postgres 实现登录");
 });
 
 test("unclear intents without an interactive channel proceed with planning", async () => {
-  const harness = makeHarness([{ clarity: "unclear", task: "尽量实现登录", questions: ["用哪个数据库？"] }]);
   const logs: string[] = [];
+  const selfExecuted: { id: string; goal: string }[] = [];
   const orchestrator = new Orchestrator({
     agent: {
       async analyzeIntent() {
         return { clarity: "unclear", task: "尽量实现登录", questions: ["用哪个数据库？"] };
       },
       async planSteps() {
-        return [{ id: "s1", module: "user-service", goal: "猜一个数据库实现登录", dependsOn: [] }];
+        return [{ id: "s1", agent: "", goal: "猜一个数据库实现登录", dependsOn: [] }];
+      },
+      async matchAgent() {
+        return null;
       },
       async summarize() {
         undefined;
       }
     },
     supervisor: {
-      async dispatch(tasks) {
-        harness.dispatched.push(tasks);
-        return tasks.map(resultFor);
+      async dispatch(requests) {
+        return requests.map(resultFor);
       }
     },
-    modules,
-    defaultModule: "user-service",
+    agents: { list: () => definitions },
+    selfExecute: async (step) => {
+      selfExecuted.push(step);
+      return resultFor({ taskId: step.id, agent: "supervisor", goal: step.goal });
+    },
     log: (line) => logs.push(line)
   });
   await orchestrator.run("实现登录");
   assert.match(logs.join("\n"), /非交互模式无法澄清/);
-  assert.equal(harness.dispatched.length, 1);
-  assert.equal(harness.dispatched[0][0].goal, "猜一个数据库实现登录");
+  assert.deepEqual(
+    selfExecuted.map(({ id, goal }) => ({ id, goal })),
+    [{ id: "s1", goal: "猜一个数据库实现登录" }]
+  );
+});
+
+test("planner-assigned agents win over runtime matching", async () => {
+  const harness = makeHarness(
+    [{ clarity: "complex", task: "任务", questions: [] }],
+    [{ id: "s1", agent: "test-writer", goal: "写测试", dependsOn: [] }],
+    ["code-reviewer"]
+  );
+  await harness.orchestrator.run("任务");
+  assert.equal(harness.dispatched[0].agent, "test-writer");
+  assert.equal(harness.matches.length, 1, "planner assignment skips the matcher");
+});
+
+test("planner-named unknown agents fall back to runtime matching", async () => {
+  const harness = makeHarness(
+    [{ clarity: "complex", task: "任务", questions: [] }],
+    [{ id: "s1", agent: "ghost", goal: "做什么", dependsOn: [] }],
+    ["code-reviewer"]
+  );
+  await harness.orchestrator.run("任务");
+  assert.equal(harness.dispatched[0].agent, "code-reviewer");
+  assert.match(harness.logs.join("\n"), /指定的 agent ghost 未注册，尝试运行时匹配/);
 });
 
 test("complex intents run dependency layers with prior results injected", async () => {
   const harness = makeHarness(
-    [{ clarity: "complex", task: "重构订单流程", questions: [] }],
+    [{ clarity: "complex", task: "重构流程", questions: [] }],
     [
-      { id: "s1", module: "user-service", goal: "定义用户接口", dependsOn: [] },
-      { id: "s2", module: "order-service", goal: "实现订单逻辑", dependsOn: ["s1"] }
+      { id: "s1", agent: "code-reviewer", goal: "定义接口", dependsOn: [] },
+      { id: "s2", agent: "test-writer", goal: "实现逻辑", dependsOn: ["s1"] }
     ]
   );
-  await harness.orchestrator.run("重构订单流程");
+  await harness.orchestrator.run("重构流程");
   assert.equal(harness.dispatched.length, 2, "dependent steps run in separate batches");
-  assert.equal(harness.dispatched[0][0].taskId, "s1");
-  assert.equal(harness.dispatched[1][0].goal, "实现订单逻辑\n\n前序步骤结果：\n- s1（user-service）completed：1 个文件变更");
+  assert.equal(harness.dispatched[1].goal, "实现逻辑\n\n前序步骤结果：\n- s1（code-reviewer）completed：1 个文件变更");
   assert.equal(harness.summaries.length, 1);
   assert.equal(harness.summaries[0].outcomes.length, 2);
 });
 
 test("planning failures degrade to direct execution", async () => {
-  const harness = makeHarness([{ clarity: "complex", task: "重构订单流程", questions: [] }]);
+  const harness = makeHarness([{ clarity: "complex", task: "重构流程", questions: [] }], undefined, [null]);
   harness.brain.failPlan = true;
-  await harness.orchestrator.run("重构订单流程");
-  assert.equal(harness.dispatched.length, 1);
-  assert.equal(harness.dispatched[0][0].goal, "重构订单流程");
+  await harness.orchestrator.run("重构流程");
+  assert.deepEqual(harness.selfExecuted.map((step) => step.goal), ["重构流程"]);
   assert.match(harness.logs.join("\n"), /规划失败，退化为直接执行/);
-});
-
-test("steps naming unknown modules fall back to the default module", async () => {
-  const harness = makeHarness(
-    [{ clarity: "complex", task: "任务", questions: [] }],
-    [{ id: "s1", module: "ghost-service", goal: "做什么", dependsOn: [] }]
-  );
-  await harness.orchestrator.run("任务");
-  assert.equal(harness.dispatched[0][0].module, "user-service");
-  assert.match(harness.logs.join("\n"), /指定的模块 ghost-service 不存在，改用 user-service/);
 });
