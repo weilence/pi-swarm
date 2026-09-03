@@ -57,11 +57,13 @@ const agentRegistry = await AgentRegistry.load(defaultAgentDirs(), (warning) =>
 );
 
 const events = new EventBus();
+const configStore = new JsonFileConfigStore();
 const supervisorAgent = new SupervisorAgent({
   modelRuntime: sharedRuntime,
   onText: streamText,
   onThinking: streamThinking,
-  onStreamEnd: endStream
+  onStreamEnd: endStream,
+  configStore
 });
 // Sub-agent sessions are created lazily on first dispatch and reused after.
 const subAgents = new Map<string, SubAgent>();
@@ -83,7 +85,6 @@ const supervisor = new Supervisor((name) => {
   return agent;
 }, events);
 
-const configStore = new JsonFileConfigStore();
 const savedConfig = await configStore.load();
 let restoredProvider: ModelsDevProvider | undefined;
 if (savedConfig.providerId) {
