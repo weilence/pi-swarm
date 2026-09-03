@@ -3,6 +3,8 @@ import { THINKING_LEVELS } from "../core/worker.ts";
 import type { ModuleDefinition } from "../protocol/contracts.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-store.ts";
 import { getUserDataDir } from "../core/userdata.ts";
+import { dim } from "../core/ansi.ts";
+import { forwardAssistantEvent } from "./assistant-stream.ts";
 import {
   type AgentSession,
   createAgentSession,
@@ -21,7 +23,10 @@ export interface SupervisorAgentOptions {
   cwd?: string;
   /** Pi agent directory; defaults to a folder under the user data dir to keep the repo clean. */
   agentDir?: string;
+  /** Streams assistant text; defaults to plain stdout. */
   onText?: (delta: string) => void;
+  /** Streams reasoning/thinking deltas; defaults to dimmed stdout. */
+  onThinking?: (delta: string) => void;
   /** When provided, every successful configuration change is persisted. */
   configStore?: ConfigStore;
 }
@@ -43,13 +48,15 @@ export class SupervisorAgent {
   private requestedThinkingLevel?: string;
   private readonly cwd: string;
   private readonly agentDir: string;
-  private readonly onText?: (delta: string) => void;
+  private readonly onText: (delta: string) => void;
+  private readonly onThinking: (delta: string) => void;
   private readonly configStore?: ConfigStore;
 
   public constructor(options: SupervisorAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
     this.agentDir = options.agentDir ?? join(getUserDataDir(), "supervisor-agent");
-    this.onText = options.onText;
+    this.onText = options.onText ?? ((delta) => process.stdout.write(delta));
+    this.onThinking = options.onThinking ?? ((delta) => process.stdout.write(dim(delta)));
     this.configStore = options.configStore;
   }
 
@@ -112,10 +119,13 @@ export class SupervisorAgent {
     });
     this.session = session;
     this.unsubscribe = session.subscribe((event) => {
-      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-        this.responseBuffer += event.assistantMessageEvent.delta;
-        this.onText?.(event.assistantMessageEvent.delta);
-      }
+      forwardAssistantEvent(event, {
+        appendText: (delta) => {
+          this.responseBuffer += delta;
+        },
+        onText: this.onText,
+        onThinking: this.onThinking
+      });
     });
     if (this.requestedModel) await this.applyModel(this.requestedModel);
     if (this.requestedThinkingLevel) this.applyThinkingLevel(this.requestedThinkingLevel);

@@ -14,6 +14,7 @@ import type { ModuleDefinition } from "../protocol/contracts.ts";
 import type { ConfigurableModuleWorker } from "../core/worker.ts";
 import { ModelsDevCatalog, type ModelsDevProvider } from "../models-dev/catalog.ts";
 import { JsonFileConfigStore } from "../core/config/json-file-config-store.ts";
+import { dim } from "../core/ansi.ts";
 import { SupervisorAgent } from "../pi/supervisor-agent.ts";
 import { InkApp } from "./ink-app.tsx";
 import { LogStore } from "./log-store.ts";
@@ -39,9 +40,18 @@ const log = (line: string): void => {
   if (interactive) store.append(line);
   else console.log(line);
 };
+const streamText = (delta: string): void => {
+  if (interactive) store.appendStream(delta);
+  else process.stdout.write(delta);
+};
+const streamThinking = (delta: string): void => {
+  const styled = dim(delta);
+  if (interactive) store.appendStream(styled);
+  else process.stdout.write(styled);
+};
 const worker: ConfigurableModuleWorker =
   workerMode === "pi"
-    ? new PiSdkWorker(`${module.id} manager`, interactive ? (delta) => store.appendStream(delta) : undefined)
+    ? new PiSdkWorker(`${module.id} manager`, streamText, streamThinking)
     : new MockPiWorker();
 const modelsCatalog = new ModelsDevCatalog({
   onUpdate: (info) => {
@@ -53,7 +63,8 @@ const modelsCatalog = new ModelsDevCatalog({
 const supervisor = new Supervisor(registry, new Map([[module.id, worker]]), events);
 const configStore = new JsonFileConfigStore();
 const supervisorAgent = new SupervisorAgent({
-  onText: interactive ? (delta) => store.appendStream(delta) : undefined,
+  onText: streamText,
+  onThinking: streamThinking,
   configStore
 });
 const savedConfig = await configStore.load();

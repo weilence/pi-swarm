@@ -2,6 +2,8 @@ import type { ConfigurableModuleWorker } from "../core/worker.ts";
 import { THINKING_LEVELS } from "../core/worker.ts";
 import type { TaskEnvelope, WorkerResult } from "../protocol/contracts.ts";
 import { join } from "node:path";
+import { dim } from "../core/ansi.ts";
+import { forwardAssistantEvent } from "./assistant-stream.ts";
 import {
   type AgentSession,
   createAgentSession,
@@ -24,7 +26,8 @@ export class PiSdkWorker implements ConfigurableModuleWorker {
 
   public constructor(
     private readonly workerName: string,
-    private readonly onText: (text: string) => void = (text) => process.stdout.write(text)
+    private readonly onText: (text: string) => void = (text) => process.stdout.write(text),
+    private readonly onThinking: (text: string) => void = (text) => process.stdout.write(dim(text))
   ) {}
 
   public async start(): Promise<void> {
@@ -61,9 +64,11 @@ export class PiSdkWorker implements ConfigurableModuleWorker {
     this.session = session;
     this.workingDirectory = task.workingDirectory;
     this.unsubscribe = session.subscribe((event) => {
-      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-        this.onText(event.assistantMessageEvent.delta);
-      }
+      forwardAssistantEvent(event, {
+        appendText: () => undefined,
+        onText: this.onText,
+        onThinking: this.onThinking
+      });
     });
     if (this.requestedModel) await this.applyModel(this.requestedModel);
     if (this.requestedThinkingLevel) this.applyThinkingLevel(this.requestedThinkingLevel);
