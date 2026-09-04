@@ -8,13 +8,15 @@ import {
   matchesKey,
   type OverlayHandle,
   ProcessTerminal,
+  ScrollView,
   SelectList,
   type SelectItem,
   Text,
   TuiAltScreen,
-  type TUI,
+  type ViewportTUI,
   visibleWidth,
-  wrapTextWithAnsi
+  wrapTextWithAnsi,
+  VStack
 } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
 import { dim } from "../core/ansi.ts";
@@ -24,8 +26,8 @@ import type { CommandOutcome, PickerOption } from "./commands.ts";
 export { summarizeToolArgs };
 
 export interface TuiReplOptions {
-  /** Injected TUI for tests; defaults to a ProcessTerminal + TuiAltScreen (fullscreen) pair. */
-  ui?: TUI;
+  /** Injected viewport TUI for tests; defaults to a ProcessTerminal + TuiAltScreen (fullscreen) pair. */
+  ui?: ViewportTUI;
   /** Returns "exit" to end the process (e.g. the /exit command). */
   onSubmit: (line: string) => Promise<CommandOutcome | void>;
   onExit: () => void;
@@ -285,8 +287,12 @@ class PickerComponent<T> extends Container {
  */
 export class TuiRepl {
   private readonly owned?: { terminal: ProcessTerminal; ui: TuiAltScreen };
-  private readonly ui: TUI;
+  private readonly ui: ViewportTUI;
   private readonly inputArea = new Container();
+  /** Holds the active transcript; lives inside the scroll view. */
+  private readonly scrollBody = new Container();
+  /** Scrollable chat area that fills the space above the pinned editor. */
+  private readonly scrollView: ScrollView;
   private readonly editor: Editor;
   private readonly markdownTheme: MarkdownTheme;
   private readonly tabs = new Map<string, AgentTranscript>();
@@ -329,9 +335,14 @@ export class TuiRepl {
       void this.handleSubmit(text);
     };
     this.inputArea.addChild(this.editor);
-    // Chat window mounts only the active transcript's container; the editor
-    // stays the last document child so the view follows new output.
-    this.ui.addChild(this.inputArea);
+    // Layout: the transcript scrolls inside a viewport that fills the space
+    // above the editor, and the editor stays pinned to the bottom edge so new
+    // output never pushes the input out of view.
+    this.scrollView = new ScrollView(this.scrollBody, { follow: "end", primary: true });
+    const root = new VStack();
+    root.addChild(this.scrollView, { grow: 1 });
+    root.addChild(this.inputArea, { shrink: 0 });
+    this.ui.setLayoutRoot(root);
     this.registerAgent(DEFAULT_AGENT);
     this.tabBar = new AgentTabBar(() => this.tabStates());
     this.tabBarOverlay = this.ui.showOverlay(this.tabBar, { anchor: "top-right", nonCapturing: true });
@@ -372,8 +383,7 @@ export class TuiRepl {
     });
     if (this.tabs.size === 1) {
       this.activeAgent = name;
-      const index = this.ui.children.indexOf(this.inputArea);
-      this.ui.children.splice(index >= 0 ? index : this.ui.children.length, 0, container);
+      this.mountTranscript(container);
     }
     this.ui.requestRender();
   }
@@ -382,13 +392,18 @@ export class TuiRepl {
   public setActiveAgent(name: string): void {
     const tab = this.tabs.get(name);
     if (!tab || name === this.activeAgent) return;
-    const current = this.activeTab();
-    const index = this.ui.children.indexOf(current.container);
-    if (index >= 0) this.ui.children[index] = tab.container;
+    this.mountTranscript(tab.container);
     this.activeAgent = name;
     tab.unread = false;
     this.refreshStreamArea();
     this.ui.requestRender();
+  }
+
+  /** Shows the given transcript in the chat viewport and follows its latest output. */
+  private mountTranscript(container: Container): void {
+    this.scrollBody.clear();
+    this.scrollBody.addChild(container);
+    this.scrollView.scrollToEnd();
   }
 
   /** Handles pi-swarm:// links (agent tabs, thinking folds) from OSC 8 clicks. */

@@ -33,9 +33,16 @@ function assistantEntry(content: unknown, stopReason: string, parentId: string |
 /** Fake TUI + a real TuiRepl; returns the active transcript's log container. */
 function makeRepl(): { repl: TuiRepl; log: Container } {
   const children: Component[] = [];
+  // pi-tui marks viewport TUIs with a registry symbol that is not re-exported as a value.
+  const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
   const ui = {
     terminal: { rows: 30, columns: 120 },
     children,
+    [VIEWPORT_TUI]: true,
+    layoutRoot: undefined as Component | undefined,
+    setLayoutRoot: (component: Component) => {
+      ui.layoutRoot = component;
+    },
     addChild: (component: Component) => {
       children.push(component);
     },
@@ -51,8 +58,13 @@ function makeRepl(): { repl: TuiRepl; log: Container } {
     hasOverlay: () => false
   };
   const repl = new TuiRepl({ ui: ui as never, onSubmit: async () => undefined, onExit: () => undefined });
-  const [chat] = children as [Container];
-  return { repl, log: chat.children[0] as Container };
+  // layoutRoot → VStack[ScrollView(scrollBody → transcript), inputArea]; transcript = [log, stream].
+  const root = ui.layoutRoot! as Container;
+  const [chatArea] = root.children as [Container];
+  const [scrollBody] = chatArea.children as [Container];
+  const [transcript] = scrollBody.children as [Container];
+  const [log] = transcript.children as [Container];
+  return { repl, log };
 }
 
 const plain = (component: Component, width = 80): string => stripTerminalSequences(component.render(width).join("\n"));

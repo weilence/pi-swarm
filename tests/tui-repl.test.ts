@@ -27,6 +27,9 @@ interface FakeOverlay {
   handle: { hide(): void };
 }
 
+// pi-tui marks viewport TUIs with a registry symbol that is not re-exported as a value.
+const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
+
 function makeFakeUi() {
   const children: Component[] = [];
   const overlays: FakeOverlay[] = [];
@@ -34,6 +37,11 @@ function makeFakeUi() {
     terminal: { rows: 30, columns: 120 },
     children,
     overlays,
+    [VIEWPORT_TUI]: true,
+    layoutRoot: undefined as Component | undefined,
+    setLayoutRoot: (component: Component) => {
+      ui.layoutRoot = component;
+    },
     addChild: (component: Component) => {
       children.push(component);
     },
@@ -66,6 +74,15 @@ function makeFakeUi() {
   return ui;
 }
 
+/** The active transcript container: layoutRoot → ScrollView → scrollBody → transcript([log, stream]). */
+function mountedChat(ui: ReturnType<typeof makeFakeUi>): Container {
+  const root = ui.layoutRoot! as Container;
+  const [chatArea] = root.children as [Container];
+  const [scrollBody] = chatArea.children as [Container];
+  const [transcript] = scrollBody.children as [Container];
+  return transcript;
+}
+
 function makeRepl(): {
   repl: TuiRepl;
   ui: ReturnType<typeof makeFakeUi>;
@@ -75,9 +92,7 @@ function makeRepl(): {
 } {
   const ui = makeFakeUi();
   const repl = new TuiRepl({ ui: ui as never, onSubmit: async () => undefined, onExit: () => undefined });
-  // ui.children = [active transcript container, inputArea]; the transcript holds [log, stream].
-  const [chat] = ui.children as [Container];
-  const [log, stream] = chat.children as [Container, Container];
+  const [log, stream] = mountedChat(ui).children as [Container, Container];
   return { repl, ui, log, stream, overlays: ui.overlays };
 }
 
@@ -279,7 +294,8 @@ test("busy mode keeps the editor mounted; Enter is swallowed until the task ends
     ui: ui as never,
     onSubmit: async (line) => {
       submitted.push(line);
-      const inputArea = ui.children[1] as Container;
+      const root = ui.layoutRoot! as Container;
+      const inputArea = root.children[1] as Container;
       busyState = {
         editorMounted: inputArea.children.includes(editor as never),
         busyTextShown: stripTerminalSequences(inputArea.render(80).join("\n")).includes("任务执行中"),
@@ -317,8 +333,7 @@ test("submitted user messages render as right-aligned bubbles with a background"
     onExit: () => undefined
   });
   const editor = (repl as unknown as { editor: { handleInput(data: string): void } }).editor;
-  const [chat] = ui.children as [Container];
-  const [log] = chat.children as [Container];
+  const [log] = mountedChat(ui).children as [Container];
 
   editor.handleInput("帮我看一下这个报错");
   editor.handleInput("\r");
@@ -377,18 +392,17 @@ test("agent tabs register, mark background activity unread, and switch via handl
   assert.ok(plain().includes("● code-writer"), "background output marks the tab unread");
   assert.equal(log.children.length, 0, "background output stays out of the active log");
 
-  const mountedBefore = ui.children[0];
+  const mountedBefore = mountedChat(ui);
   repl.handleLink("pi-swarm://agent/code-writer");
-  assert.notEqual(ui.children[0], mountedBefore, "switching replaces the mounted transcript");
+  assert.notEqual(mountedChat(ui), mountedBefore, "switching replaces the mounted transcript");
   assert.ok(!plain().includes("● code-writer"), "activation clears the unread marker");
-  const [chat] = ui.children as [Container];
-  const [activeLog] = chat.children as [Container];
+  const [activeLog] = mountedChat(ui).children as [Container];
   assert.equal(activeLog.children.length, 1);
   assert.ok(activeLog.children[0].render(80).join("\n").includes("后台输出"));
 
-  const mounted = ui.children[0];
+  const mounted = mountedChat(ui);
   repl.handleLink("pi-swarm://agent/ghost");
-  assert.equal(ui.children[0], mounted, "links for unknown agents are ignored");
+  assert.equal(mountedChat(ui), mounted, "links for unknown agents are ignored");
 });
 
 test("streaming to a background agent stays silent and lands in its transcript", () => {
@@ -403,8 +417,7 @@ test("streaming to a background agent stays silent and lands in its transcript",
   assert.equal(stream.children.length, 0, "active stream area untouched");
 
   repl.handleLink("pi-swarm://agent/code-writer");
-  const [chat] = ui.children as [Container];
-  const [bgLog] = chat.children as [Container];
+  const [bgLog] = mountedChat(ui).children as [Container];
   assert.equal(bgLog.children.length, 3, "collapsible reasoning + two markdown blocks");
   assert.ok(!(bgLog.children[0] instanceof Markdown), "thinking folds as collapsible reasoning");
   assert.ok(bgLog.children[1] instanceof Markdown);
