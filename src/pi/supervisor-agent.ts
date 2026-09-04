@@ -1,5 +1,4 @@
 import { join } from "node:path";
-import { THINKING_LEVELS } from "../core/thinking.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
 import { createTaskRun, type StepRecord } from "../core/task-run.ts";
 import type { StepJob } from "../core/supervisor.ts";
@@ -7,6 +6,7 @@ import { getUserDataDir } from "../core/userdata.ts";
 import { forwardAssistantEvent } from "./assistant-stream.ts";
 import { createDelegateTool, type DelegateState } from "./delegate-tool.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../core/config/config-store.ts";
+import { clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
   createAgentSession,
@@ -86,7 +86,7 @@ export class SupervisorAgent {
   private providerConfig?: Parameters<ModelRuntime["registerProvider"]>[1];
   private providerId = "models-dev";
   private requestedModel?: string;
-  private requestedThinkingLevel?: string;
+  private requestedThinkingLevel?: ModelThinkingLevel;
   private readonly cwd: string;
   private readonly agentDir: string;
   private readonly onText: (delta: string, agent: string) => void;
@@ -145,7 +145,8 @@ export class SupervisorAgent {
         }
       }
       if (saved.thinkingLevel) {
-        await this.setThinkingLevel(saved.thinkingLevel);
+        // Pending preference: validated and clamped against the model once the session opens.
+        this.requestedThinkingLevel = saved.thinkingLevel as ModelThinkingLevel;
         parts.push(`thinking ${saved.thinkingLevel}`);
       }
     } catch (error) {
@@ -217,7 +218,7 @@ export class SupervisorAgent {
     } catch {
       // The model may be unavailable after a provider switch: keep it pending.
     }
-    if (this.requestedThinkingLevel) this.applyThinkingLevel(this.requestedThinkingLevel);
+    this.applyRequestedThinkingLevel();
     return session;
   }
 
@@ -364,6 +365,12 @@ export class SupervisorAgent {
     return `当前模型：${specifier}`;
   }
 
+  /** Thinking levels the current model supports (ascending); empty before a model is selected. */
+  public thinkingLevels(): string[] {
+    const model = this.session?.model;
+    return model ? [...getSupportedThinkingLevels(model)] : [];
+  }
+
   public async setThinkingLevel(level: string): Promise<string> {
     const message = this.applyThinkingLevel(level);
     await this.persist({ thinkingLevel: this.requestedThinkingLevel });
@@ -371,11 +378,33 @@ export class SupervisorAgent {
   }
 
   private applyThinkingLevel(level: string): string {
-    const normalized = level.trim().toLowerCase();
-    if (!THINKING_LEVELS.includes(normalized)) throw new Error(`thinking level 应为：${THINKING_LEVELS.join(", ")}`);
-    if (this.session) this.session.setThinkingLevel(normalized as never);
+    const model = this.session?.model;
+    if (!model) throw new Error("请先使用 /model 选择模型；thinking level 由当前模型决定");
+    const normalized = level.trim().toLowerCase() as ModelThinkingLevel;
+    const supported = getSupportedThinkingLevels(model);
+    if (!supported.includes(normalized)) {
+      throw new Error(`当前模型支持的 thinking level：${supported.join(", ")}`);
+    }
+    this.session!.setThinkingLevel(normalized);
     this.requestedThinkingLevel = normalized;
-    return this.session ? `当前 thinking level：${normalized}` : `thinking level 将在会话建立后切换为 ${normalized}`;
+    return `当前 thinking level：${normalized}`;
+  }
+
+  /**
+   * Applies the pending thinking preference after the session opens: clamped to
+   * the model's supported levels; without a preference, defaults to the highest
+   * supported level. A no-op until the model resolves.
+   */
+  private applyRequestedThinkingLevel(): void {
+    const session = this.session;
+    const model = session?.model;
+    if (!session || !model) return;
+    const supported = getSupportedThinkingLevels(model);
+    const level = this.requestedThinkingLevel
+      ? clampThinkingLevel(model, this.requestedThinkingLevel)
+      : supported[supported.length - 1];
+    session.setThinkingLevel(level);
+    this.requestedThinkingLevel = level;
   }
 
   public status(): string {

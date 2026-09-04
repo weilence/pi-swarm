@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { executeCommand, type AgentController, type CommandServices, type CommandState } from "../src/cli/commands.ts";
-import { THINKING_LEVELS } from "../src/core/thinking.ts";
 import type { ModelsDevProvider } from "../src/cli/../models-dev/catalog.ts";
+
+/** Levels of a reasoning model without xhigh/max support, as pi-ai would report. */
+const SUPPORTED_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"];
 
 function makeProviders(): ModelsDevProvider[] {
   return [
@@ -45,8 +47,13 @@ function makeAgent(recording: Recording): AgentController {
       recording.models.push(specifier);
       return `当前模型：${specifier}`;
     },
+    thinkingLevels() {
+      return [...SUPPORTED_THINKING_LEVELS];
+    },
     async setThinkingLevel(level: string) {
-      if (!THINKING_LEVELS.includes(level)) throw new Error(`thinking level 应为：${THINKING_LEVELS.join(", ")}`);
+      if (!SUPPORTED_THINKING_LEVELS.includes(level)) {
+        throw new Error(`当前模型支持的 thinking level：${SUPPORTED_THINKING_LEVELS.join(", ")}`);
+      }
       recording.thinkingLevels.push(level);
       return `当前 thinking level：${level}`;
     },
@@ -190,20 +197,37 @@ test("/apikey failures surface the agent error", async () => {
   assert.match(services.logs.join("\n"), /API key 配置失败：请先使用 \/provider 选择 provider/);
 });
 
-test("/thinking validates levels and bare form lists or picks them", async () => {
+test("/thinking validates against the current model and bare form lists or picks its levels", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
   await executeCommand("/thinking high", services, {});
-  await executeCommand("/thinking wild", services, {});
-  assert.match(services.logs.join("\n"), /thinking 切换失败：thinking level 应为/);
+  await executeCommand("/thinking xhigh", services, {});
+  assert.match(services.logs.join("\n"), /thinking 切换失败：当前模型支持的 thinking level：/);
   assert.deepEqual(recording.thinkingLevels, ["high"]);
 
   await executeCommand("/thinking", services, {});
-  assert.match(services.logs.join("\n"), /thinking level 可选：off, minimal, low, medium, high, xhigh, max/);
+  assert.match(services.logs.join("\n"), /当前模型支持的 thinking level：off, minimal, low, medium, high/);
 
-  const interactive = makeServices(recording, ["xhigh"], true);
+  const interactive = makeServices(recording, ["low"], true);
   await executeCommand("/thinking", interactive, {});
-  assert.deepEqual(recording.thinkingLevels, ["high", "xhigh"]);
+  assert.deepEqual(recording.thinkingLevels, ["high", "low"]);
+});
+
+test("bare /thinking without a model asks for /model first", async () => {
+  const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
+  const services = makeServices(recording);
+  services.agent = {
+    ...makeAgent(recording),
+    thinkingLevels: () => [],
+    async setThinkingLevel() {
+      throw new Error("请先使用 /model 选择模型；thinking level 由当前模型决定");
+    }
+  };
+  await executeCommand("/thinking", services, {});
+  assert.match(services.logs.join("\n"), /请先用 \/model 选择模型/);
+  await executeCommand("/thinking high", services, {});
+  assert.match(services.logs.join("\n"), /thinking 切换失败：请先使用 \/model 选择模型/);
+  assert.deepEqual(recording.thinkingLevels, []);
 });
 
 test("/status reports supervisor state and /exit wins over other commands", async () => {

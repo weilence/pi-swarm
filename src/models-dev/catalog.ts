@@ -10,12 +10,25 @@ export type { KnownApi };
 /** API types offered in the picker, derived from Pi's runtime api registry. */
 export const PI_API_TYPES: readonly KnownApi[] = getApiProviders().map((provider) => provider.api as KnownApi);
 
-export interface ModelsDevReasoningOption {
-  type: string;
-  values?: (string | null)[];
+interface ModelsDevReasoningOptionToggle {
+  type: "toggle";
+}
+
+interface ModelsDevReasoningOptionEffort {
+  type: "effort";
+  values: Array<'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'>;
+}
+
+interface ModelsDevReasoningOptionBudget {
+  type: "budget_tokens";
   min?: number;
   max?: number;
 }
+
+export type ModelsDevReasoningOption =
+  | ModelsDevReasoningOptionToggle
+  | ModelsDevReasoningOptionEffort
+  | ModelsDevReasoningOptionBudget;
 
 export interface ModelsDevModel {
   id: string;
@@ -233,8 +246,6 @@ const EFFORT_TO_PI_LEVEL: Readonly<Record<string, keyof ThinkingLevelMap>> = {
   max: "max"
 };
 
-const PI_THINKING_LEVELS: readonly (keyof ThinkingLevelMap)[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
 /**
  * Builds a Pi thinkingLevelMap from models.dev reasoning_options. Effort-style
  * options pass their provider value through 1:1 (none → off); Pi levels the
@@ -250,7 +261,7 @@ export function toThinkingLevelMap(model: ModelsDevModel): ThinkingLevelMap | un
     if (level) map[level] = value;
   }
   if (Object.keys(map).length === 0) return undefined;
-  for (const level of PI_THINKING_LEVELS) {
+  for (const level of Object.values(EFFORT_TO_PI_LEVEL)) {
     if (map[level] === undefined) map[level] = null;
   }
   return map;

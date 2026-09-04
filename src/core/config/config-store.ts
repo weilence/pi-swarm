@@ -4,7 +4,11 @@ export interface AgentConfigSnapshot {
   providerId?: string;
   /** Full "provider/model" specifier, e.g. "anthropic/claude-sonnet-4". */
   model?: string;
-  /** Normalized thinking level (one of THINKING_LEVELS). */
+  /**
+   * Pi thinking level (pi-ai ThinkingLevel). Applied when the model supports
+   * it, clamped to the nearest supported level otherwise; without it the
+   * model's highest supported level is the default.
+   */
   thinkingLevel?: string;
   /**
    * Literal API key overriding the "$ENV_VAR" reference inside providerConfig.

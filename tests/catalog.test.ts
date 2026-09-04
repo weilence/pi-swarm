@@ -4,10 +4,10 @@ import { createServer } from "node:http";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelsDevCatalog, inferPiApi, toThinkingLevelMap, toPiProviderConfig, type CatalogUpdateInfo, type ModelsDevProvider } from "../src/models-dev/catalog.ts";
+import { ModelsDevCatalog, inferPiApi, toThinkingLevelMap, toPiProviderConfig, type CatalogUpdateInfo, type ModelsDevModel, type ModelsDevProvider } from "../src/models-dev/catalog.ts";
 
 test("toThinkingLevelMap generates a level map from effort reasoning_options", () => {
-  const model = { id: "m", reasoning_options: [{ type: "effort", values: ["none", "low", "high", "max"] }] };
+  const model: ModelsDevModel = { id: "m", reasoning_options: [{ type: "effort", values: ["none", "low", "high", "max"] }] };
   assert.deepEqual(toThinkingLevelMap(model), {
     off: "none",
     low: "low",
@@ -20,7 +20,11 @@ test("toThinkingLevelMap generates a level map from effort reasoning_options", (
 });
 
 test("toThinkingLevelMap skips unknown effort values and noise", () => {
-  const model = { id: "m", reasoning_options: [{ type: "effort", values: ["default", null, "medium"] }] };
+  // The declared effort union is trusted only after validation: raw models.dev
+  // payloads can still carry out-of-union values and nulls, which are skipped.
+  const model: ModelsDevModel = JSON.parse(
+    `{"id":"m","reasoning_options":[{"type":"effort","values":["default",null,"medium"]}]}`
+  );
   assert.deepEqual(toThinkingLevelMap(model), {
     medium: "medium",
     off: null,

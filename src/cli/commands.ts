@@ -1,4 +1,3 @@
-import { THINKING_LEVELS } from "../core/thinking.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
 import type { SessionManager } from "../core/session/session-manager.ts";
 import { SessionBusyError, SessionClosedError, SessionNotFoundError } from "../core/session/session-types.ts";
@@ -35,6 +34,8 @@ export interface ProviderCatalog {
 export interface AgentController {
   configureProvider?(providerId: string, config: unknown, modelId?: string): Promise<string>;
   setModel?(specifier: string): Promise<string>;
+  /** 当前模型支持的 thinking level（升序）；未选模型时为空。 */
+  thinkingLevels?(): string[];
   setThinkingLevel?(level: string): Promise<string>;
   setApiKey?(key: string): Promise<string>;
   status?(): string;
@@ -301,15 +302,20 @@ async function commandApiKey(key: string | undefined, services: CommandServices,
 
 async function commandThinking(level: string | undefined, services: CommandServices): Promise<void> {
   if (!level) {
+    const levels = services.agent?.thinkingLevels?.() ?? [];
+    if (levels.length === 0) {
+      services.log("[主 agent] 请先用 /model 选择模型；thinking level 由当前模型决定。");
+      return;
+    }
     if (services.interactive) {
-      const picked = await services.pick("选择 thinking level", THINKING_LEVELS.map((candidate) => ({ value: candidate, label: candidate })));
+      const picked = await services.pick("选择 thinking level", levels.map((candidate) => ({ value: candidate, label: candidate })));
       if (picked === undefined) {
         services.log("[主 agent] 已取消 thinking 切换。");
         return;
       }
       level = picked;
     } else {
-      services.log(`[主 agent] thinking level 可选：${THINKING_LEVELS.join(", ")}`);
+      services.log(`[主 agent] 当前模型支持的 thinking level：${levels.join(", ")}`);
       return;
     }
   }

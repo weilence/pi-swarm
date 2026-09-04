@@ -43,24 +43,23 @@ test("configureProvider persists the provider without opening a session", async 
   assert.match(agent.status(), /配置已就绪（provider anthropic，模型 anthropic\/claude-sonnet-4），会话尚未建立/);
 });
 
-test("setModel and setThinkingLevel merge into one snapshot", async () => {
+test("configureProvider and setModel merge into one snapshot", async () => {
   const store = makeStore();
   const agent = makeAgent(store);
   await agent.configureProvider("anthropic", { api: "anthropic-messages" });
   await agent.setModel("anthropic/claude-haiku-4");
-  await agent.setThinkingLevel("high");
   assert.deepEqual(store.saved[store.saved.length - 1], {
     providerId: "anthropic",
     providerConfig: { api: "anthropic-messages" },
-    model: "anthropic/claude-haiku-4",
-    thinkingLevel: "high"
+    model: "anthropic/claude-haiku-4"
   });
 });
 
-test("invalid thinking levels throw and persist nothing", async () => {
+test("setThinkingLevel requires a model and persists nothing without one", async () => {
   const store = makeStore();
   const agent = makeAgent(store);
-  await assert.rejects(agent.setThinkingLevel("wild"), /thinking level 应为/);
+  assert.deepEqual(agent.thinkingLevels(), []);
+  await assert.rejects(agent.setThinkingLevel("high"), /请先使用 \/model/);
   assert.equal(store.saved.length, 0);
 });
 
@@ -141,6 +140,8 @@ test("restore applies a persisted snapshot and reports it", async () => {
   const summary = await agent.restore();
   assert.match(summary, /已恢复配置：provider openai，模型 openai\/gpt-4o，thinking medium/);
   assert.match(agent.status(), /配置已就绪（provider openai，模型 openai\/gpt-4o，thinking medium），会话尚未建立/);
+  // The level stays pending until a session opens and the model can clamp it.
+  assert.deepEqual(agent.thinkingLevels(), []);
 });
 
 test("restore applies the persisted api key over the provider config", async () => {
