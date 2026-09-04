@@ -178,7 +178,8 @@ const sharedServices = {
   };
   repl = new TuiRepl({
     onSubmit: async (line) => {
-      await executeCommand(line, services, commandState);
+      // 必须把结果透传（如 "exit"），否则 /exit 永远不会结束进程。
+      return await executeCommand(line, services, commandState);
     },
     onExit: settleExit
   });
