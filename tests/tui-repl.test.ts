@@ -31,6 +31,7 @@ function makeFakeUi() {
   const children: Component[] = [];
   const overlays: FakeOverlay[] = [];
   const ui = {
+    terminal: { rows: 30, columns: 120 },
     children,
     overlays,
     addChild: (component: Component) => {
@@ -93,16 +94,27 @@ test("streamText flushes completed markdown blocks and keeps the partial in the 
   assert.ok((stream.children[0] as Text).render(80).join("\n").includes("步骤一"));
 });
 
-test("streamThinking shows a live summary and folds into the log as collapsible reasoning", () => {
+test("streamThinking shows an expanded live tail and folds into the log as collapsible reasoning", () => {
   const { repl, log, stream } = makeRepl();
   repl.streamThinking("让我想想…");
-  assert.ok(stream.children.length > 0, "thinking summary is visible while streaming");
-  assert.ok(stream.children[0].render(80).join("\n").includes("思考"));
+  assert.ok(stream.children.length > 0, "thinking tail is visible while streaming");
+  const live = stripTerminalSequences(stream.children[0].render(80).join("\n"));
+  assert.ok(live.includes("让我想想…"), "thinking content is expanded, not a collapsed summary");
+  assert.ok(live.includes("▸"), "tail keeps the thinking marker");
 
   repl.streamText("答案");
   assert.equal(log.children.length, 1, "thinking folds into the log as a collapsible entry");
   assert.ok(!(log.children[0] instanceof Markdown));
   assert.ok(log.children[0].render(80).join("\n").includes("pi-swarm://think/1"));
+});
+
+test("live thinking tail shows at most 3 lines and keeps the latest content", () => {
+  const { repl, stream } = makeRepl();
+  repl.streamThinking("第一行\n第二行\n第三行\n第四行\n第五行");
+  const lines = stripTerminalSequences(stream.children[0].render(80).join("\n")).split("\n");
+  assert.equal(lines.length, 3, "rendered tail is capped at 3 lines");
+  assert.ok(lines[0].includes("第三行"), "older lines beyond the cap are dropped");
+  assert.ok(lines[2].includes("第五行"), "the latest thinking line is visible");
 });
 
 test("endStream flushes the remaining partial block as markdown", () => {
@@ -219,6 +231,70 @@ test("askQuestion collects one answer line and hands the prompt back", async () 
   editor.handleInput("\r");
   assert.equal(await answer, "postgres");
   assert.ok(log.children.length > 0);
+  const raw = log.children[log.children.length - 1].render(80).join("\n");
+  assert.ok(raw.includes("\x1b[48;5;61m") && raw.includes("postgres"), "answers echo as user bubbles too");
+});
+
+test("busy mode keeps the editor mounted; Enter is swallowed until the task ends", async () => {
+  const ui = makeFakeUi();
+  const submitted: string[] = [];
+  let editor: { handleInput(data: string): void; disableSubmit: boolean };
+  let busyState: { editorMounted: boolean; busyTextShown: boolean; disableSubmit: boolean } | undefined;
+  const repl = new TuiRepl({
+    ui: ui as never,
+    onSubmit: async (line) => {
+      submitted.push(line);
+      const inputArea = ui.children[1] as Container;
+      busyState = {
+        editorMounted: inputArea.children.includes(editor as never),
+        busyTextShown: stripTerminalSequences(inputArea.render(80).join("\n")).includes("任务执行中"),
+        disableSubmit: editor.disableSubmit
+      };
+      editor.handleInput("\r");
+    },
+    onExit: () => undefined
+  });
+  editor = (repl as unknown as { editor: typeof editor }).editor;
+
+  editor.handleInput("第一件事");
+  editor.handleInput("\r");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(submitted, ["第一件事"], "Enter while busy does not submit again");
+  assert.ok(busyState);
+  assert.ok(busyState.editorMounted, "editor stays mounted while busy");
+  assert.ok(!busyState.busyTextShown, "no 'task running' placeholder replaces the editor");
+  assert.ok(busyState.disableSubmit, "submit is disabled while busy");
+  assert.ok(!editor.disableSubmit, "submit is re-enabled once the task ends");
+});
+
+test("submitted user messages render as right-aligned bubbles with a background", async () => {
+  const ui = makeFakeUi();
+  let release!: () => void;
+  const task = new Promise<void>((settle) => {
+    release = settle;
+  });
+  const repl = new TuiRepl({
+    ui: ui as never,
+    onSubmit: async () => {
+      release();
+    },
+    onExit: () => undefined
+  });
+  const editor = (repl as unknown as { editor: { handleInput(data: string): void } }).editor;
+  const [chat] = ui.children as [Container];
+  const [log] = chat.children as [Container];
+
+  editor.handleInput("帮我看一下这个报错");
+  editor.handleInput("\r");
+  await task;
+
+  assert.equal(log.children.length, 1, "the message is echoed into the transcript");
+  const raw = log.children[0].render(80).join("\n");
+  assert.ok(raw.includes("\x1b[48;5;61m"), "bubble uses a colored background");
+  const plain = stripTerminalSequences(raw);
+  assert.ok(plain.startsWith(" "), "bubble is right-aligned, not left-anchored");
+  assert.ok(plain.trimEnd().endsWith("帮我看一下这个报错"), "bubble keeps one padding column at the right edge");
 });
 
 test("pick selects via Enter, filters by typing, and cancels with Esc", async () => {

@@ -1,4 +1,3 @@
-import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { loadEnvFile } from "node:process";
 import { resolve } from "node:path";
@@ -22,10 +21,9 @@ try {
   if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 }
 
-const interactive = input.isTTY === true;
-
+// 终端能力缺失时（如 stdin 被重定向）ProcessTerminal 会自动降级，不硬退。
 // Streams and log lines route into the interactive REPL once it exists; before
-// that (and in pipe mode) they fall back to plain stdout.
+// that they fall back to plain stdout.
 let repl: TuiRepl | undefined;
 const log = (line: string, agent = "supervisor"): void => {
   if (repl) repl.appendLine(line, agent);
@@ -40,8 +38,8 @@ const streamThinking = (delta: string, agent = "supervisor"): void => {
   else process.stdout.write(dim(delta));
 };
 const endStream = (agent = "supervisor"): void => repl?.endStream(agent);
-// Tool calls: interactive mode renders live lines in the transcript; pipe mode
-// logs start/end lines to stdout.
+// Tool calls render as live lines in the transcript; without a REPL they log
+// start/end lines to stdout.
 const toolStart = (id: string, name: string, args: unknown, agent: string): void => {
   if (repl) {
     repl.toolStart(agent, id, name, args);
@@ -146,9 +144,7 @@ console.log("pi-swarm 主 agent 已启动。");
 const loadedAgents = agentRegistry.list();
 console.log(loadedAgents.length > 0 ? `已加载子 agent：${loadedAgents.map((agent) => agent.name).join(", ")}` : "未加载任何子 agent，所有任务由 supervisor 自执行。");
 console.log(
-  interactive
-    ? "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close 管理会话，/status 查看状态，或 /exit 退出。\n"
-    : "输入任务，/provider <id> [接口类型]，/model [模型]，/thinking level，/apikey <key>，/new [名称]，/sessions，/switch <id|序号>，/close，/status，或输入 /exit 退出。\n"
+  "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close 管理会话，/status 查看状态，或 /exit 退出。\n"
 );
 
 log(`[主 agent] ${await supervisorAgent.restore()}`);
@@ -165,7 +161,7 @@ const sharedServices = {
   sessions: sessionManager
 };
 
-if (interactive) {
+{
   let settleExit!: () => void;
   const exited = new Promise<void>((settle) => {
     settleExit = settle;
@@ -174,7 +170,10 @@ if (interactive) {
     ...sharedServices,
     interactive: true,
     log,
-    logMarkdown: (md) => (repl ? repl.appendMarkdown(md) : console.log(md)),
+    // getter：repl 在 services 之后才创建；/switch 历史回放直接驱动它的组件
+    get repl() {
+      return repl;
+    },
     pick: (title, options) => repl!.pick(title, options)
   };
   repl = new TuiRepl({
@@ -189,21 +188,6 @@ if (interactive) {
   repl.start();
   await exited;
   repl.stop();
-} else {
-  const rl = createInterface({ input, output, terminal: true });
-  const services: CommandServices = {
-    ...sharedServices,
-    interactive: false,
-    log,
-    pick: async () => undefined
-  };
-  try {
-    for await (const line of rl) {
-      if ((await executeCommand(line, services, commandState)) === "exit") break;
-    }
-  } finally {
-    rl.close();
-  }
 }
 
 await supervisor.close();

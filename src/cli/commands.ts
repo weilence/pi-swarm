@@ -2,7 +2,8 @@ import { THINKING_LEVELS } from "../core/thinking.ts";
 import type { AgentDefinition } from "../core/agent-format.ts";
 import type { SessionManager } from "../core/session/session-manager.ts";
 import { SessionBusyError, SessionClosedError, SessionNotFoundError } from "../core/session/session-types.ts";
-import { renderSessionHistory, renderUserMessage } from "../core/session-history.ts";
+import type { TuiRepl } from "./tui-repl.ts";
+import { replayHistory } from "./history-replay.ts";
 import type { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
 import {
   PI_API_TYPES,
@@ -49,8 +50,8 @@ export interface CommandServices {
   agent?: AgentController;
   catalog: ProviderCatalog;
   log: (line: string) => void;
-  /** Markdown 块输出（历史回显用）；缺省回落到 log。 */
-  logMarkdown?: (markdown: string) => void;
+  /** 交互式 TUI；/switch 历史回放直接驱动它的组件（与实时显示同源）。 */
+  repl?: TuiRepl;
   /** Interactive selection; resolves to undefined when cancelled or unavailable. */
   pick: <T>(title: string, options: readonly PickerOption<T>[]) => Promise<T | undefined>;
   interactive: boolean;
@@ -423,17 +424,14 @@ async function commandSwitch(ref: string, services: CommandServices): Promise<vo
 }
 
 /**
- * 切换成功后回放目标会话历史（compaction-aware）：块经 logMarkdown（缺省
- * 回落 log）逐条输出。整个过程不抛错——回放失败只提示，不影响切换结果。
- * /new 不回放（新会话没有历史）。
+ * 切换成功后回放目标会话历史（compaction-aware）：直接驱动 TUI 组件，与实时
+ * 显示同源（气泡/折叠思考/✔✘ 工具行）。整个过程不抛错——回放失败只提示，
+ * 不影响切换结果。/new 不回放（新会话没有历史）。
  */
 function replaySessionHistory(pi: PiSessionManager, services: CommandServices): void {
+  if (!services.repl) return;
   try {
-    const blocks = renderSessionHistory(pi.buildContextEntries());
-    if (blocks.length === 0) return;
-    services.log(`[主 agent] 已回放 ${blocks.length} 条历史记录：`);
-    const write = services.logMarkdown ?? services.log;
-    for (const block of blocks) write(block);
+    replayHistory(services.repl, pi.buildContextEntries());
   } catch (error) {
     services.log(`[主 agent] 历史回放失败：${error instanceof Error ? error.message : String(error)}`);
   }
@@ -470,9 +468,8 @@ async function dispatchTask(goal: string, services: CommandServices, _state: Com
     services.log("[主 agent] 已有任务正在执行，请等待完成后再输入。");
     return;
   }
-  // 用户输入是聊天内容：先回显进 transcript（与历史回放的「▸ 你」格式一致），
-  // 任务输出才有上下文可对照；斜杠命令是 UI 操作且可能含密钥（/apikey），不回显。
-  (services.logMarkdown ?? services.log)(renderUserMessage(goal));
+  // 用户输入的回显由 TUI 气泡承担（TuiRepl.handleSubmit），此处不再回显；
+  // 斜杠命令是 UI 操作且可能含密钥（/apikey），两种渠道都不回显。
   // 当前会话不存在（已关闭或从未创建）时自动新建承接，保证无缝体验
   let sessionId = services.sessions?.current()?.id;
   if (!sessionId && services.sessions) {

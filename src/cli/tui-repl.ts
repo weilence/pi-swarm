@@ -13,16 +13,21 @@ import {
   Text,
   TuiAltScreen,
   type TUI,
-  visibleWidth
+  visibleWidth,
+  wrapTextWithAnsi
 } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
 import { dim } from "../core/ansi.ts";
-import type { PickerOption } from "./commands.ts";
+import { summarizeToolArgs } from "../core/tool-summary.ts";
+import type { CommandOutcome, PickerOption } from "./commands.ts";
+
+export { summarizeToolArgs };
 
 export interface TuiReplOptions {
   /** Injected TUI for tests; defaults to a ProcessTerminal + TuiAltScreen (fullscreen) pair. */
   ui?: TUI;
-  onSubmit: (line: string) => Promise<void>;
+  /** Returns "exit" to end the process (e.g. the /exit command). */
+  onSubmit: (line: string) => Promise<CommandOutcome | void>;
   onExit: () => void;
 }
 
@@ -139,31 +144,54 @@ class CollapsibleReasoning {
   }
 }
 
-/** Preferred arg keys for the one-line tool summary, in priority order. */
-const TOOL_SUMMARY_KEYS = ["command", "path", "file_path", "url", "pattern", "query", "name", "skill", "agent"];
+/**
+ * Live thinking tail: the latest lines of the streaming thinking buffer, dim,
+ * capped at 3 rendered lines. Expansion is automatic; folded reasoning still
+ * lands in the transcript once the stream moves on.
+ */
+class ThinkingTail {
+  private static readonly MAX_LINES = 3;
 
-/** Flattens whitespace and truncates to a single short line. */
-function oneLine(text: string): string {
-  const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length > 80 ? `${flat.slice(0, 79)}…` : flat;
+  public constructor(private readonly buffer: string) {}
+
+  public render(width: number): string[] {
+    const wrapped = wrapTextWithAnsi(this.buffer.trim(), Math.max(20, width));
+    return wrapped
+      .slice(-ThinkingTail.MAX_LINES)
+      .map((line, index) => dim(index === 0 ? `▸ ${line}` : `  ${line}`));
+  }
+
+  public invalidate(): void {}
 }
 
+/** User bubble style: bright white text on a blue background. */
+const USER_BUBBLE_BG = "\x1b[48;5;61m";
+const USER_BUBBLE_FG = "\x1b[97m";
+const USER_BUBBLE_RESET = "\x1b[0m";
+
 /**
- * One-line human summary of a tool call's arguments: the first meaningful
- * string among known keys (command, path, …), else the first string value.
+ * One user message: a right-aligned chat bubble with a colored background so
+ * submitted input stands out from the agent's left-aligned output.
  */
-export function summarizeToolArgs(args: unknown): string {
-  if (args == null) return "";
-  if (typeof args !== "object") return oneLine(String(args));
-  const record = args as Record<string, unknown>;
-  for (const key of TOOL_SUMMARY_KEYS) {
-    const value = record[key];
-    if (typeof value === "string" && value.trim()) return oneLine(value);
+class UserMessage {
+  public constructor(private readonly message: string) {}
+
+  public render(width: number): string[] {
+    const rightMargin = 1;
+    const innerMax = Math.max(12, Math.floor(width * 0.7) - 2);
+    const lines: string[] = [];
+    for (const raw of this.message.split("\n")) {
+      lines.push(...(raw.trim() ? wrapTextWithAnsi(raw, innerMax) : [""]));
+    }
+    const rightEdge = Math.max(0, width - rightMargin);
+    return lines.map((line) => {
+      const bubbleWidth = visibleWidth(line) + 2; // one padding column per side
+      const pad = Math.max(0, rightEdge - bubbleWidth);
+      return `${" ".repeat(pad)}${USER_BUBBLE_BG}${USER_BUBBLE_FG} ${line} ${USER_BUBBLE_RESET}`;
+    });
   }
-  for (const value of Object.values(record)) {
-    if (typeof value === "string" && value.trim()) return oneLine(value);
-  }
-  return "";
+
+  public invalidate(): void {}
 }
 
 /**
@@ -270,6 +298,8 @@ export class TuiRepl {
   private readonly tabBar: AgentTabBar;
   private readonly tabBarOverlay?: OverlayHandle;
   private pendingAnswer?: (answer: string) => void;
+  /** True while a submitted task is running; Enter is swallowed, text is kept. */
+  private busy = false;
 
   public constructor(private readonly options: TuiReplOptions) {
     initTheme();
@@ -291,9 +321,11 @@ export class TuiRepl {
         const settle = this.pendingAnswer;
         this.pendingAnswer = undefined;
         this.setBusy(true);
+        this.appendUserMessage(text);
         settle(text);
         return;
       }
+      if (this.busy) return;
       void this.handleSubmit(text);
     };
     this.inputArea.addChild(this.editor);
@@ -447,6 +479,22 @@ export class TuiRepl {
     }
   }
 
+  /** A finished tool-call row from history replay; renders like a settled live row. */
+  public appendToolCall(toolName: string, summary: string, isError: boolean, agent: string = DEFAULT_AGENT): void {
+    const line = new ToolCallLine(toolName, summary);
+    line.finish(isError);
+    this.tabFor(agent).log.addChild(line);
+    this.ui.requestRender();
+  }
+
+  /** One finished thinking entry (collapsible), as the live stream would leave it. */
+  public appendThinking(text: string, agent: string = DEFAULT_AGENT): void {
+    const tab = this.tabFor(agent);
+    this.flushStream(tab);
+    if (text.trim()) tab.log.addChild(this.newReasoning(text.trim()));
+    this.ui.requestRender();
+  }
+
   public async pick<T>(title: string, options: readonly PickerOption<T>[]): Promise<T | undefined> {
     if (options.length === 0) return undefined;
     const entries = options.map((option) => ({
@@ -476,6 +524,15 @@ export class TuiRepl {
       this.setBusy(false);
       this.pendingAnswer = resolve;
     });
+  }
+
+  /** Echoes a submitted user message as a right-aligned bubble in the active tab. */
+  public appendUserMessage(message: string): void {
+    if (!message.trim()) return;
+    const tab = this.activeTab();
+    this.flushStream(tab);
+    tab.log.addChild(new UserMessage(message));
+    this.ui.requestRender();
   }
 
   public appendMarkdown(markdown: string, agent: string = DEFAULT_AGENT): void {
@@ -541,24 +598,30 @@ export class TuiRepl {
   private refreshStreamArea(): void {
     const tab = this.activeTab();
     tab.stream.clear();
-    const shown = tab.thinkingBuffer
-      ? dim(`▸ 思考（${[...tab.thinkingBuffer.trim()].length} 字）…`)
-      : tab.partialBlock;
-    if (shown.trim().length > 0) tab.stream.addChild(new Text(shown, 0, 0));
+    if (tab.thinkingBuffer.trim()) {
+      tab.stream.addChild(new ThinkingTail(tab.thinkingBuffer));
+    } else if (tab.partialBlock.trim().length > 0) {
+      tab.stream.addChild(new Text(tab.partialBlock, 0, 0));
+    }
     this.ui.requestRender();
   }
 
   private setBusy(busy: boolean): void {
-    this.inputArea.clear();
-    this.inputArea.addChild(busy ? new Text(dim("⏳ 任务执行中（Ctrl+C 退出）…"), 0, 0) : this.editor);
+    this.busy = busy;
+    // The editor stays mounted and focused; Enter is ignored while busy so the
+    // queued text survives until the running task finishes.
+    this.editor.disableSubmit = busy;
     this.ui.requestRender();
     if (!busy) this.ui.setFocus(this.editor);
   }
 
   private async handleSubmit(text: string): Promise<void> {
+    // 斜杠命令是 UI 操作且可能含密钥（/apikey），不作为聊天气泡回显。
+    if (!text.startsWith("/")) this.appendUserMessage(text);
     this.setBusy(true);
     try {
-      await this.options.onSubmit(text);
+      const outcome = await this.options.onSubmit(text);
+      if (outcome === "exit") this.options.onExit();
     } finally {
       this.setBusy(false);
     }

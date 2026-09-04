@@ -26,7 +26,7 @@ test("main agent stays alive until an explicit exit command", async () => {
 
   await new Promise((resolve) => setTimeout(resolve, 250));
   assert.equal(child.exitCode, null, "the interactive main agent must not exit after startup");
-  child.stdin.write("/exit\n");
+  child.stdin.write("/exit\r");
   const [result] = await once(child, "exit");
   assert.equal(result, 0);
   assert.match(output, /主 agent 已启动/);
