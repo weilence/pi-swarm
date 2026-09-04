@@ -42,7 +42,7 @@ export const DEFAULT_CLEANUP_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /**
  * pi-swarm 的会话管理门面：维护会话索引（SessionStore）、当前指针与
  * 生命周期。会话正文由 Pi SDK 的 SessionManager 以 JSONL 落盘，本类只
- * 管理元数据；实际把 AgentSession 绑定到某个会话文件由 SupervisorAgent
+ * 管理元数据；实际把 AgentSession 绑定到某个会话文件由 supervisor agent
  * 的 rebind 流程完成（见 docs/session-design.md）。
  */
 export class SessionManager {
@@ -131,7 +131,7 @@ export class SessionManager {
   /**
    * 切换当前会话：目标不存在（含 id 为空或纯空白）抛 SessionNotFoundError；
    * 已关闭抛 SessionClosedError；成功后更新当前指针并持久化。只改指针，
-   * AgentSession 的实际重绑由调用方经 bind() + SupervisorAgent.rebind() 完成。
+   * AgentSession 的实际重绑由调用方经 bind() + Agent.rebind() 完成。
    */
   public switch(id: string): Promise<SessionRecord> {
     return this.enqueue(() => this.switchInternal(id));

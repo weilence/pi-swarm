@@ -8,7 +8,7 @@ export interface StepJob {
   agent: string;
 }
 
-/** Anything that can execute a step: today the Pi-backed SubAgent. */
+/** Anything that can execute a step: today a Pi-backed Agent from createSubAgent. */
 export interface StepRunner {
   run(step: StepJob): Promise<StepRecord>;
   close?(): Promise<void> | void;

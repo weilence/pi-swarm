@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
-import { SupervisorAgent } from "../src/pi/supervisor-agent.ts";
+import { createSupervisorAgent } from "../src/pi/supervisor-agent.ts";
+import type { Agent } from "../src/pi/agent.ts";
 import { SessionBusyError } from "../src/core/session/session-types.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../src/core/config/config-store.ts";
 
@@ -28,9 +29,9 @@ const silentSinks = {
   onToolEnd: () => undefined
 };
 
-/** A SupervisorAgent wired to the fake store; the Pi session is never created in these tests. */
-function makeAgent(store: ConfigStore): SupervisorAgent {
-  return new SupervisorAgent({ ...silentSinks, configStore: store, cwd: process.cwd(), agentDir: "not-created-in-tests" });
+/** A supervisor wired to the fake store; the Pi session is never created in these tests. */
+function makeAgent(store: ConfigStore): Agent {
+  return createSupervisorAgent({ ...silentSinks, configStore: store, cwd: process.cwd(), agentDir: "not-created-in-tests" });
 }
 
 test("configureProvider persists the provider without opening a session", async () => {
@@ -64,7 +65,7 @@ test("setThinkingLevel requires a model and persists nothing without one", async
 });
 
 test("persistence failures propagate to the caller", async () => {
-  const agent = new SupervisorAgent({
+  const agent = createSupervisorAgent({
     ...silentSinks,
     cwd: process.cwd(),
     agentDir: "not-created-in-tests",

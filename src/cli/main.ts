@@ -9,8 +9,9 @@ import { JsonFileConfigStore } from "../core/config/json-file-config-store.ts";
 import { JsonFileSessionStore } from "../core/session/json-file-session-store.ts";
 import { SessionManager } from "../core/session/session-manager.ts";
 import { dim } from "../core/ansi.ts";
-import { SupervisorAgent } from "../pi/supervisor-agent.ts";
-import { SubAgent } from "../pi/sub-agent.ts";
+import { createSupervisorAgent } from "../pi/supervisor-agent.ts";
+import { createSubAgent } from "../pi/sub-agent.ts";
+import type { Agent } from "../pi/agent.ts";
 import { TuiRepl, summarizeToolArgs } from "./tui-repl.ts";
 import { AgentRegistry, defaultAgentDirs } from "../core/agent-registry.ts";
 import { executeCommand, type CommandServices, type CommandState } from "./commands.ts";
@@ -89,8 +90,8 @@ log(`[主 agent] 已新建会话：${startupRecord.name ?? startupRecord.id}（$
 // Sub-agent sessions are created lazily on first dispatch and reused after;
 // the supervisor and supervisor-agent reference each other lazily, so both
 // bindings carry explicit types.
-const subAgents = new Map<string, SubAgent>();
-const supervisorAgent: SupervisorAgent = new SupervisorAgent({
+const subAgents = new Map<string, Agent>();
+const supervisorAgent = createSupervisorAgent({
   modelRuntime: sharedRuntime,
   onText: streamText,
   onThinking: streamThinking,
@@ -100,6 +101,7 @@ const supervisorAgent: SupervisorAgent = new SupervisorAgent({
   configStore,
   sessionManager: startupSession,
   agents: agentRegistry,
+  definition: agentRegistry.supervisor,
   // Forwarder: `supervisor` is declared right after; run() only fires on dispatch.
   stepExecutor: { run: (job) => supervisor.run(job) },
   log
@@ -109,10 +111,11 @@ const supervisor: Supervisor = new Supervisor((name) => {
   if (!agent) {
     const definition = agentRegistry.get(name);
     if (!definition) throw new Error(`未注册的 agent：${name}`);
-    agent = new SubAgent({
+    agent = createSubAgent({
       definition,
       modelRuntime: sharedRuntime,
       resolveModel: () => supervisorAgent.currentModel,
+      resolveThinkingLevel: () => supervisorAgent.currentThinkingLevel,
       onText: streamText,
       onThinking: streamThinking,
       onStreamEnd: endStream,
@@ -123,7 +126,8 @@ const supervisor: Supervisor = new Supervisor((name) => {
     repl?.registerAgent(name);
     subAgents.set(name, agent);
   }
-  return agent;
+  // The unified Agent speaks runStep; adapt it to the Supervisor's StepRunner.
+  return { run: (job) => agent.runStep(job), close: () => agent.close() };
 }, events);
 
 const savedConfig = await configStore.load();
