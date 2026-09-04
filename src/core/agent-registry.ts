@@ -18,6 +18,30 @@ export function defaultAgentDirs(projectRoot = process.cwd()): AgentDirs {
   };
 }
 
+/** The coordinator's reserved name; its definition never appears in the delegate roster. */
+export const SUPERVISOR_NAME = "supervisor";
+
+/**
+ * Built-in coordinator definition. A `supervisor.md` in the global or project
+ * agent directory overrides its prompt (project wins), but the role itself —
+ * config persistence, the delegate tool, session switching — stays wired in
+ * code; the definition only carries the prompt.
+ */
+const SUPERVISOR_AGENT_MARKDOWN = `---
+name: supervisor
+description: pi-swarm 协调者：理解用户任务，规划步骤，用 delegate 把步骤派发给子 agent，并根据真实结果继续决策、汇总最终答复。
+capabilities: [任务规划, 步骤派发, 结果汇总]
+tools: []
+---
+
+You are the pi-swarm Supervisor agent coordinating user-defined sub-agents.
+`;
+
+/** The built-in coordinator definition, parsed from the markdown above. */
+export function builtinSupervisorDefinition(): AgentDefinition {
+  return parseAgentMarkdown(SUPERVISOR_AGENT_MARKDOWN, "<builtin>").agent!;
+}
+
 export interface RegistryWarning {
   file: string;
   problems: string[];
@@ -27,9 +51,12 @@ export interface RegistryWarning {
  * Registry of user-created agents. Loads `*.md` definitions from the global
  * and project directories; on name collisions the project definition wins.
  * Corrupt files are skipped and surfaced through warnings, never thrown.
+ * The supervisor definition is resolved separately (project > global >
+ * built-in) and never listed as a delegable agent.
  */
 export class AgentRegistry {
   private readonly agents = new Map<string, AgentDefinition>();
+  private resolvedSupervisor: AgentDefinition = builtinSupervisorDefinition();
   public readonly warnings: RegistryWarning[] = [];
 
   private constructor(private readonly dirs: AgentDirs) {}
@@ -60,6 +87,10 @@ export class AgentRegistry {
           continue;
         }
         if (parsed.warnings.length > 0) registry.recordWarning(path, parsed.warnings, onWarning);
+        if (parsed.agent.name === SUPERVISOR_NAME) {
+          registry.resolvedSupervisor = parsed.agent; // later origins (project) win
+          continue;
+        }
         if (origin === "project" && registry.agents.has(parsed.agent.name)) {
           registry.agents.delete(parsed.agent.name); // project re-definition replaces global
         }
@@ -67,6 +98,11 @@ export class AgentRegistry {
       }
     }
     return registry;
+  }
+
+  /** The coordinator's definition (prompt overridable, role wired in code). */
+  public get supervisor(): AgentDefinition {
+    return this.resolvedSupervisor;
   }
 
   /** All agents, project definitions shadowing global ones, sorted by name. */
