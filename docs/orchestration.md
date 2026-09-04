@@ -26,7 +26,7 @@
 
 - **入参**：`{ steps: [{ id, goal, agent, dependsOn? }] }`，`agent` 必须取系统提示花名册中的 name。
 - **执行**：按 `dependsOn` 分层（`dependencyLayers`），层内经 worker pool 并行（≤4），
-  每步经 `Supervisor.run` → 长驻 `SubAgent` 会话执行。
+  每步经 `Supervisor.run` → 长驻子 agent 会话执行。
 - **出参**：每步真实记录的 JSON（状态、changedFiles、error、截断摘要）——这是模型下一轮决策的观察输入。
 - **上下文传递**：批内被依赖步骤完成后，其状态行 + 截断摘要注入下游步骤 goal。
 - **校验失败**（未注册 agent / 步骤超批 / id 重复 / 超总预算）返回纠正性文本，不消耗预算、不执行任何步骤。
@@ -67,7 +67,7 @@ StepRecord { id, agent, goal, status: completed|failed|timeout, summary, changed
 
 ## 失败恢复分层
 
-- **可重试错误**（`isRetryableError`：网络、超时、429/5xx）：同一 SubAgent 会话内带错误反馈自动重试 1 次，保留已积累的代码上下文。
+- **可重试错误**（`isRetryableError`：网络、超时、429/5xx）：同一子 agent 会话内带错误反馈自动重试 1 次，保留已积累的代码上下文。
 - **语义失败**：以 `failed` 记录原样返回给模型，由它决定换 agent 重派、改目标或放弃——重规划不是独立机制，就是主循环的下一个回合。
 
 ## 模块落点
@@ -77,11 +77,12 @@ StepRecord { id, agent, goal, status: completed|failed|timeout, summary, changed
 | `src/core/task-run.ts` | TaskRun/StepRecord 类型、预算常量、dependencyLayers、错误分类、格式化 |
 | `src/core/tool-observation.ts` | 事件侧观察采集（纯函数，可独立测试） |
 | `src/core/supervisor.ts` | runner 注册表 + 单步执行 + 失败收容 + 事件发布 |
+| `src/pi/agent.ts` | 唯一的 `Agent` 类：会话生命周期、流式转发、timeout/abort/重试（runStep）、runTask 换入 TaskRun、配置持久化与 delegate 能力 |
 | `src/pi/delegate-tool.ts` | delegate 工具：校验→分层→并发池→观察汇总→预算执行 |
-| `src/pi/sub-agent.ts` | 长驻子 agent 会话：timeout/abort/重试、tools 允许名单、StepRecord 产出 |
-| `src/pi/supervisor-agent.ts` | 会话/配置/持久化；runTask 换入 TaskRun；花名册与准则进系统提示 |
+| `src/pi/sub-agent.ts` | `createSubAgent`：按定义装配提示词、tools 允许名单、模型/thinking 拉取 |
+| `src/pi/supervisor-agent.ts` | `createSupervisorAgent`：协调者提示词（内置定义 + 花名册 + 准则）与 delegate 装配 |
 | `src/cli/commands.ts` | dispatchTask：busy 守卫、自动建会话、调 `runTask` |
-| `src/cli/main.ts` | 装配：Supervisor + SupervisorAgent 互相前向引用（stepExecutor 转发器） |
+| `src/cli/main.ts` | 装配：Supervisor + supervisor Agent 互相前向引用（stepExecutor 转发器） |
 
 测试：`tests/task-run.test.ts`、`tests/tool-observation.test.ts`、`tests/delegate-tool.test.ts`
 （分层/并行/预算/校验），`tests/commands*.test.ts`（dispatch 路径）。

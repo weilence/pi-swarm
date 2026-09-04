@@ -36,7 +36,7 @@ Each user-created agent owns its own system prompt and tool grants. The Supervis
 - No LangGraph or other orchestration framework.
 - No production database, message broker, web UI, or automatic merge.
 - No hidden long-term memory: durable knowledge belongs in versioned files.
-- Pi SDK integration is isolated in `src/pi/` (SupervisorAgent + SubAgent on one shared ModelRuntime).
+- Pi SDK integration is isolated in `src/pi/` (one `Agent` class, wired as supervisor or sub-agent via `createSupervisorAgent`/`createSubAgent`, all on one shared ModelRuntime).
 
 See [docs/quick-validation-plan.md](docs/quick-validation-plan.md) and [docs/architecture.md](docs/architecture.md).
 

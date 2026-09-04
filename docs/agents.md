@@ -4,6 +4,8 @@
 
 - **初始无子 agent**：全新环境下不预置任何子 agent；不与代码模块（module registry）直接绑定。
 - **用户按需自建 agent**：每个 agent 是一个带 frontmatter 元信息的 Markdown 文档。
+- **只有一种 Agent 定义**：运行时只有一个 `Agent` 类（`src/pi/agent.ts`）；supervisor 与子 agent 的差异仅在于提示词与能力配置（delegate 工具、配置持久化、工具允许名单），不存在两套实现。
+- **Supervisor 也是一份定义**：协调者角色来自内置 `supervisor` 定义（`src/core/agent-registry.ts`），全局/项目目录下的 `supervisor.md` 可按同样的覆盖规则替换其提示词；身份仍是协调者，不进 delegate 花名册。
 - **Supervisor 动态调度**：任务执行时由 LLM 根据任务信息与各 agent 描述匹配，调用合适的子 agent。
 - **无匹配则自执行**：注册表为空、无合适 agent、或匹配失败时，步骤由 Supervisor 在自己的会话中直接执行。
 
@@ -42,23 +44,25 @@ tags: [review]               # 可选，分组标签
 
 1. 用户输入 = 对 supervisor 会话的一次 prompt；可用 agent 以花名册形式写进系统提示。
 2. 模型决定派发时调用 `delegate` 工具（`src/pi/delegate-tool.ts`），在入参里为每步指定 `agent`（只能取花名册中的 name）。
-3. delegate 按依赖分层并行执行：每步派发给该 agent 的长驻 `SubAgent` 会话（懒创建、复用，注入 agent 的 system prompt），返回真实观察记录（状态、变更文件、错误、摘要）。
+3. delegate 按依赖分层并行执行：每步派发给该 agent 的长驻 `Agent` 会话（懒创建、复用，注入 agent 的 system prompt），返回真实观察记录（状态、变更文件、错误、摘要）。
 4. 模型根据返回结果继续决策：再派下一批、换 agent 重做失败步骤，或自己在主会话完成剩余工作；全部结束后输出 markdown 总结。
 5. 注册表为空时不注册 delegate，所有工作由 supervisor 在主会话直接完成。
 
-supervisor 会话与所有 SubAgent 会话共享同一个 `ModelRuntime`：`/provider`、`/model`、`/apikey`
+supervisor 会话与所有子 agent 会话共享同一个 `ModelRuntime`：`/provider`、`/model`、`/apikey`
 配置的是全局默认模型，注册一次对全部会话生效；会话之间互相隔离。
+子 agent 在会话创建时拉取一次全局默认模型与 thinking level（`resolveModel`/`resolveThinkingLevel`）；
 frontmatter 的 `tools:` 已生效：作为子 agent 会话的工具允许名单传入 `createAgentSession`；`model:` 仍为预留字段。
 
 ## 实现落点
 
 - `src/core/agent-format.ts` — 定义解析与校验（parser/validator）
-- `src/core/agent-registry.ts` — 双目录注册表（项目覆盖全局、损坏容错、list/get）
+- `src/core/agent-registry.ts` — 双目录注册表（项目覆盖全局、损坏容错、list/get）、内置 supervisor 定义与覆盖
 - `src/core/task-run.ts` — StepRecord/TaskRun、预算护栏、依赖分层
+- `src/pi/agent.ts` — 唯一的 `Agent` 类：会话生命周期、流式转发、模型/thinking、runStep/runTask、配置持久化与 delegate 能力
 - `src/pi/delegate-tool.ts` — delegate 工具：校验、分层并行、观察汇总
-- `src/pi/supervisor-agent.ts` — Supervisor 会话（模型驱动控制流）、`runTask`、花名册系统提示
-- `src/pi/sub-agent.ts` — `SubAgent`：按定义懒创建的 Pi 会话执行器，产出真实 StepRecord
-- `src/cli/main.ts` — 启动时加载 agent 注册表，按需懒创建 SubAgent
+- `src/pi/supervisor-agent.ts` — `createSupervisorAgent`：协调者提示词装配（定义 + 花名册 + 准则）与 delegate 装配
+- `src/pi/sub-agent.ts` — `createSubAgent`：按定义装配提示词、工具允许名单与模型/thinking 拉取
+- `src/cli/main.ts` — 启动时加载 agent 注册表，按需懒创建子 agent
 - 示例：`.pi-swarm/agents/code-reviewer.md`、`.pi-swarm/agents/test-writer.md`、`.pi-swarm/agents/code-writer.md`
 - 测试：`tests/agent-format.test.ts`、`tests/agent-registry.test.ts`、`tests/delegate-tool.test.ts`、`tests/task-run.test.ts`
 

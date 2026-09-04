@@ -2,10 +2,10 @@
 
 ## 1. 现状与问题
 
-- `SupervisorAgent`（`src/pi/supervisor-agent.ts`）在 `ensureSession()` 中硬编码 `SessionManager.inMemory()`（Pi SDK），会话不落盘，进程退出即丢失。
-- `SubAgent`（`src/pi/sub-agent.ts`）同样只用 in-memory 会话。
+- supervisor agent（`src/pi/supervisor-agent.ts` 的 `createSupervisorAgent`）在 `ensureSession()` 中硬编码 `SessionManager.inMemory()`（Pi SDK），会话不落盘，进程退出即丢失。
+- 子 agent（`src/pi/sub-agent.ts` 的 `createSubAgent`）同样只用 in-memory 会话。
 - CLI（`src/cli/commands.ts`）只有 `/provider /model /thinking /apikey /status /exit`，没有多会话、列表、切换、恢复能力。
-- Pi SDK 本身已具备持久化会话能力：`SessionManager.create / open / continueRecent / list`（JSONL 文件），见 `node_modules/@earendil-works/pi-coding-agent/docs/sdk.md` 与 `session-format.md`。**缺的是 pi-swarm 自己的会话管理层**（元数据、当前指针、关闭状态、生命周期），以及把 `SupervisorAgent` 从 in-memory 切到持久化会话的注入点。
+- Pi SDK 本身已具备持久化会话能力：`SessionManager.create / open / continueRecent / list`（JSONL 文件），见 `node_modules/@earendil-works/pi-coding-agent/docs/sdk.md` 与 `session-format.md`。**缺的是 pi-swarm 自己的会话管理层**（元数据、当前指针、关闭状态、生命周期），以及把 supervisor agent 从 in-memory 切到持久化会话的注入点。
 
 ## 2. 目标
 
@@ -123,11 +123,11 @@ export class SessionManager {
 
 - **id 由 pi-swarm 生成**（`randomUUID()`）并经 `NewSessionOptions.id` 传入 SDK：预留路径文件名、未来 flush 的 session header、索引记录三者 id 一致。若由 SDK 生成，对未落盘路径 `open()` 会重生成 header id，与索引脱钩。
 - **SDK 延迟落盘**：`_persist` 直到首条 assistant 消息才写 JSONL（避免空文件）。因此 `create()` 只预留路径不写文件，name 只存索引；绑定 AgentSession 时若文件不存在则 `PiSessionManager.create(cwd, sessionDir, { id: record.id })` 同 id 重建并回写索引 sessionFile，存在则 `open()`。
-- `switch()` 只改指针并返回目标记录；**实际重绑 AgentSession 发生在 SupervisorAgent**：
+- `switch()` 只改指针并返回目标记录；**实际重绑 AgentSession 发生在 supervisor agent（`Agent.rebind`）**：
   - `SupervisorAgentOptions` 增加 `sessionManager?: PiSessionManager`（可选注入）；
   - `ensureSession()` 使用注入的 PiSessionManager（缺省仍 `SessionManager.inMemory()`，向后兼容）；
   - 切换流程（CLI 层编排）：`sessionMgr.switch(id)` → `supervisorAgent.rebind(PiSessionManager.open(record.sessionFile))` → `rebind` 内部 `unsubscribe + session.dispose()` 旧会话、重建 AgentSession 并重新应用 model/thinking；流式输出期间切换抛 `SessionBusyError`。
-- `SubAgent` 不纳入本期会话管理（每 agent 一条长会话，随进程关闭）。
+- 子 agent 不纳入本期会话管理（每 agent 一条长会话，随进程关闭）。
 
 ### 生命周期与过期策略
 
@@ -166,7 +166,7 @@ export class SessionManager {
 const sessionStore = new JsonFileSessionStore();
 const sessionMgr = new SessionManager({ cwd: process.cwd(), store: sessionStore });
 await sessionMgr.initialize();           // 恢复 + 清理
-const supervisorAgent = new SupervisorAgent({ ..., sessionManager: <恢复到的 PiSessionManager> });
+const supervisorAgent = createSupervisorAgent({ ..., sessionManager: <恢复到的 PiSessionManager> });
 sharedServices.sessions = sessionMgr;    // commands.ts 使用
 ```
 
@@ -179,11 +179,11 @@ sharedServices.sessions = sessionMgr;    // commands.ts 使用
 5. touch：updatedAt 推进、messageCount 累计。
 6. cleanup：TTL 内 closed 保留、超期移除、active 永不移除；`cleanupTtlMs=0` 禁用。
 7. JsonFileSessionStore：原子写、损坏文件降级 []、PI_SWARM_USERDATA 隔离。
-8. SupervisorAgent.rebind：旧会话 dispose、model/thinking 重新应用、busy 时抛错。
+8. `Agent.rebind`：旧会话 dispose、model/thinking 重新应用、busy 时抛错。
 
 ## 10. 边界与不做的事
 
 - 不做多进程并发索引写（单进程 CLI，无文件锁）。
 - 不删除 JSONL 会话文件（保留审计能力；后续可加 `--purge`）。
-- 不管理 SubAgent 会话；不做跨项目 `forkFrom`（列为后续 seam）。
+- 不管理子 agent 会话；不做跨项目 `forkFrom`（列为后续 seam）。
 - in-memory 会话（无 sessionFile）仍可存在于索引中，标记无文件即可。
