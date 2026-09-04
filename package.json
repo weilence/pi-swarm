@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/cli/main.ts",
-    "test": "tsx --test \"tests/*.test.{ts,tsx}\"",
+    "test": "node scripts/run-tests.mjs",
+    "test:raw": "tsx --test \"tests/*.test.{ts,tsx}\"",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
