@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { test } from "node:test";
 import { mkdtemp } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -31,6 +32,12 @@ test("main agent stays alive until an explicit exit command", async () => {
     // take longer than any hardcoded delay.
     await waitFor(() => output, /主 agent 已启动/);
     assert.equal(child.exitCode, null, "the interactive main agent must not exit after startup");
+
+    // Lazy session creation: an untouched startup must not create a session —
+    // no "已新建会话" log line and no session index file on disk. The first
+    // dispatched task auto-creates one (dispatchTask) and persists it then.
+    assert.doesNotMatch(output, /已新建会话/);
+    assert.equal(existsSync(join(userData, "sessions", "index.json")), false, "startup must not persist a session index");
 
     // Send the text and the Enter key as separate stdin chunks. The editor
     // submits only when a chunk is exactly "\r"; "/exit\r" in one write would

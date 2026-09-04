@@ -79,13 +79,11 @@ export class SessionManager {
     return run;
   }
 
-  /** 载入索引、执行过期清理，并把当前指针恢复为最新的 active 会话。 */
+  /** 载入索引并执行过期清理；当前指针保持为空，只由 create/switch/close 驱动。 */
   public initialize(): Promise<void> {
     return this.enqueue(async () => {
       this.records = await this.store.load();
       await this.cleanupInternal(this.now());
-      const active = this.sortedRecords().find((record) => sessionStatus(record) === "active");
-      this.currentId = active?.id;
     });
   }
 

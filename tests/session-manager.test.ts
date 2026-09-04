@@ -103,7 +103,7 @@ test("initialize on an empty index starts with no current session", async () => 
   assert.deepEqual(await manager.list(), []);
 });
 
-test("initialize resumes the most recent active session and skips closed ones", async () => {
+test("initialize loads records but never resumes the current pointer", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-swarm-session-"));
   const store = new InMemorySessionStore([
     seedRecord("active-old", { updatedAt: recordAt(-5 * DAY_MS) }),
@@ -112,7 +112,9 @@ test("initialize resumes the most recent active session and skips closed ones", 
   ]);
   const manager = new SessionManager({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
   await manager.initialize();
-  assert.equal(manager.current()?.id, "active-new", "the newest active record wins, closed records never resume");
+  assert.equal(manager.current(), undefined, "startup has no current session; the first dispatch auto-creates one");
+  const listed = (await manager.list()).map((summary) => summary.id);
+  assert.deepEqual(listed, ["closed-newer", "active-new", "active-old"], "records are loaded (updatedAt desc), closed ones skipped for /switch only");
 });
 
 test("initialize with only closed sessions leaves no current session", async () => {
@@ -179,6 +181,7 @@ test("create fails cleanly when the pi session cannot provide a usable id", asyn
       ({ isPersisted: () => false, getSessionFile: () => undefined, getSessionId: () => "" }) as unknown as PiSessionManager
   });
   await manager.initialize();
+  await manager.switch("existing");
   assert.equal(manager.current()?.id, "existing");
   await assert.rejects(
     () => manager.create(),
@@ -433,7 +436,7 @@ test("initialize + cleanup remove only closed records past the ttl; active ones 
   assert.ok(remaining.includes("fresh-closed"), "closed within the ttl stays");
   assert.ok(remaining.includes("ancient-active"), "active sessions never expire regardless of age");
   assert.ok(remaining.includes("invalid-closedAt"), "unparseable closedAt is kept and never cleaned");
-  assert.equal(manager.current()?.id, "ancient-active");
+  assert.equal(manager.current(), undefined, "initialize never restores the pointer");
   assert.ok(!(await store.load()).some((candidate) => candidate.id === "expired-closed"), "removals are persisted");
   assert.equal(await manager.cleanup(), 0, "a second cleanup run is a no-op");
 });
@@ -500,7 +503,7 @@ test("sessions survive a restart through the json file store", async () => {
     now: () => new Date(clockMs)
   });
   await second.initialize();
-  assert.equal(second.current()?.name, "beta", "the newest active session resumes");
+  assert.equal(second.current(), undefined, "restart starts with no current session");
   assert.ok(second.get(alpha.id)?.closedAt, "the closed session is still listed after restart");
   assert.deepEqual((await second.list()).map((summary) => summary.name), ["beta", "alpha"]);
 });

@@ -9,7 +9,7 @@
 
 ## 2. 目标
 
-1. supervisor 会话默认持久化（JSONL 落盘）；但启动总是新建会话，旧会话经 /sessions + /switch 手动恢复。
+1. supervisor 会话默认持久化（JSONL 落盘）；但启动不创建会话，首次派发任务时自动新建并立即持久化，旧会话经 /sessions + /switch 手动恢复——没发过消息的启动在磁盘上不留任何会话记录。
 2. 支持多会话：创建、命名、列出、切换、关闭。
 3. 生命周期与过期策略：active 会话永不过期；closed 会话按 TTL 从索引清理（文件保留）。
 4. 存储抽象：会话索引可替换（内存实现便于测试，JSON 文件实现用于生产）。
@@ -136,7 +136,7 @@ export class SessionManager {
 | active | `create` / `switch` 恢复 | prompt、switch 目标、close | 永不过期 |
 | closed | `close` | get/list 可见（标 closed） | `closedAt + cleanupTtlMs` 后由 `cleanup()` 从索引移除；JSONL 文件保留 |
 
-- `initialize()` 时执行一次 `cleanup()`，并把 current 指针恢复为索引最新的 active 会话；但 CLI 启动流程不使用该指针恢复会话，而是总是 `create()` 新建。旧会话的恢复是显式动作：用户经 /sessions + /switch 触发，此时才 `PiSessionManager.open` 打开旧 JSONL。
+- `initialize()` 时执行一次 `cleanup()`；当前指针不恢复，启动后 `current()` 为空（指针只由 create/switch/close 驱动）。首次派发任务时 dispatchTask 自动 `create()` 新会话承接；旧会话的恢复是显式动作：用户经 /sessions + /switch 触发，此时才 `PiSessionManager.open` 打开旧 JSONL。
 
 ### 错误处理矩阵
 
@@ -158,16 +158,16 @@ export class SessionManager {
 | `/switch <id\|序号>` | 校验后切换；序号取 /sessions 显示顺序 | 同左 |
 | `/close [id\|序号]` | 关闭（缺省当前）并提示"已关闭，输入任务将自动新建会话或 /switch 恢复" | 同左 |
 
-- 约束：当前会话 closed 且用户直接输入任务时，自动 `create()` 新会话承接（无缝体验）。
+- 约束：当前会话不存在（从未创建或已关闭）且用户直接输入任务时，自动 `create()` 新会话承接（无缝体验）。
 
 ## 8. 集成点（main.ts）
 
 ```
 const sessionStore = new JsonFileSessionStore();
 const sessionMgr = new SessionManager({ cwd: process.cwd(), store: sessionStore });
-await sessionMgr.initialize();           // 恢复 + 清理
-const supervisorAgent = createSupervisorAgent({ ..., sessionManager: <恢复到的 PiSessionManager> });
-sharedServices.sessions = sessionMgr;    // commands.ts 使用
+await sessionMgr.initialize();           // 载入索引 + 清理；不创建会话、不恢复指针
+const supervisorAgent = createSupervisorAgent({ ... });  // 不注入 sessionManager，首次派发时 rebind
+sharedServices.sessions = sessionMgr;    // commands.ts 使用（dispatchTask 自动新建）
 ```
 
 ## 9. 测试要点（供 s5）

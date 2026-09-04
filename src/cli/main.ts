@@ -76,17 +76,14 @@ const agentRegistry = await AgentRegistry.load(defaultAgentDirs(), (warning) =>
 
 const events = new EventBus();
 const configStore = new JsonFileConfigStore();
-// Session management: persistent JSONL conversations under the user data dir;
-// initialize() still loads the index (needed by /sessions), then startup always
-// creates a fresh session — old ones remain switchable via /sessions + /switch.
+// Session management: persistent JSONL conversations under the user data dir.
+// initialize() only loads the index (needed by /sessions); no session is
+// created here — the first dispatched task auto-creates one (dispatchTask),
+// so an untouched startup leaves nothing on disk. Old sessions stay
+// switchable via /sessions + /switch.
 const sessionStore = new JsonFileSessionStore();
 const sessionManager = new SessionManager({ cwd: process.cwd(), store: sessionStore });
 await sessionManager.initialize();
-const startupRecord = await sessionManager.create();
-const startupSession: Awaited<ReturnType<typeof sessionManager.bind>> = await sessionManager.bind(
-  startupRecord.id
-);
-log(`[主 agent] 已新建会话：${startupRecord.name ?? startupRecord.id}（${startupRecord.id}）`);
 // Sub-agent sessions are created lazily on first dispatch and reused after;
 // the supervisor and supervisor-agent reference each other lazily, so both
 // bindings carry explicit types.
@@ -99,7 +96,6 @@ const supervisorAgent = createSupervisorAgent({
   onToolStart: toolStart,
   onToolEnd: toolEnd,
   configStore,
-  sessionManager: startupSession,
   agents: agentRegistry,
   definition: agentRegistry.supervisor,
   // Forwarder: `supervisor` is declared right after; run() only fires on dispatch.
@@ -148,7 +144,7 @@ console.log("pi-swarm 主 agent 已启动。");
 const loadedAgents = agentRegistry.list();
 console.log(loadedAgents.length > 0 ? `已加载子 agent：${loadedAgents.map((agent) => agent.name).join(", ")}` : "未加载任何子 agent，所有任务由 supervisor 自执行。");
 console.log(
-  "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close 管理会话，/status 查看状态，或 /exit 退出。\n"
+  "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close 管理会话，/status 查看状态，或 /exit 退出。首次输入任务会自动新建会话。\n"
 );
 
 log(`[主 agent] ${await supervisorAgent.restore()}`);
