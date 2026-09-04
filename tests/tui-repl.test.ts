@@ -197,6 +197,41 @@ test("toolStart commits the pending stream tail first, keeping arrival order", (
   assert.ok(log.children[1].render(80).join("\n").includes("src/a.ts"));
 });
 
+test("flushed stream tail leaves the stream area: no duplicated content around tool rows", () => {
+  // Regression: flushStream() committed the live tail into the log but left the
+  // raw streaming copy in the stream area, so the text/thinking showed twice
+  // (once above the tool row, once below) until the next stream event rebuilt
+  // the area.
+  const { repl, log, stream } = makeRepl();
+
+  repl.streamText("调用工具前的说明");
+  assert.ok(stream.children.length > 0, "live tail visible while streaming");
+  repl.toolStart("supervisor", "t5", "bash", { command: "npm test" });
+  assert.equal(stream.children.length, 0, "text tail must leave the stream area when committed");
+  repl.toolEnd("supervisor", "t5", false);
+  repl.streamText("工具后的新内容");
+  assert.ok(stream.children.length > 0, "new live tail shows again for fresh text");
+
+  const text = log.children.map((child) => stripTerminalSequences(child.render(80).join("\n"))).join("\n");
+  const occurrences = text.split("调用工具前的说明").length - 1;
+  assert.equal(occurrences, 1, "committed content appears exactly once, not duplicated");
+});
+
+test("flushed thinking tail leaves the stream area when a tool row arrives", () => {
+  const { repl, log, stream } = makeRepl();
+  repl.streamThinking("先分析一下失败原因，可能和配置有关");
+  repl.toolStart("supervisor", "t6", "read", { path: "package.json" });
+
+  assert.equal(stream.children.length, 0, "thinking tail must leave the stream area when folded");
+  assert.equal(log.children.length, 2, "folded reasoning then the tool row");
+  assert.ok(!(log.children[0] instanceof Markdown), "thinking folds as collapsible reasoning");
+  const text = log.children.map((child) => stripTerminalSequences(child.render(80).join("\n"))).join("\n");
+  const rawText = log.children.map((child) => child.render(80).join("\n")).join("\n");
+  const occurrences = rawText.split("pi-swarm://think/1").length - 1;
+  assert.equal(occurrences, 1, "folded reasoning appears exactly once (collapsed summary)");
+  assert.ok(!text.includes("先分析一下失败原因"), "raw thinking is folded away, not left as a stale tail");
+});
+
 test("endStream finalizes tool lines still marked running as interrupted", () => {
   const { repl, log } = makeRepl();
   repl.toolStart("supervisor", "t4", "bash", { command: "sleep 100" });

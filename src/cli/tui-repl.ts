@@ -552,6 +552,10 @@ export class TuiRepl {
       tab.partialBlock = "";
     }
     tab.streamKind = undefined;
+    // The committed tail must leave the stream area at the same time, or the
+    // raw copy lingers below the newly added line (tool row/log entry) and the
+    // content shows twice until the next stream event rebuilds the area.
+    tab.stream.clear();
   }
 
   /** Adds one finalized markdown block to the transcript (no stream flush). */
