@@ -236,6 +236,20 @@ export class Agent {
     return `已切换会话：${name ?? sessionManager.getSessionId()}`;
   }
 
+  /**
+   * Draft-mode support: releases the bound session without opening a new one
+   * (the next ensureSession/rebind builds a fresh one). Pending model/thinking
+   * preferences survive — they are exactly the draft's configurable settings.
+   */
+  public detach(): void {
+    if (this.prompting) throw new SessionBusyError("会话正在输出，无法切换；请等待当前任务完成");
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    this.session?.dispose();
+    this.session = undefined;
+    this.piSession = undefined;
+  }
+
   /** Whether a prompt is currently streaming (session switches are rejected). */
   public isBusy(): boolean {
     return this.prompting;
@@ -426,10 +440,19 @@ export class Agent {
     return `当前模型：${specifier}`;
   }
 
-  /** Thinking levels the current model supports (ascending); empty before a model is selected. */
+  /** Thinking levels the current model supports (ascending); before a session exists, resolved from the pending model preference. */
   public thinkingLevels(): string[] {
-    const model = this.session?.model;
+    const model = this.session?.model ?? this.requestedModelInstance();
     return model ? [...getSupportedThinkingLevels(model)] : [];
+  }
+
+  /** Resolves the pending model preference against the runtime; undefined when unset or unknown. */
+  private requestedModelInstance(): ReturnType<ModelRuntime["getModel"]> | undefined {
+    const specifier = this.requestedModel;
+    if (!specifier || !this.modelRuntime) return undefined;
+    const separator = specifier.indexOf("/");
+    if (separator <= 0 || separator === specifier.length - 1) return undefined;
+    return this.modelRuntime.getModel(specifier.slice(0, separator), specifier.slice(separator + 1));
   }
 
   public async setThinkingLevel(level: string): Promise<string> {
@@ -439,16 +462,19 @@ export class Agent {
   }
 
   private applyThinkingLevel(level: string): string {
-    const model = this.session?.model;
+    // 草稿态（无会话）也允许设置：按待生效的模型校验，会话建立后自动应用。
+    const model = this.session?.model ?? this.requestedModelInstance();
     if (!model) throw new Error("请先使用 /model 选择模型；thinking level 由当前模型决定");
     const normalized = level.trim().toLowerCase() as ModelThinkingLevel;
     const supported = getSupportedThinkingLevels(model);
     if (!supported.includes(normalized)) {
       throw new Error(`当前模型支持的 thinking level：${supported.join(", ")}`);
     }
-    this.session!.setThinkingLevel(normalized);
+    this.session?.setThinkingLevel(normalized);
     this.requestedThinkingLevel = normalized;
-    return `当前 thinking level：${normalized}`;
+    return this.session
+      ? `当前 thinking level：${normalized}`
+      : `thinking level 将在会话建立后应用：${normalized}`;
   }
 
   /**

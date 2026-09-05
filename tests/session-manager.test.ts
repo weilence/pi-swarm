@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
@@ -506,4 +506,84 @@ test("sessions survive a restart through the json file store", async () => {
   assert.equal(second.current(), undefined, "restart starts with no current session");
   assert.ok(second.get(alpha.id)?.closedAt, "the closed session is still listed after restart");
   assert.deepEqual((await second.list()).map((summary) => summary.name), ["beta", "alpha"]);
+});
+
+test("startDraft opens a draft without touching the index; materialize creates for real", async () => {
+  const { manager, store } = await makeHarness();
+  await manager.initialize();
+
+  manager.startDraft();
+  assert.equal(manager.isDraft(), true, "the pointer enters the draft state");
+  assert.equal(manager.current(), undefined);
+  assert.deepEqual(await store.load(), [], "the index stays untouched");
+
+  const record = await manager.materialize();
+  assert.equal(manager.isDraft(), false, "materialize consumes the draft");
+  assert.equal(manager.current()?.id, record.id);
+  const stored = await store.load();
+  assert.ok(stored.some((entry) => entry.id === record.id), "the record is persisted");
+});
+
+test("materialize prefers the draft name over the fallback, and the fallback over nothing", async () => {
+  const { manager } = await makeHarness();
+  await manager.initialize();
+
+  manager.startDraft("显式名");
+  const named = await manager.materialize("消息摘要");
+  assert.equal(named.name, "显式名", "the draft name wins");
+  assert.equal(manager.isDraft(), false);
+
+  manager.startDraft();
+  const fallback = await manager.materialize("消息摘要");
+  assert.equal(fallback.name, "消息摘要", "the fallback names an unnamed draft");
+});
+
+test("repeated startDraft keeps the draft name; switching to a real session discards it", async () => {
+  const { manager } = await makeHarness();
+  await manager.initialize();
+  const alpha = await manager.create({ name: "alpha" });
+
+  manager.startDraft("draft-a");
+  manager.startDraft();
+  assert.equal(manager.isDraft(), true, "still the same draft");
+
+  await manager.switch(alpha.id);
+  assert.equal(manager.isDraft(), false, "switching away leaves the draft");
+  assert.equal(manager.current()?.id, alpha.id);
+
+  manager.startDraft();
+  const fresh = await manager.materialize("summary");
+  assert.equal(fresh.name, "summary", "the discarded draft name does not leak into a later draft");
+});
+
+test("materialize is idempotent when a current session already exists", async () => {
+  const { manager } = await makeHarness();
+  await manager.initialize();
+  const alpha = await manager.create({ name: "alpha" });
+
+  // Defensive branch: materialize with a live current session returns it as-is
+  // instead of creating a second one.
+  const record = await manager.materialize("summary");
+  assert.equal(record.id, alpha.id, "the current session is returned untouched");
+  assert.equal(manager.isDraft(), false, "no draft state lingers");
+});
+
+test("delete removes the record, the current pointer, and the jsonl file", async () => {
+  const { manager } = await makeHarness();
+  await manager.initialize();
+  const alpha = await manager.create({ name: "alpha" });
+  await writeFile(alpha.sessionFile!, "fake jsonl content");
+  const beta = await manager.create({ name: "beta" }); // becomes current, no file flushed yet
+
+  const removed = await manager.delete(alpha.id);
+  assert.equal(removed.id, alpha.id, "the removed record is returned");
+  await assert.rejects(() => stat(alpha.sessionFile!), "the jsonl file is deleted");
+  assert.deepEqual((await manager.list()).map((summary) => summary.name), ["beta"]);
+  assert.equal(manager.current()?.id, beta.id, "a non-current delete keeps the pointer");
+  await assert.rejects(() => manager.delete(alpha.id), /不存在/, "deleting again reports not-found");
+
+  // Deleting the current session clears the pointer; a missing file is fine.
+  await manager.delete(beta.id);
+  assert.equal(manager.current(), undefined);
+  assert.deepEqual(await manager.list(), []);
 });

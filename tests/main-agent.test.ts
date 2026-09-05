@@ -35,7 +35,7 @@ test("main agent stays alive until an explicit exit command", async () => {
 
     // Lazy session creation: an untouched startup must not create a session —
     // no "已新建会话" log line and no session index file on disk. The first
-    // dispatched task auto-creates one (dispatchTask) and persists it then.
+    // the dispatched task materializes the draft (dispatchTask) and persists it then.
     assert.doesNotMatch(output, /已新建会话/);
     assert.equal(existsSync(join(userData, "sessions", "index.json")), false, "startup must not persist a session index");
 

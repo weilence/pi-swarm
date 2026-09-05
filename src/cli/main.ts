@@ -14,7 +14,7 @@ import { createSubAgent } from "../pi/sub-agent.ts";
 import type { Agent } from "../pi/agent.ts";
 import { TuiRepl, summarizeToolArgs } from "./tui-repl.ts";
 import { AgentRegistry, defaultAgentDirs } from "../core/agent-registry.ts";
-import { executeCommand, type CommandServices, type CommandState } from "./commands.ts";
+import { openDraftSession, deleteSessionById, executeCommand, switchToSessionId, type CommandServices, type CommandState } from "./commands.ts";
 
 try {
   loadEnvFile(resolve(process.cwd(), ".env"));
@@ -144,7 +144,7 @@ console.log("pi-swarm 主 agent 已启动。");
 const loadedAgents = agentRegistry.list();
 console.log(loadedAgents.length > 0 ? `已加载子 agent：${loadedAgents.map((agent) => agent.name).join(", ")}` : "未加载任何子 agent，所有任务由 supervisor 自执行。");
 console.log(
-  "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close 管理会话，/status 查看状态，或 /exit 退出。首次输入任务会自动新建会话。\n"
+  "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close /delete 管理会话（/new 只开草稿，首次发送时才创建），/status 查看状态，或 /exit 退出。\n"
 );
 
 log(`[主 agent] ${await supervisorAgent.restore()}`);
@@ -176,10 +176,31 @@ const sharedServices = {
     },
     pick: (title, options) => repl!.pick(title, options)
   };
+  // 会话栏快照：会话是延迟创建的（启动不建会话、「＋ 新建」只开草稿），
+  // 草稿激活时列表顶部多一行「✎ 草稿」；首个任务物化、/new /switch /close
+  // 或点击会话之后，都统一在这里刷新。
+  const refreshSessionBar = async (): Promise<void> => {
+    if (!repl) return;
+    repl.setDraftMode(sessionManager.isDraft());
+    repl.setSessions(await sessionManager.list());
+  };
   repl = new TuiRepl({
     onSubmit: async (line) => {
       // 必须把结果透传（如 "exit"），否则 /exit 永远不会结束进程。
-      return await executeCommand(line, services, commandState);
+      const outcome = await executeCommand(line, services, commandState);
+      await refreshSessionBar();
+      return outcome;
+    },
+    // 会话栏点击："draft" 是未保存草稿（等同 /new），其余为会话 id，走
+    // /switch 同一核心流程。右键菜单的删除动作走 /delete 同一核心流程。
+    onSessionClick: async (sessionId) => {
+      if (sessionId === "draft") await openDraftSession(services);
+      else await switchToSessionId(sessionId, services);
+      await refreshSessionBar();
+    },
+    onDeleteSession: async (sessionId) => {
+      await deleteSessionById(sessionId, services);
+      await refreshSessionBar();
     },
     onExit: settleExit
   });
@@ -187,6 +208,7 @@ const sharedServices = {
   repl.registerAgent("supervisor");
   for (const definition of agentRegistry.list()) repl.registerAgent(definition.name);
   repl.start();
+  await refreshSessionBar();
   await exited;
   repl.stop();
 }

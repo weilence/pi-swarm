@@ -9,7 +9,7 @@
 
 ## 2. 目标
 
-1. supervisor 会话默认持久化（JSONL 落盘）；但启动不创建会话，首次派发任务时自动新建并立即持久化，旧会话经 /sessions + /switch 手动恢复——没发过消息的启动在磁盘上不留任何会话记录。
+1. supervisor 会话默认持久化（JSONL 落盘）；但启动不创建会话，「新建」也只开草稿：首次派发任务时才把草稿物化为真实会话并立即持久化，旧会话经 /sessions + /switch 手动恢复——没发过消息的启动在磁盘上不留任何会话记录。
 2. 支持多会话：创建、命名、列出、切换、关闭。
 3. 生命周期与过期策略：active 会话永不过期；closed 会话按 TTL 从索引清理（文件保留）。
 4. 存储抽象：会话索引可替换（内存实现便于测试，JSON 文件实现用于生产）。
@@ -153,12 +153,14 @@ export class SessionManager {
 
 | 命令 | 交互 | 非交互 |
 |---|---|---|
-| `/new [name]` | 创建并切换 | 同左 |
+| `/new [name]` | 只开草稿（清空 transcript，不创建记录；重复调用幂等）；首次发送时物化 | 同左 |
 | `/sessions` / `/ls` | 列出（含 id、名称、状态、current 标记、更新时间、消息数） | 同左 |
-| `/switch <id\|序号>` | 校验后切换；序号取 /sessions 显示顺序 | 同左 |
-| `/close [id\|序号]` | 关闭（缺省当前）并提示"已关闭，输入任务将自动新建会话或 /switch 恢复" | 同左 |
+| `/switch <id\|序号\|draft>` | 校验后切换；序号取 /sessions 显示顺序；`draft` 开草稿 | 同左 |
+| `/close [id\|序号]` | 关闭（缺省当前）并提示“已关闭，输入任务将开启新草稿或 /switch 恢复” | 同左 |
+| `/delete <id\|序号>` | 删除会话（索引 + JSONL 文件）；删当前会话先解绑 agent，再打开侧栏同位会话（updatedAt 倒序：后一位顶替，末位取前一位），无其他活跃会话才落回草稿态；会话栏右键菜单共用此核心 | 同左 |
 
-- 约束：当前会话不存在（从未创建或已关闭）且用户直接输入任务时，自动 `create()` 新会话承接（无缝体验）。
+- 约束：当前会话不存在（草稿、从未创建或已关闭）且用户直接输入任务时，`materialize()` 把草稿物化为新会话承接（无缝体验）：草稿名优先，否则用首条消息摘要命名。
+- 草稿态：`SessionManager.startDraft()/isDraft()/materialize()`；agent 侧由 `Agent.detach()` 解绑会话，模型/thinking 作为待生效配置保留在 agent 上，物化 rebind 后自动应用。
 
 ## 8. 集成点（main.ts）
 
@@ -167,7 +169,7 @@ const sessionStore = new JsonFileSessionStore();
 const sessionMgr = new SessionManager({ cwd: process.cwd(), store: sessionStore });
 await sessionMgr.initialize();           // 载入索引 + 清理；不创建会话、不恢复指针
 const supervisorAgent = createSupervisorAgent({ ... });  // 不注入 sessionManager，首次派发时 rebind
-sharedServices.sessions = sessionMgr;    // commands.ts 使用（dispatchTask 自动新建）
+sharedServices.sessions = sessionMgr;    // commands.ts 使用（dispatchTask 物化草稿）
 ```
 
 ## 9. 测试要点（供 s5）

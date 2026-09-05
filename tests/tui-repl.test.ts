@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Component } from "@earendil-works/pi-tui";
-import { Container, Markdown, stripTerminalSequences, Text } from "@earendil-works/pi-tui";
-import { splitMarkdownBlocks, summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
+import { Container, Markdown, stripTerminalSequences, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { parseRightClick, splitMarkdownBlocks, summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
+import type { SessionSummary } from "../src/core/session/session-types.ts";
 
 test("splitMarkdownBlocks cuts on blank lines outside code fences", () => {
   assert.deepEqual(splitMarkdownBlocks("para1\n\npara2"), { blocks: ["para1"], rest: "para2" });
@@ -74,11 +75,12 @@ function makeFakeUi() {
   return ui;
 }
 
-/** The active transcript container: layoutRoot → ScrollView → scrollBody → transcript([log, stream]). */
+/** The active transcript container: layoutRoot → HStack[sidebar, VStack[ScrollView → scrollBody → transcript([log, stream]), inputArea]]. */
 function mountedChat(ui: ReturnType<typeof makeFakeUi>): Container {
   const root = ui.layoutRoot! as Container;
-  const [chatArea] = root.children as [Container];
-  const [scrollBody] = chatArea.children as [Container];
+  const [, chatColumn] = root.children as [Container, Container];
+  const [scrollView] = chatColumn.children as [Container];
+  const [scrollBody] = scrollView.children as [Container];
   const [transcript] = scrollBody.children as [Container];
   return transcript;
 }
@@ -295,7 +297,8 @@ test("busy mode keeps the editor mounted; Enter is swallowed until the task ends
     onSubmit: async (line) => {
       submitted.push(line);
       const root = ui.layoutRoot! as Container;
-      const inputArea = root.children[1] as Container;
+      const [, chatColumn] = root.children as [Container, Container];
+      const inputArea = chatColumn.children[1] as Container;
       busyState = {
         editorMounted: inputArea.children.includes(editor as never),
         busyTextShown: stripTerminalSequences(inputArea.render(80).join("\n")).includes("任务执行中"),
@@ -441,4 +444,233 @@ test("collapsible reasoning expands and collapses via pi-swarm://think links", (
 
   repl.handleLink("pi-swarm://think/1");
   assert.equal(reasoning.render(80).length, 1, "second click collapses again");
+});
+
+/** Minimal SessionSummary for sessions-bar tests. */
+function makeSummary(overrides: Partial<SessionSummary> & { id: string }): SessionSummary {
+  return {
+    name: overrides.id,
+    status: "active",
+    current: false,
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2025-01-01T00:00:00.000Z",
+    messageCount: 0,
+    ...overrides
+  };
+}
+
+/**
+ * The sessions sidebar parts: first child of the layout HStack (left of the
+ * chat column), a VStack of [top border, scrolling rows, bottom border].
+ */
+function sidebarParts(ui: ReturnType<typeof makeFakeUi>) {
+  const root = ui.layoutRoot! as Container;
+  const column = root.children[0] as unknown as Container;
+  const [topBorder, scroll, bottomBorder] = column.children as [
+    { render(width: number): string[] },
+    Component,
+    { render(width: number): string[] }
+  ];
+  const rows = (scroll as unknown as { child: { render(width: number): string[] } }).child;
+  return { column, topBorder, scroll, bottomBorder, rows };
+}
+
+test("sessions sidebar is a full-height bordered column with scrollable rows", () => {
+  const { repl, ui, overlays } = makeRepl();
+  const { column, topBorder, scroll, bottomBorder, rows } = sidebarParts(ui);
+
+  // The sidebar is a layout column, not an overlay: only the agent tab bar remains.
+  assert.equal(overlays.length, 1);
+  assert.equal(column.children.length, 3, "top border + scrolling rows + bottom border");
+  assert.ok(stripTerminalSequences(topBorder.render(22)[0]).startsWith("╭"), "top border hugs the left edge");
+  const strippedTop = stripTerminalSequences(topBorder.render(22)[0]);
+  assert.ok(strippedTop.includes("─ 会话"), "the title rides the top border");
+  assert.ok(strippedTop.includes("＋ 新建"), "the ＋ 新建 link rides the title edge to save a row");
+  assert.ok(topBorder.render(22)[0].includes("pi-swarm://session/draft"), "＋ 新建 stays a clickable link (draft id)");
+  assert.ok(stripTerminalSequences(bottomBorder.render(22)[0]).startsWith("╰"), "bottom border closes the box");
+
+  // Full-height wiring: the scroll viewport grows to absorb the spare height.
+  const entries = (column as unknown as { entries: { grow: number }[] }).entries;
+  assert.equal(entries[1].grow, 1, "the rows viewport stretches to the terminal height");
+
+  // Overflow is the ScrollView's job, not truncation: every session stays a row.
+  const sessions = Array.from({ length: 30 }, (_, index) => makeSummary({ id: `s${index}`, name: `会话${index}号` }));
+  repl.setSessions(sessions);
+  assert.equal(rows.render(22).length, 30, "one row per session, nothing dropped (＋ 新建 lives on the border)");
+  assert.equal((scroll as unknown as { scrollbar: string }).scrollbar, "auto", "the sidebar thumb stays hidden at rest (no gray stripe by the gap)");
+  assert.equal((scroll as unknown as { primary: boolean }).primary, false, "the transcript stays the primary scroller");
+  assert.equal((scroll as unknown as { overscroll: string }).overscroll, "contain", "sidebar wheel does not chain into the chat");
+
+  // The transcript scrolls with a visible scrollbar too, and a one-column gap
+  // keeps the sidebar's scrollbar from touching the chat content.
+  const root = ui.layoutRoot! as Container;
+  const chatScroll = (root.children[1] as unknown as Container).children[0];
+  assert.equal((chatScroll as unknown as { scrollbar: string }).scrollbar, "auto", "the transcript scrollbar is transient (auto-visible)");
+  assert.equal((root as unknown as { gap: number }).gap, 1, "one blank column between sidebar and chat");
+});
+
+test("sessions sidebar rows list current/closed/empty states and stay inside the column", () => {
+  const { repl, ui } = makeRepl();
+  const { topBorder, rows } = sidebarParts(ui);
+  const plain = (width = 22) => stripTerminalSequences(rows.render(width).join("\n"));
+
+  // Lazy creation: nothing exists yet — the border ＋ link and the empty-state hint.
+  assert.ok(topBorder.render(22)[0].includes("pi-swarm://session/draft"), "＋ 新建 is always offered as a link");
+  assert.ok(plain().includes("暂无会话"), "empty state hints at lazy auto-create");
+
+  repl.setSessions([
+    makeSummary({ id: "s1", name: "会话甲", current: true }),
+    makeSummary({ id: "s2", name: "会话乙" }),
+    makeSummary({ id: "s3", name: "会话丙", status: "closed" })
+  ]);
+  const rendered = rows.render(22);
+  const raw = rendered.join("\n");
+  assert.ok(raw.includes("pi-swarm://session/s1"), "each session is its own OSC 8 link");
+  assert.ok(raw.includes("pi-swarm://session/s2"));
+  assert.ok(!plain().includes("暂无会话"), "hint disappears once sessions exist");
+  assert.ok(raw.includes("\x1b[7m● 会话甲\x1b[27m"), "current session is highlighted with a ● marker");
+  assert.ok(plain().includes("✕ 会话丙"), "closed sessions show a ✕ marker");
+  assert.ok(plain().includes("  会话乙"), "other sessions keep marker alignment");
+
+  // Long names never spill past the column (rows render inside a scrollbar
+  // viewport one column narrower than the bordered sidebar).
+  repl.setSessions([makeSummary({ id: "wide", name: "很长的会话名称占位符很多字" })]);
+  for (const line of rows.render(22)) {
+    assert.ok(visibleWidth(line) <= 22, "every row fits the sidebar width");
+  }
+  assert.ok(!plain(22).includes("很长的会话名称占位符很多字"), "long names are ellipsized before rendering");
+});
+
+test("setDraftMode pins a highlighted ✎ 草稿 row at the top of the sidebar", () => {
+  const { repl, ui } = makeRepl();
+  const { rows } = sidebarParts(ui);
+  const plain = (width = 22) => stripTerminalSequences(rows.render(width).join("\n"));
+
+  assert.ok(!plain().includes("草稿"), "no draft row before setDraftMode");
+
+  repl.setDraftMode(true);
+  const rendered = rows.render(22);
+  assert.ok(rendered.join("\n").includes("pi-swarm://session/draft"), "the draft row is its own OSC 8 link");
+  assert.ok(plain().includes("✎ 草稿（未保存）"), "the draft row is visible");
+  assert.ok(rendered.join("\n").includes("\x1b[7m"), "the draft row uses the current-session highlight");
+
+  // The hint stays hidden while a draft is open (the draft itself is the hint).
+  repl.setSessions([]);
+  assert.ok(!plain().includes("暂无会话"), "empty-state hint yields to the draft row");
+
+  repl.setDraftMode(false);
+  assert.ok(!plain().includes("草稿"), "leaving draft mode removes the row");
+});
+
+test("clearTranscript empties the active transcript (draft starts from a clean slate)", () => {
+  const { repl, log, stream } = makeRepl();
+  repl.appendLine("旧行一");
+  repl.appendMarkdown("旧正文");
+  repl.streamText("未完成的流");
+  assert.ok(log.children.length > 0 || stream.children.length > 0);
+
+  repl.clearTranscript();
+  assert.equal(log.children.length, 0, "the log is emptied");
+  assert.equal(stream.children.length, 0, "the live tail is emptied");
+
+  // After clearing, new content still lands normally.
+  repl.appendLine("新行");
+  assert.equal(log.children.length, 1);
+});
+
+test("handleLink routes pi-swarm://session clicks to onSessionClick", () => {
+  const ui = makeFakeUi();
+  const clicked: string[] = [];
+  const repl = new TuiRepl({
+    ui: ui as never,
+    onSubmit: async () => undefined,
+    onExit: () => undefined,
+    onSessionClick: (id) => {
+      clicked.push(id);
+    }
+  });
+  repl.handleLink("pi-swarm://session/abc-123");
+  repl.handleLink("pi-swarm://session/draft");
+  repl.handleLink("pi-swarm://agent/supervisor"); // agent links stay agent switches
+  repl.handleLink("pi-swarm://unrelated/xyz");
+  assert.deepEqual(clicked, ["abc-123", "draft"]);
+});
+
+test("parseRightClick keeps only right-button SGR mouse sequences", () => {
+  assert.deepEqual(parseRightClick("\x1b[<2;5;8M"), { x: 4, y: 7, release: false }, "press (1-based coords)");
+  assert.deepEqual(parseRightClick("\x1b[<2;5;8m"), { x: 4, y: 7, release: true }, "release");
+  assert.equal(parseRightClick("\x1b[<0;5;8M"), undefined, "left button is not a right-click");
+  assert.equal(parseRightClick("\x1b[<64;5;8M"), undefined, "wheel events are ignored");
+  assert.equal(parseRightClick("\x1b[<32;5;8M"), undefined, "motion events are ignored");
+  assert.equal(parseRightClick("\x1b[A"), undefined, "non-mouse input passes through");
+});
+
+test("right-click on a sidebar session opens a context menu; items work by mouse link and keyboard", () => {
+  const ui = makeFakeUi();
+  const deleted: string[] = [];
+  const repl = new TuiRepl({
+    ui: ui as never,
+    onSubmit: async () => undefined,
+    onExit: () => undefined,
+    onDeleteSession: (id) => {
+      deleted.push(id);
+    }
+  });
+  repl.setSessions([
+    makeSummary({ id: "s1", name: "会话甲" }),
+    makeSummary({ id: "s2", name: "会话乙" })
+  ]);
+  const rightClick = (x: number, y: number): void =>
+    (repl as unknown as { handleSidebarRightClick(x: number, y: number): void }).handleSidebarRightClick(x, y);
+  // The constructor already shows the agent tab bar overlay; measure deltas.
+  const baseline = ui.overlays.length;
+
+  // Rows start at screen row 1: y=1 is the first session, y=0 the top border.
+  rightClick(1, 1);
+  assert.equal(ui.overlays.length, baseline + 1, "the context menu overlay is shown");
+  const menu = ui.overlays[ui.overlays.length - 1]!.component as unknown as { render(width: number): string[] };
+  assert.ok(menu.render(26).join("\n").includes("pi-swarm://menu/0"), "menu items are OSC 8 links (mouse-clickable)");
+
+  // Mouse click on the 删除 item routes through the hyperlink handler.
+  repl.handleLink("pi-swarm://menu/0");
+  assert.deepEqual(deleted, ["s1"], "the menu link runs the delete action");
+  assert.equal(ui.overlays.length, baseline, "the menu closes after the action");
+
+  // Keyboard path: open again, arrow down to 取消, press Enter — nothing is deleted.
+  rightClick(1, 1);
+  const keyed = ui.overlays[ui.overlays.length - 1]!.component as unknown as { handleInput(data: string): void };
+  keyed.handleInput("\x1b[B"); // down → 取消
+  keyed.handleInput("\r"); // enter
+  assert.deepEqual(deleted, ["s1"], "取消 runs no action");
+  assert.equal(ui.overlays.length, baseline, "enter closes the menu");
+
+  rightClick(30, 1);
+  rightClick(1, 0);
+  assert.equal(ui.overlays.length, baseline, "clicks outside the sidebar rows show no menu");
+});
+
+test("with a draft open the first sidebar row is the draft and the second is session one", () => {
+  const ui = makeFakeUi();
+  const deleted: string[] = [];
+  const repl = new TuiRepl({
+    ui: ui as never,
+    onSubmit: async () => undefined,
+    onExit: () => undefined,
+    onDeleteSession: (id) => {
+      deleted.push(id);
+    }
+  });
+  repl.setSessions([makeSummary({ id: "s1", name: "会话甲" })]);
+  repl.setDraftMode(true);
+  const rightClick = (x: number, y: number): void =>
+    (repl as unknown as { handleSidebarRightClick(x: number, y: number): void }).handleSidebarRightClick(x, y);
+  const baseline = ui.overlays.length;
+
+  rightClick(1, 1); // the draft row: nothing to delete
+  assert.equal(ui.overlays.length, baseline, "the draft row has no context menu");
+
+  rightClick(1, 2); // session one shifted down by the draft row
+  assert.equal(ui.overlays.length, baseline + 1);
+  repl.handleLink("pi-swarm://menu/0");
+  assert.deepEqual(deleted, ["s1"]);
 });

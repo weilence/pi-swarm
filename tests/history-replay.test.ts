@@ -58,10 +58,11 @@ function makeRepl(): { repl: TuiRepl; log: Container } {
     hasOverlay: () => false
   };
   const repl = new TuiRepl({ ui: ui as never, onSubmit: async () => undefined, onExit: () => undefined });
-  // layoutRoot → VStack[ScrollView(scrollBody → transcript), inputArea]; transcript = [log, stream].
+  // layoutRoot → HStack[sidebar, VStack[ScrollView(scrollBody → transcript), inputArea]]; transcript = [log, stream].
   const root = ui.layoutRoot! as Container;
-  const [chatArea] = root.children as [Container];
-  const [scrollBody] = chatArea.children as [Container];
+  const [, chatColumn] = root.children as [Container, Container];
+  const [scrollView] = chatColumn.children as [Container];
+  const [scrollBody] = scrollView.children as [Container];
   const [transcript] = scrollBody.children as [Container];
   const [log] = transcript.children as [Container];
   return { repl, log };

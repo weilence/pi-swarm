@@ -1,27 +1,25 @@
 import {
   Container,
   Editor,
-  fuzzyFilter,
-  Input,
+  HStack,
   type MarkdownTheme,
   Markdown,
   matchesKey,
   type OverlayHandle,
   ProcessTerminal,
   ScrollView,
-  SelectList,
-  type SelectItem,
   Text,
   TuiAltScreen,
+  truncateToWidth,
   type ViewportTUI,
   visibleWidth,
-  wrapTextWithAnsi,
   VStack
 } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
-import { dim } from "../core/ansi.ts";
+import type { SessionSummary } from "../core/session/session-types.ts";
 import { summarizeToolArgs } from "../core/tool-summary.ts";
 import type { CommandOutcome, PickerOption } from "./commands.ts";
+import { AgentTabBar, CollapsibleReasoning, PickerComponent, SessionSidebar, SidebarBorderLine, ThinkingTail, ToolCallLine, UserMessage } from "./components.ts";
 
 export { summarizeToolArgs };
 
@@ -31,14 +29,33 @@ export interface TuiReplOptions {
   /** Returns "exit" to end the process (e.g. the /exit command). */
   onSubmit: (line: string) => Promise<CommandOutcome | void>;
   onExit: () => void;
+  /** A sessions-bar entry was clicked; "draft" means the ＋ 新建/草稿 entry. */
+  onSessionClick?: (sessionId: string) => void | Promise<void>;
+  /** A session was picked for deletion from the sidebar's right-click menu. */
+  onDeleteSession?: (sessionId: string) => void | Promise<void>;
 }
 
 /** Agent that owns output when no explicit label is passed. */
 const DEFAULT_AGENT = "supervisor";
 
 /** Wraps text in an OSC 8 hyperlink so TuiAltScreen click detection can resolve the url. */
-function link(url: string, text: string): string {
+export function link(url: string, text: string): string {
   return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
+}
+
+/**
+ * Parses an SGR mouse sequence (`\x1b[<b;x;yM|m`, 1-based coords) and keeps
+ * only the right (secondary) button press/release. pi-tui consumes every mouse
+ * event itself, so right-clicks are intercepted in the terminal wrapper below
+ * before they ever reach it; everything else passes through untouched.
+ */
+export function parseRightClick(data: string): { x: number; y: number; release: boolean } | undefined {
+  const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+  if (!match) return undefined;
+  const button = Number(match[1]);
+  if ((button & 64) !== 0 || (button & 32) !== 0) return undefined; // wheel / motion
+  if ((button & 3) !== 2) return undefined; // right button only
+  return { x: Number(match[2]) - 1, y: Number(match[3]) - 1, release: match[4] === "m" };
 }
 
 /** Counts opening code fences so blocks inside ``` pairs stay together. */
@@ -72,6 +89,58 @@ export function splitMarkdownBlocks(buffer: string): { blocks: string[]; rest: s
   return { blocks: blocks.map((block) => block.trim()).filter((block) => block.length > 0), rest };
 }
 
+/**
+ * Right-click menu on a sidebar session: a small positioned overlay. Items are
+ * OSC 8 links so mouse clicks work (this app resolves clicks through
+ * hyperlinks, not hit-testing — see TuiRepl.handleLink), while ↑/↓/Enter/Esc
+ * drive the same menu from the keyboard. The selected row is reverse-videoed.
+ */
+class SessionContextMenu {
+  private selected = 0;
+
+  public constructor(
+    private readonly title: string,
+    private readonly actions: readonly { label: string; run(): void }[],
+    private readonly close: () => void,
+    private readonly requestRender: () => void
+  ) { }
+
+  public handleInput(data: string): void {
+    if (matchesKey(data, "escape")) {
+      this.close();
+      return;
+    }
+    if (matchesKey(data, "up")) {
+      this.selected = (this.selected - 1 + this.actions.length) % this.actions.length;
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.selected = (this.selected + 1) % this.actions.length;
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      const action = this.actions[this.selected];
+      this.close();
+      action?.run();
+    }
+  }
+
+  public render(width: number): string[] {
+    const labelWidth = Math.max(8, width - 2);
+    const lines: string[] = [];
+    this.actions.forEach((action, index) => {
+      const label = truncateToWidth(action.label, labelWidth);
+      const styled = index === this.selected ? `\x1b[7m${label}\x1b[27m` : label;
+      lines.push(" " + link(`pi-swarm://menu/${index}`, styled));
+    });
+    return lines;
+  }
+
+  public invalidate(): void { }
+}
+
 /** Per-agent transcript state: the chat window mounts only the active one. */
 interface AgentTranscript {
   name: string;
@@ -87,196 +156,21 @@ interface AgentTranscript {
 }
 
 /** Render-time snapshot of one tab for the tab bar. */
-interface AgentTabState {
+export interface AgentTabState {
   name: string;
   active: boolean;
   unread: boolean;
 }
 
-/** Single-line, right-aligned row of agent tabs; each tab is a pi-swarm://agent link. */
-class AgentTabBar {
-  public constructor(private readonly snapshot: () => readonly AgentTabState[]) {}
+/** Fixed column width of the sessions sidebar (labels truncate to fit). */
+const SESSION_SIDEBAR_WIDTH = 22;
 
-  public render(width: number): string[] {
-    const tabs = this.snapshot();
-    if (tabs.length === 0) return [""];
-    const cells = tabs.map((tab) => {
-      const label = `${tab.unread ? "● " : ""}${tab.name}`;
-      const styled = tab.active ? `\x1b[7m${label}\x1b[27m` : label;
-      return link(`pi-swarm://agent/${encodeURIComponent(tab.name)}`, styled);
-    });
-    const line = cells.join(dim(" │ "));
-    const pad = Math.max(0, width - visibleWidth(line));
-    return [`${" ".repeat(pad)}${line}`];
-  }
-
-  public invalidate(): void {}
-}
-
-/**
- * One thinking entry in a transcript: a dim one-line summary that expands to
- * the full dim (width-wrapped) text when clicked, and collapses on click again.
- */
-class CollapsibleReasoning {
-  public readonly id: number;
-  private expanded = false;
-  private readonly chars: number;
-  private readonly body: Text;
-
-  public constructor(id: number, text: string) {
-    this.id = id;
-    this.chars = [...text].length;
-    this.body = new Text(dim(text), 0, 0);
-  }
-
-  public toggle(): void {
-    this.expanded = !this.expanded;
-  }
-
-  public render(width: number): string[] {
-    const label = this.expanded
-      ? `▾ 思考（${this.chars} 字）· 点击收起`
-      : `▸ 思考（${this.chars} 字）· 点击展开`;
-    const header = link(`pi-swarm://think/${this.id}`, dim(label));
-    return this.expanded ? [header, ...this.body.render(width)] : [header];
-  }
-
-  public invalidate(): void {
-    this.body.invalidate();
-  }
-}
-
-/**
- * Live thinking tail: the latest lines of the streaming thinking buffer, dim,
- * capped at 3 rendered lines. Expansion is automatic; folded reasoning still
- * lands in the transcript once the stream moves on.
- */
-class ThinkingTail {
-  private static readonly MAX_LINES = 3;
-
-  public constructor(private readonly buffer: string) {}
-
-  public render(width: number): string[] {
-    const wrapped = wrapTextWithAnsi(this.buffer.trim(), Math.max(20, width));
-    return wrapped
-      .slice(-ThinkingTail.MAX_LINES)
-      .map((line, index) => dim(index === 0 ? `▸ ${line}` : `  ${line}`));
-  }
-
-  public invalidate(): void {}
-}
-
-/** User bubble style: bright white text on a blue background. */
-const USER_BUBBLE_BG = "\x1b[48;5;61m";
-const USER_BUBBLE_FG = "\x1b[97m";
-const USER_BUBBLE_RESET = "\x1b[0m";
-
-/**
- * One user message: a right-aligned chat bubble with a colored background so
- * submitted input stands out from the agent's left-aligned output.
- */
-class UserMessage {
-  public constructor(private readonly message: string) {}
-
-  public render(width: number): string[] {
-    const rightMargin = 1;
-    const innerMax = Math.max(12, Math.floor(width * 0.7) - 2);
-    const lines: string[] = [];
-    for (const raw of this.message.split("\n")) {
-      lines.push(...(raw.trim() ? wrapTextWithAnsi(raw, innerMax) : [""]));
-    }
-    const rightEdge = Math.max(0, width - rightMargin);
-    return lines.map((line) => {
-      const bubbleWidth = visibleWidth(line) + 2; // one padding column per side
-      const pad = Math.max(0, rightEdge - bubbleWidth);
-      return `${" ".repeat(pad)}${USER_BUBBLE_BG}${USER_BUBBLE_FG} ${line} ${USER_BUBBLE_RESET}`;
-    });
-  }
-
-  public invalidate(): void {}
-}
-
-/**
- * One tool call in a transcript: a dim running line that mutates in place into
- * ✔/✘ when the call finishes (pi-tui re-renders components each frame).
- */
-class ToolCallLine {
-  private state: "running" | "ok" | "error" = "running";
-
-  public constructor(
-    private readonly toolName: string,
-    private readonly summary: string
-  ) {}
-
-  public finish(isError: boolean): void {
-    this.state = isError ? "error" : "ok";
-  }
-
-  public render(_width: number): string[] {
-    const label = `${this.toolName}${this.summary ? ` ${this.summary}` : ""}`;
-    if (this.state === "running") return [dim(`⏳ ${label} …`)];
-    const mark = this.state === "ok" ? dim("✔") : "\x1b[31m✘\x1b[0m";
-    return [`${mark}${dim(` ${label}`)}`];
-  }
-
-  public invalidate(): void {}
-}
-
-/** Overlay picker: title, type-to-filter input, fuzzy-filtered select list. */
-class PickerComponent<T> extends Container {
-  private readonly searchInput = new Input();
-  private list: SelectList;
-  private readonly listIndex: number;
-
-  private readonly entries: { option: PickerOption<T>; searchable: string }[];
-
-  public constructor(
-    title: string,
-    entries: readonly { option: PickerOption<T>; searchable: string }[],
-    private readonly settle: (value: T | undefined) => void
-  ) {
-    super();
-    this.entries = [...entries];
-    this.addChild(new Text(title, 0, 0));
-    this.list = this.buildList(this.entries);
-    this.listIndex = this.children.length - 1;
-    this.addChild(new Text(dim("输入过滤 · Enter 确认 · Esc 取消"), 0, 0));
-  }
-
-  private buildList(entries: readonly { option: PickerOption<T>; searchable: string }[]): SelectList {
-    const items: SelectItem[] = entries.map((entry, index) => ({
-      value: String(index),
-      label: entry.option.label,
-      description: entry.option.hint
-    }));
-    const list = new SelectList(items, Math.min(items.length, 10), getSelectListTheme());
-    list.onSelect = (item) => {
-      const entry = entries[Number(item.value)];
-      this.settle(entry ? entry.option.value : undefined);
-    };
-    list.onCancel = () => this.settle(undefined);
-    return list;
-  }
-
-  private applyFilter(query: string): void {
-    const previous = this.list.getSelectedItem();
-    const filtered = query ? fuzzyFilter(this.entries, query, (entry) => entry.searchable) : this.entries;
-    this.list = this.buildList(filtered);
-    this.children[this.listIndex] = this.list;
-    if (previous) {
-      const restore = filtered.findIndex((entry) => entry === this.entries[Number(previous.value)]);
-      if (restore >= 0) this.list.setSelectedIndex(restore);
-    }
-  }
-
-  public handleInput(data: string): void {
-    if (data === "\r" || data === "\n" || data.startsWith("\x1b")) {
-      this.list.handleInput(data);
-      return;
-    }
-    this.searchInput.handleInput(data);
-    this.applyFilter(this.searchInput.getValue());
-  }
+/** Render-time snapshot of one entry in the sessions sidebar. */
+export interface SessionEntryState {
+  id: string;
+  name: string;
+  current: boolean;
+  closed: boolean;
 }
 
 /**
@@ -303,6 +197,17 @@ export class TuiRepl {
   private readonly toolLines = new Map<string, ToolCallLine>();
   private readonly tabBar: AgentTabBar;
   private readonly tabBarOverlay?: OverlayHandle;
+  /** Sessions sidebar rows; mounted inside sidebarScroll. */
+  private readonly sidebar: SessionSidebar;
+  /** Viewport that scrolls the sidebar rows; fills the terminal height. */
+  private readonly sidebarScroll: ScrollView;
+  /** Sessions snapshot pushed by main.ts; rendered by the sidebar. */
+  private sessionList: readonly SessionEntryState[] = [];
+  /** True while the unsaved draft (新建未发送) is the active view. */
+  private draftMode = false;
+  /** Currently open right-click menu: item activation + dismissal from handleLink. */
+  private openMenu?: { select(index: number): void; dismiss(): void };
+  private menuHandle?: OverlayHandle;
   private pendingAnswer?: (answer: string) => void;
   /** True while a submitted task is running; Enter is swallowed, text is kept. */
   private busy = false;
@@ -317,7 +222,11 @@ export class TuiRepl {
       // Fullscreen (alternate-screen) mode: app owns the whole viewport with a
       // scrollable document that follows new output; screen is restored on stop.
       // OSC 8 links (agent tabs, thinking folds) route back into handleLink.
-      const ui = new TuiAltScreen(terminal, true, undefined, { openUrl: (url) => this.handleLink(url) });
+      // The terminal is wrapped so right-clicks reach the sidebar context menu
+      // before pi-tui consumes the mouse sequence (it never re-emits them).
+      const ui = new TuiAltScreen(this.wrapTerminalForRightClick(terminal), true, undefined, {
+        openUrl: (url) => this.handleLink(url)
+      });
       this.owned = { terminal, ui };
       this.ui = ui;
     }
@@ -335,14 +244,28 @@ export class TuiRepl {
       void this.handleSubmit(text);
     };
     this.inputArea.addChild(this.editor);
-    // Layout: the transcript scrolls inside a viewport that fills the space
-    // above the editor, and the editor stays pinned to the bottom edge so new
-    // output never pushes the input out of view.
-    this.scrollView = new ScrollView(this.scrollBody, { follow: "end", primary: true });
-    const root = new VStack();
-    root.addChild(this.scrollView, { grow: 1 });
-    root.addChild(this.inputArea, { shrink: 0 });
-    this.ui.setLayoutRoot(root);
+
+    // Layout: a full-height sessions sidebar sits on the left edge of the
+    // whole app — borders stay fixed while a ScrollView scrolls the rows.
+    // The sidebar's scrollbar is transient ("auto"): an always-on thumb here
+    // would paint a permanent gray column right next to the chat gap (and a
+    // full-height one whenever sessions fit the viewport). It still appears
+    // whenever an overflowing list is actually scrolled. A one-column gap
+    // separates sidebar from the chat column, which fills the rest with its
+    // own auto-visible scrollbar above the pinned editor.
+    this.scrollView = new ScrollView(this.scrollBody, { follow: "end", primary: true, scrollbar: "auto" });
+    this.sidebar = new SessionSidebar(() => ({ entries: this.sessionList, draft: this.draftMode }));
+    this.sidebarScroll = new ScrollView(this.sidebar, { scrollbar: "auto", overscroll: "contain" });
+
+    const sidebarColumn = new VStack();
+    sidebarColumn.addChild(new SidebarBorderLine(true), { shrink: 0 });
+    sidebarColumn.addChild(this.sidebarScroll, { grow: 1 });
+    sidebarColumn.addChild(new SidebarBorderLine(false), { shrink: 0 });
+
+    const chatColumn = new VStack();
+    chatColumn.addChild(this.scrollView, { grow: 1 });
+    chatColumn.addChild(this.inputArea, { shrink: 0 });
+
     this.registerAgent(DEFAULT_AGENT);
     this.tabBar = new AgentTabBar(() => this.tabStates());
     this.tabBarOverlay = this.ui.showOverlay(this.tabBar, { anchor: "top-right", nonCapturing: true });
@@ -353,6 +276,13 @@ export class TuiRepl {
       }
       return undefined;
     });
+
+
+    const root = new HStack([], { gap: 1 });
+    root.addChild(sidebarColumn, { basis: SESSION_SIDEBAR_WIDTH, grow: 0, shrink: 0 });
+    root.addChild(chatColumn, { grow: 1 });
+
+    this.ui.setLayoutRoot(root);
   }
 
   public start(): void {
@@ -388,6 +318,17 @@ export class TuiRepl {
     this.ui.requestRender();
   }
 
+  /** Replaces the sidebar snapshot (already updatedAt-desc from the manager). */
+  public setSessions(list: readonly SessionSummary[]): void {
+    this.sessionList = list.map((session) => ({
+      id: session.id,
+      name: session.name,
+      current: session.current,
+      closed: session.status === "closed"
+    }));
+    this.ui.requestRender();
+  }
+
   /** Switches the mounted transcript to the given agent and clears its unread flag. */
   public setActiveAgent(name: string): void {
     const tab = this.tabs.get(name);
@@ -406,10 +347,44 @@ export class TuiRepl {
     this.scrollView.scrollToEnd();
   }
 
-  /** Handles pi-swarm:// links (agent tabs, thinking folds) from OSC 8 clicks. */
+  /** Toggles the draft entry (✎ 草稿) at the top of the sessions sidebar. */
+  public setDraftMode(active: boolean): void {
+    if (this.draftMode === active) return;
+    this.draftMode = active;
+    this.ui.requestRender();
+  }
+
+  /**
+   * Empties one agent's transcript (log + live tail): used when entering the
+   * draft view so 「新建」 starts from a clean slate instead of appending to
+   * the previous session's output.
+   */
+  public clearTranscript(agent: string = this.activeAgent): void {
+    const tab = this.tabs.get(agent);
+    if (!tab) return;
+    this.flushStream(tab);
+    tab.log.clear();
+    tab.stream.clear();
+    this.ui.requestRender();
+  }
+
+  /** Handles pi-swarm:// links (sessions bar, agent tabs, thinking folds) from OSC 8 clicks. */
   public handleLink(url: string): void {
+    const menuPrefix = "pi-swarm://menu/";
+    if (url.startsWith(menuPrefix)) {
+      this.openMenu?.select(Number(url.slice(menuPrefix.length)));
+      return;
+    }
+    // Clicking anything else while the menu is open dismisses it first.
+    if (this.openMenu) this.openMenu.dismiss();
     const agentPrefix = "pi-swarm://agent/";
     const thinkPrefix = "pi-swarm://think/";
+    const sessionPrefix = "pi-swarm://session/";
+    if (url.startsWith(sessionPrefix)) {
+      const sessionId = decodeURIComponent(url.slice(sessionPrefix.length));
+      void this.options.onSessionClick?.(sessionId);
+      return;
+    }
     if (url.startsWith(agentPrefix)) {
       this.setActiveAgent(decodeURIComponent(url.slice(agentPrefix.length)));
       return;
@@ -421,6 +396,85 @@ export class TuiRepl {
         this.ui.requestRender();
       }
     }
+  }
+
+  /**
+   * Wraps the owned terminal so right-button SGR sequences reach the sidebar
+   * context menu: pi-tui consumes every mouse event itself and never re-emits
+   * them, so interception must happen before TuiAltScreen sees the input.
+   * Press and release are both swallowed; everything else passes through.
+   */
+  private wrapTerminalForRightClick(terminal: ProcessTerminal): ProcessTerminal {
+    return new Proxy(terminal, {
+      get: (target, property) => {
+        if (property === "start") {
+          return (onInput: (data: string) => void, onResize: () => void): void => {
+            target.start((data) => {
+              const event = parseRightClick(data);
+              if (event) {
+                if (!event.release) this.handleSidebarRightClick(event.x, event.y);
+                return;
+              }
+              onInput(data);
+            }, onResize);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    }) as ProcessTerminal;
+  }
+
+  /** Resolves the sidebar row under (x, y) to a session entry; undefined outside list rows. */
+  private sidebarEntryAt(x: number, y: number): { id: string; name: string } | undefined {
+    if (x < 0 || x >= SESSION_SIDEBAR_WIDTH) return undefined;
+    // Layout geometry: the top border occupies row 0, the rows viewport starts
+    // at row 1 and shows entries [scrollTop, scrollTop + viewportHeight).
+    const index = this.sidebarScroll.scrollTop + (y - 1);
+    if (index < 0) return undefined;
+    const entry = this.sessionList[this.draftMode ? index - 1 : index];
+    return entry ? { id: entry.id, name: entry.name } : undefined;
+  }
+
+  /** Opens the context menu for the sidebar session under (x, y), if any. */
+  private handleSidebarRightClick(x: number, y: number): void {
+    if (this.openMenu) this.openMenu.dismiss();
+    const entry = this.sidebarEntryAt(x, y);
+    if (!entry) return;
+    const actions = [
+      {
+        label: "删除会话（含记录文件）",
+        run: () => {
+          void this.options.onDeleteSession?.(entry.id);
+        }
+      },
+      { label: "取消", run: () => undefined }
+    ];
+    const close = (): void => {
+      this.menuHandle?.hide();
+      this.menuHandle = undefined;
+      this.openMenu = undefined;
+      this.ui.setFocus(this.editor);
+    };
+    this.openMenu = {
+      select: (index) => {
+        const action = actions[index];
+        close();
+        action?.run();
+      },
+      dismiss: close
+    };
+    // pi-tui renders overlays at min(80, terminal width) unless told otherwise;
+    // size the menu to its widest line so the highlight hugs the content.
+    const width = Math.min(
+      30,
+      Math.max(14, visibleWidth(entry.name) + 4, ...actions.map((action) => visibleWidth(action.label) + 4))
+    );
+    this.menuHandle = this.ui.showOverlay(
+      new SessionContextMenu(entry.name, actions, close, () => this.ui.requestRender()),
+      // pi-tui clamps absolute positions to stay on screen.
+      { col: x + 1, row: y + 1, width }
+    );
   }
 
   public appendLine(line: string, agent: string = DEFAULT_AGENT): void {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { SessionManager as PiSessionManager, type NewSessionOptions } from "@earendil-works/pi-coding-agent";
 import { getUserDataDir } from "../userdata.ts";
@@ -55,6 +55,10 @@ export class SessionManager {
   private readonly openPiSession: PiSessionOpener;
   private records: SessionRecord[] = [];
   private currentId?: string;
+  /** 草稿态开启标志；与 currentId 解耦：未命名草稿也要与启动时的「无会话」区分开。 */
+  private draftOpen = false;
+  /** 草稿态的待用名字（/new <name> 提供）；物化时作为会话名，无则用首条消息摘要。 */
+  private draftName?: string;
   /** 串行化索引变更的互斥队列：并发 switch/create/close/touch 不会交错写。 */
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -84,6 +88,39 @@ export class SessionManager {
     return this.enqueue(async () => {
       this.records = await this.store.load();
       await this.cleanupInternal(this.now());
+    });
+  }
+
+  /**
+   * 进入草稿态：不创建任何记录，只清空当前指针并记住待用名字。所有「新建
+   * 会话」入口（/new、会话栏「＋」）都走这里；真正的创建推迟到首次任务
+   * （materialize）。幂等：已是草稿且未提供新名字时保持原名字不变。
+   */
+  public startDraft(name?: string): void {
+    const normalized = normalizeOptionalText(name);
+    if (normalized) this.draftName = normalized;
+    else if (!this.draftOpen) this.draftName = undefined;
+    this.draftOpen = true;
+    this.currentId = undefined;
+  }
+
+  /** 是否处于草稿态（已显式开启草稿且尚无当前会话）。 */
+  public isDraft(): boolean {
+    return this.draftOpen && this.currentId === undefined;
+  }
+
+  /**
+   * 物化草稿：为首次任务创建真实会话并设为当前。名字取显式草稿名，否则用
+   * fallbackName（首条消息摘要）。已有当前会话时幂等返回它（并丢弃草稿名）。
+   */
+  public materialize(fallbackName?: string): Promise<SessionRecord> {
+    return this.enqueue(async () => {
+      const current = this.records.find((candidate) => candidate.id === this.currentId);
+      const name = normalizeOptionalText(this.draftName ?? fallbackName);
+      this.draftOpen = false;
+      this.draftName = undefined;
+      if (current) return { ...current };
+      return await this.createInternal({ name });
     });
   }
 
@@ -140,6 +177,9 @@ export class SessionManager {
     if (!target) throw new SessionNotFoundError(`会话不存在：${normalizeOptionalText(id) ?? "(空)"}`);
     if (target.closedAt) throw new SessionClosedError(`会话已关闭，无法切换：${target.name ?? target.id}`);
     this.currentId = target.id;
+    // 切到真实会话即离开草稿态：草稿名随切换丢弃。
+    this.draftOpen = false;
+    this.draftName = undefined;
     await this.store.save(this.records);
     return { ...target };
   }
@@ -201,6 +241,28 @@ export class SessionManager {
       await this.store.save(this.records);
     }
     if (this.currentId === target.id) this.currentId = undefined;
+    return { ...target };
+  }
+
+  /**
+   * 删除会话：从索引移除并尽力删除 JSONL 文件（区别于 close 的只标记）；
+   * 文件删除失败（如被占用）不回滚索引——与 cleanup 的「文件可残留」策略
+   * 一致。删除当前会话会清空当前指针；调用方负责先解绑 agent（释放文件
+   * 句柄）。
+   */
+  public delete(id: string): Promise<SessionRecord> {
+    return this.enqueue(() => this.deleteInternal(id));
+  }
+
+  private async deleteInternal(id: string): Promise<SessionRecord> {
+    const target = this.find(id);
+    if (!target) throw new SessionNotFoundError(`会话不存在：${normalizeOptionalText(id) ?? "(空)"}`);
+    this.records = this.records.filter((record) => record.id !== target.id);
+    if (this.currentId === target.id) this.currentId = undefined;
+    await this.store.save(this.records);
+    if (target.sessionFile) {
+      await rm(target.sessionFile, { force: true }).catch(() => undefined);
+    }
     return { ...target };
   }
 
