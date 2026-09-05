@@ -1,9 +1,32 @@
-import { visibleWidth, Component, truncateToWidth, Container, fuzzyFilter, Input, SelectList, Text, wrapTextWithAnsi, type SelectItem } from "@earendil-works/pi-tui";
-import { dim } from "../core/ansi.ts";
-import { link, SessionEntryState, AgentTabState } from "./tui-repl.ts";
+import { visibleWidth, truncateToWidth, Container, fuzzyFilter, Input, matchesKey, SelectList, Text, wrapTextWithAnsi, type Component, type SelectItem } from "@earendil-works/pi-tui";
 import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
+import { dim } from "../core/ansi.ts";
+import { link, LinkDispatcher } from "./link-dispatcher.ts";
 import type { PickerOption } from "./commands.ts";
 
+/** Fixed column width of the sessions sidebar (labels truncate to fit). */
+export const SESSION_SIDEBAR_WIDTH = 22;
+
+/** OSC 8 link schemes: each component renders its scheme and answers it via the dispatcher. */
+const SESSION_SCHEME = "pi-swarm://session/";
+const AGENT_SCHEME = "pi-swarm://agent/";
+const THINK_SCHEME = "pi-swarm://think/";
+const MENU_SCHEME = "pi-swarm://menu/";
+
+/** Render-time snapshot of one entry in the sessions sidebar. */
+export interface SessionEntryState {
+  id: string;
+  name: string;
+  current: boolean;
+  closed: boolean;
+}
+
+/** Render-time snapshot of one tab for the tab bar. */
+export interface AgentTabState {
+  name: string;
+  active: boolean;
+  unread: boolean;
+}
 
 /**
  * One border edge of the sessions sidebar; the top edge carries the title and
@@ -16,7 +39,7 @@ export class SidebarBorderLine {
   public render(width: number): string[] {
     if (this.top) {
       const titleGap = "─ 会话 ";
-      const newLink = link("pi-swarm://session/draft", dim("＋ 新建"));
+      const newLink = link(`${SESSION_SCHEME}draft`, dim("＋ 新建"));
       const used = visibleWidth(titleGap) + visibleWidth(newLink) + 1;
       const fill = "─".repeat(Math.max(1, width - 2 - used));
       return [`╭${dim(titleGap)}${newLink} ${dim(fill)}╮`];
@@ -29,13 +52,21 @@ export class SidebarBorderLine {
 /**
  * Sessions sidebar rows: the draft entry (✎ 草稿， shown while a draft is
  * open) first, then one session per line — current highlighted, closed marked
- * ✕. Every entry is a pi-swarm://session link. Rendered inside a full-height ScrollView (see TuiRepl): overflow is
- * handled by scrolling with a visible scrollbar, not by truncation. The
- * empty-state hint keeps the lazy-creation invariant: startup creates
- * nothing, the first dispatched task does.
+ * ✕. Every entry is a session link answered by this class's own registration.
+ * Rendered inside a full-height ScrollView (see TuiRepl): overflow is handled
+ * by scrolling with a visible scrollbar, not by truncation. The empty-state
+ * hint keeps the lazy-creation invariant: startup creates nothing, the first
+ * dispatched task does.
  */
 export class SessionSidebar implements Component {
-  public constructor(private readonly snapshot: () => { entries: readonly SessionEntryState[]; draft: boolean; }) { }
+  public constructor(
+    private readonly snapshot: () => { entries: readonly SessionEntryState[]; draft: boolean; },
+    links: LinkDispatcher,
+    private readonly onActivate: (id: string) => void,
+    private readonly onDelete: (id: string) => void
+  ) {
+    links.register(SESSION_SCHEME, (rest) => this.onActivate(decodeURIComponent(rest)));
+  }
 
   public render(width: number): string[] {
     const { entries, draft } = this.snapshot();
@@ -44,7 +75,7 @@ export class SessionSidebar implements Component {
     const lines: string[] = [];
     if (draft) {
       const label = truncateToWidth("✎ 草稿（未保存）", labelWidth);
-      lines.push(" " + link("pi-swarm://session/draft", `\x1b[7m${label}\x1b[27m`));
+      lines.push(" " + link(`${SESSION_SCHEME}draft`, `\x1b[7m${label}\x1b[27m`));
     }
     if (entries.length === 0 && !draft) {
       lines.push(" " + dim("暂无会话"));
@@ -54,16 +85,45 @@ export class SessionSidebar implements Component {
       const marker = entry.current ? "●" : entry.closed ? "✕" : " ";
       const label = truncateToWidth(`${marker} ${entry.name}`, labelWidth);
       const styled = entry.current ? `\x1b[7m${label}\x1b[27m` : entry.closed ? dim(label) : label;
-      lines.push(" " + link(`pi-swarm://session/${encodeURIComponent(entry.id)}`, styled));
+      lines.push(" " + link(`${SESSION_SCHEME}${encodeURIComponent(entry.id)}`, styled));
     }
     return lines;
   }
 
+  /**
+   * Resolves a screen cell to the sidebar entry under it, given the rows
+   * viewport's scrollTop. Geometry facts live here, next to the render that
+   * produces them: row 0 is the border line above the rows viewport, and the
+   * draft row occupies the first viewport row while a draft is open.
+   */
+  public entryAt(x: number, y: number, scrollTop: number): SessionEntryState | undefined {
+    if (x < 0 || x >= SESSION_SIDEBAR_WIDTH) return undefined;
+    const index = scrollTop + (y - 1);
+    if (index < 0) return undefined;
+    const { entries, draft } = this.snapshot();
+    const entry = entries[draft ? index - 1 : index];
+    return entry ?? undefined;
+  }
+
+  /** Context-menu actions offered for one entry; the delete action runs onDelete. */
+  public menuActions(entry: SessionEntryState): readonly { label: string; run(): void }[] {
+    return [
+      { label: "删除会话（含记录文件）", run: () => this.onDelete(entry.id) },
+      { label: "取消", run: () => undefined }
+    ];
+  }
+
   public invalidate(): void { }
 }
-/** Single-line, right-aligned row of agent tabs; each tab is a pi-swarm://agent link. */
+/** Single-line, right-aligned row of agent tabs; each tab is an agent link answered by this class. */
 export class AgentTabBar implements Component {
-  public constructor(private readonly snapshot: () => readonly AgentTabState[]) { }
+  public constructor(
+    private readonly snapshot: () => readonly AgentTabState[],
+    links: LinkDispatcher,
+    private readonly onSelect: (name: string) => void
+  ) {
+    links.register(AGENT_SCHEME, (rest) => this.onSelect(decodeURIComponent(rest)));
+  }
 
   public render(width: number): string[] {
     const tabs = this.snapshot();
@@ -71,7 +131,7 @@ export class AgentTabBar implements Component {
     const cells = tabs.map((tab) => {
       const label = `${tab.unread ? "● " : ""}${tab.name}`;
       const styled = tab.active ? `\x1b[7m${label}\x1b[27m` : label;
-      return link(`pi-swarm://agent/${encodeURIComponent(tab.name)}`, styled);
+      return link(`${AGENT_SCHEME}${encodeURIComponent(tab.name)}`, styled);
     });
     const line = cells.join(dim(" │ "));
     const pad = Math.max(0, width - visibleWidth(line));
@@ -83,28 +143,32 @@ export class AgentTabBar implements Component {
 /**
  * One thinking entry in a transcript: a dim one-line summary that expands to
  * the full dim (width-wrapped) text when clicked, and collapses on click again.
+ * The click arrives through the entry's own think/{id} link registration.
  */
 export class CollapsibleReasoning implements Component {
-  public readonly id: number;
   private expanded = false;
   private readonly chars: number;
   private readonly body: Text;
 
-  public constructor(id: number, text: string) {
-    this.id = id;
+  public constructor(
+    public readonly id: number,
+    text: string,
+    links: LinkDispatcher,
+    private readonly requestRender: () => void
+  ) {
     this.chars = [...text].length;
     this.body = new Text(dim(text), 0, 0);
-  }
-
-  public toggle(): void {
-    this.expanded = !this.expanded;
+    links.register(`${THINK_SCHEME}${this.id}`, () => {
+      this.expanded = !this.expanded;
+      this.requestRender();
+    });
   }
 
   public render(width: number): string[] {
     const label = this.expanded
       ? `▾ 思考（${this.chars} 字）· 点击收起`
       : `▸ 思考（${this.chars} 字）· 点击展开`;
-    const header = link(`pi-swarm://think/${this.id}`, dim(label));
+    const header = link(`${THINK_SCHEME}${this.id}`, dim(label));
     return this.expanded ? [header, ...this.body.render(width)] : [header];
   }
 
@@ -184,6 +248,66 @@ export class ToolCallLine implements Component {
 
   public invalidate(): void { }
 }
+/**
+ * Right-click menu on a sidebar session: a small positioned overlay. Items are
+ * OSC 8 links so mouse clicks work (this app resolves clicks through
+ * hyperlinks, not hit-testing — see TuiRepl.handleLink), while ↑/↓/Enter/Esc
+ * drive the same menu from the keyboard. The selected row is reverse-videoed.
+ */
+export class SessionContextMenu {
+  private selected = 0;
+
+  public constructor(
+    private readonly title: string,
+    private readonly actions: readonly { label: string; run(): void }[],
+    private readonly close: () => void,
+    private readonly requestRender: () => void
+  ) { }
+
+  /** Consumes a menu-item link click; false lets other links dismiss the menu. */
+  public handleLink(url: string): boolean {
+    if (!url.startsWith(MENU_SCHEME)) return false;
+    const action = this.actions[Number(url.slice(MENU_SCHEME.length))];
+    this.close();
+    action?.run();
+    return true;
+  }
+
+  public handleInput(data: string): void {
+    if (matchesKey(data, "escape")) {
+      this.close();
+      return;
+    }
+    if (matchesKey(data, "up")) {
+      this.selected = (this.selected - 1 + this.actions.length) % this.actions.length;
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.selected = (this.selected + 1) % this.actions.length;
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      const action = this.actions[this.selected];
+      this.close();
+      action?.run();
+    }
+  }
+
+  public render(width: number): string[] {
+    const labelWidth = Math.max(8, width - 2);
+    const lines: string[] = [];
+    this.actions.forEach((action, index) => {
+      const label = truncateToWidth(action.label, labelWidth);
+      const styled = index === this.selected ? `\x1b[7m${label}\x1b[27m` : label;
+      lines.push(" " + link(`${MENU_SCHEME}${index}`, styled));
+    });
+    return lines;
+  }
+
+  public invalidate(): void { }
+}
 /** Overlay picker: title, type-to-filter input, fuzzy-filtered select list. */
 export class PickerComponent<T> extends Container {
   private readonly searchInput = new Input();
@@ -209,7 +333,7 @@ export class PickerComponent<T> extends Container {
     const items: SelectItem[] = entries.map((entry, index) => ({
       value: String(index),
       label: entry.option.label,
-      description: entry.option.hint
+      hint: entry.option.hint
     }));
     const list = new SelectList(items, Math.min(items.length, 10), getSelectListTheme());
     list.onSelect = (item) => {
@@ -240,4 +364,3 @@ export class PickerComponent<T> extends Container {
     this.applyFilter(this.searchInput.getValue());
   }
 }
-

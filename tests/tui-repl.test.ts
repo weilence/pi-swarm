@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Component } from "@earendil-works/pi-tui";
 import { Container, Markdown, stripTerminalSequences, Text, visibleWidth } from "@earendil-works/pi-tui";
-import { parseRightClick, splitMarkdownBlocks, summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
+import { splitMarkdownBlocks, summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
+import { parseRightClick } from "../src/cli/right-click.ts";
 import type { SessionSummary } from "../src/core/session/session-types.ts";
 
 test("splitMarkdownBlocks cuts on blank lines outside code fences", () => {
