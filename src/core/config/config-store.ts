@@ -20,6 +20,13 @@ export interface AgentConfigSnapshot {
    * the ids so the agent can be restored without the models.dev catalog.
    */
   providerConfig?: unknown;
+  /**
+   * Manually set context-window capacity in tokens (e.g. 200000 for a 1M
+   * model): overrides the model's own contextWindow, so Pi's auto-compaction
+   * threshold and usage percentages trigger against this value. Undefined =
+   * follow the model default.
+   */
+  contextWindow?: number;
 }
 
 /**

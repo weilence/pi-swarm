@@ -13,6 +13,7 @@ import { createSupervisorAgent } from "../pi/supervisor-agent.ts";
 import { createSubAgent } from "../pi/sub-agent.ts";
 import type { Agent } from "../pi/agent.ts";
 import { TuiRepl, summarizeToolArgs } from "./tui-repl.ts";
+import { TOAST_ICONS, type ToastLevel } from "./components.ts";
 import { AgentRegistry, defaultAgentDirs } from "../core/agent-registry.ts";
 import { openDraftSession, deleteSessionById, executeCommand, switchToSessionId, type CommandServices, type CommandState } from "./commands.ts";
 
@@ -26,19 +27,52 @@ try {
 // Streams and log lines route into the interactive REPL once it exists; before
 // that they fall back to plain stdout.
 let repl: TuiRepl | undefined;
+// 输出中每秒推送一次状态栏快照，StatusBar 据此计算输出速度（tok/s）。
+let statusTimer: ReturnType<typeof setInterval> | undefined;
+const startStatusPolling = (): void => {
+  if (statusTimer) return;
+  statusTimer = setInterval(() => refreshStatusBar(), 1000);
+  statusTimer.unref?.();
+};
+const stopStatusPolling = (): void => {
+  if (statusTimer) {
+    clearInterval(statusTimer);
+    statusTimer = undefined;
+  }
+  refreshStatusBar();
+};
 const log = (line: string, agent = "supervisor"): void => {
   if (repl) repl.appendLine(line, agent);
   else console.log(line);
 };
 const streamText = (delta: string, agent = "supervisor"): void => {
-  if (repl) repl.streamText(delta, agent);
-  else process.stdout.write(delta);
+  if (repl) {
+    repl.streamText(delta, agent);
+    startStatusPolling();
+  } else process.stdout.write(delta);
 };
 const streamThinking = (delta: string, agent = "supervisor"): void => {
-  if (repl) repl.streamThinking(delta, agent);
-  else process.stdout.write(dim(delta));
+  if (repl) {
+    repl.streamThinking(delta, agent);
+    startStatusPolling();
+  } else process.stdout.write(dim(delta));
 };
-const endStream = (agent = "supervisor"): void => repl?.endStream(agent);
+const endStream = (agent = "supervisor"): void => {
+  repl?.endStream(agent);
+  // 每轮流结束都可能更新 token/上下文统计，刷新状态栏并停止速度采样。
+  stopStatusPolling();
+};
+
+/** 状态栏快照（模型/上下文/缓存命中率）；supervisorAgent 声明在后，运行时取值。 */
+function refreshStatusBar(): void {
+  repl?.setStatus(supervisorAgent.statusSnapshot);
+}
+// 瞬态提示（命令反馈、后台告警）：REPL 起来之后走编辑器上方的 toast 栈；
+// 之前只有控制台，回退为带级别图标的 console 行。
+const notify = (message: string, level: ToastLevel = "info"): void => {
+  if (repl) repl.notify(message, level);
+  else console.log(level === "info" ? message : `${TOAST_ICONS[level]} ${message}`);
+};
 // Tool calls render as live lines in the transcript; without a REPL they log
 // start/end lines to stdout.
 const toolStart = (id: string, name: string, args: unknown, agent: string): void => {
@@ -63,7 +97,7 @@ const sharedRuntime = await ModelRuntime.create({ refreshOnCreate: false });
 const modelsCatalog = new ModelsDevCatalog({
   onUpdate: (info) => {
     if (info.source === "refresh" && info.updated) {
-      log(`[主 agent] models.dev 目录已在后台更新：${info.count} 个 providers。`);
+      notify(`models.dev 目录已在后台更新：${info.count} 个 providers。`);
     }
   }
 });
@@ -71,7 +105,7 @@ const modelsCatalog = new ModelsDevCatalog({
 // Sub-agents are user-created markdown definitions (global + project dirs);
 // none are pre-provisioned, matching the "no initial sub-agents" architecture.
 const agentRegistry = await AgentRegistry.load(defaultAgentDirs(), (warning) =>
-  log(`[主 agent] agent 定义告警（${warning.file}）：${warning.problems.join("；")}`)
+  notify(`agent 定义告警（${warning.file}）：${warning.problems.join("；")}`, "warning")
 );
 
 const events = new EventBus();
@@ -144,7 +178,7 @@ console.log("pi-swarm 主 agent 已启动。");
 const loadedAgents = agentRegistry.list();
 console.log(loadedAgents.length > 0 ? `已加载子 agent：${loadedAgents.map((agent) => agent.name).join(", ")}` : "未加载任何子 agent，所有任务由 supervisor 自执行。");
 console.log(
-  "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/new /sessions /switch /close /delete 管理会话（/new 只开草稿，首次发送时才创建），/status 查看状态，或 /exit 退出。\n"
+  "输入任务，/provider /model /thinking 打开选择弹窗，/apikey <key> 配置密钥，/context <n>[k|w|m] 设置上下文容量，/compact 手动压缩上下文（输出中双击 Esc 停止），/new /sessions /switch /close /delete 管理会话，/status 查看状态，或 /exit 退出。\n"
 );
 
 log(`[主 agent] ${await supervisorAgent.restore()}`);
@@ -170,25 +204,27 @@ const sharedServices = {
     ...sharedServices,
     interactive: true,
     log,
+    notify,
     // getter：repl 在 services 之后才创建；/switch 历史回放直接驱动它的组件
     get repl() {
       return repl;
     },
     pick: (title, options) => repl!.pick(title, options)
   };
-  // 会话栏快照：会话是延迟创建的（启动不建会话、「＋ 新建」只开草稿），
+  // 会话栏与状态栏快照：会话是延迟创建的（启动不建会话、「＋ 新建」只开草稿），
   // 草稿激活时列表顶部多一行「✎ 草稿」；首个任务物化、/new /switch /close
-  // 或点击会话之后，都统一在这里刷新。
-  const refreshSessionBar = async (): Promise<void> => {
+  // 或点击会话之后，都统一在这里刷新。状态栏（模型/上下文/缓存）同批刷新。
+  const refreshBars = async (): Promise<void> => {
     if (!repl) return;
     repl.setDraftMode(sessionManager.isDraft());
     repl.setSessions(await sessionManager.list());
+    refreshStatusBar();
   };
   repl = new TuiRepl({
     onSubmit: async (line) => {
       // 必须把结果透传（如 "exit"），否则 /exit 永远不会结束进程。
       const outcome = await executeCommand(line, services, commandState);
-      await refreshSessionBar();
+      await refreshBars();
       return outcome;
     },
     // 会话栏点击："draft" 是未保存草稿（等同 /new），其余为会话 id，走
@@ -196,19 +232,22 @@ const sharedServices = {
     onSessionClick: async (sessionId) => {
       if (sessionId === "draft") await openDraftSession(services);
       else await switchToSessionId(sessionId, services);
-      await refreshSessionBar();
+      await refreshBars();
     },
     onDeleteSession: async (sessionId) => {
       await deleteSessionById(sessionId, services);
-      await refreshSessionBar();
+      await refreshBars();
     },
-    onExit: settleExit
+    onExit: settleExit,
+    // 双击 Esc 停止输出：busy 判断与中止动作都走 supervisor agent。
+    isBusy: () => supervisorAgent.isBusy(),
+    onAbort: () => supervisorAgent.abort()
   });
   // Tabs: supervisor plus every registry agent; later dispatches register lazily.
   repl.registerAgent("supervisor");
   for (const definition of agentRegistry.list()) repl.registerAgent(definition.name);
   repl.start();
-  await refreshSessionBar();
+  await refreshBars();
   await exited;
   repl.stop();
 }

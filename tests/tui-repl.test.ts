@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Component } from "@earendil-works/pi-tui";
-import { Container, Markdown, stripTerminalSequences, Text, visibleWidth } from "@earendil-works/pi-tui";
-import { splitMarkdownBlocks, summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
-import { parseRightClick } from "../src/cli/right-click.ts";
+import { Container, Markdown, stripTerminalSequences, TuiAltScreen, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { splitMarkdownBlocks, type ChatPanel } from "../src/cli/chat-panel.ts";
+import { summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
+import { PickerComponent, StatusBar, StatusLine, ToastStack } from "../src/cli/components.ts";
 import type { SessionSummary } from "../src/core/session/session-types.ts";
 
 test("splitMarkdownBlocks cuts on blank lines outside code fences", () => {
@@ -26,7 +27,9 @@ test("splitMarkdownBlocks keeps blank lines inside open fences in the remainder"
 
 interface FakeOverlay {
   component: Component;
-  handle: { hide(): void };
+  options?: Record<string, unknown>;
+  hidden: boolean;
+  handle: { hide(): void; setHidden(hidden: boolean): void; isHidden(): boolean };
 }
 
 // pi-tui marks viewport TUIs with a registry symbol that is not re-exported as a value.
@@ -35,10 +38,14 @@ const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
 function makeFakeUi() {
   const children: Component[] = [];
   const overlays: FakeOverlay[] = [];
+  const inputListeners: ((data: string) => { consume?: boolean } | undefined)[] = [];
+  const focusTargets: unknown[] = [];
   const ui = {
     terminal: { rows: 30, columns: 120 },
     children,
     overlays,
+    inputListeners,
+    focusTargets,
     [VIEWPORT_TUI]: true,
     layoutRoot: undefined as Component | undefined,
     setLayoutRoot: (component: Component) => {
@@ -55,16 +62,30 @@ function makeFakeUi() {
     requestRender: () => undefined,
     start: () => undefined,
     stop: () => undefined,
-    setFocus: () => undefined,
-    addInputListener: () => () => undefined,
-    showOverlay: (component: Component) => {
+    setFocus: (component: unknown) => {
+      focusTargets.push(component);
+    },
+    addInputListener: (listener: (data: string) => { consume?: boolean } | undefined) => {
+      inputListeners.push(listener);
+      return () => {
+        const index = inputListeners.indexOf(listener);
+        if (index >= 0) inputListeners.splice(index, 1);
+      };
+    },
+    showOverlay: (component: Component, options?: Record<string, unknown>) => {
       const entry: FakeOverlay = {
         component,
+        options,
+        hidden: false,
         handle: {
           hide: () => {
             const index = overlays.indexOf(entry);
             if (index >= 0) overlays.splice(index, 1);
-          }
+          },
+          setHidden: (hidden: boolean) => {
+            entry.hidden = hidden;
+          },
+          isHidden: () => entry.hidden
         }
       };
       overlays.push(entry);
@@ -76,11 +97,45 @@ function makeFakeUi() {
   return ui;
 }
 
-/** The active transcript container: layoutRoot → HStack[sidebar, VStack[ScrollView → scrollBody → transcript([log, stream]), inputArea]]. */
+/** Feeds a keystroke through the registered input listeners, TuiBase-style. */
+function press(ui: ReturnType<typeof makeFakeUi>, data: string): boolean {
+  for (const listener of ui.inputListeners) {
+    if (listener(data)?.consume) return true;
+  }
+  return false;
+}
+
+/** The chat panel's editor, reached through the REPL for input simulation. */
+function editorOf(repl: TuiRepl): { handleInput(data: string): void; disableSubmit: boolean } {
+  return (repl as unknown as { chat: { editor: { handleInput(data: string): void; disableSubmit: boolean } } }).chat.editor;
+}
+
+/** The chat half of the layout: layoutRoot → HStack[sidebar, VStack[ChatPanel, statusBar]]. */
+function chatPanelOf(ui: ReturnType<typeof makeFakeUi>): ChatPanel {
+  const root = ui.layoutRoot! as Container;
+  const [, chatColumn] = root.children as [Container, Container];
+  const [chat] = chatColumn.children as [Container];
+  return chat as ChatPanel;
+}
+
+/** The toast overlay entry in the fake ui (tab bar overlay is separate). */
+function toastOverlayOf(ui: ReturnType<typeof makeFakeUi>): FakeOverlay {
+  const entry = ui.overlays.find((overlay) => overlay.component instanceof ToastStack);
+  assert.ok(entry, "toast overlay is mounted");
+  return entry;
+}
+
+/** The toast stack held by the chat panel (private, tests only). */
+function toastsOf(ui: ReturnType<typeof makeFakeUi>): ToastStack {
+  return (chatPanelOf(ui) as unknown as { toasts: ToastStack }).toasts;
+}
+
+/** The active transcript container: layoutRoot → HStack[sidebar, VStack[ChatPanel(VStack[ScrollView → scrollBody → transcript([log, stream]), inputArea]), statusBar]]. */
 function mountedChat(ui: ReturnType<typeof makeFakeUi>): Container {
   const root = ui.layoutRoot! as Container;
   const [, chatColumn] = root.children as [Container, Container];
-  const [scrollView] = chatColumn.children as [Container];
+  const [chat] = chatColumn.children as [Container];
+  const [scrollView] = chat.children as [Container];
   const [scrollBody] = scrollView.children as [Container];
   const [transcript] = scrollBody.children as [Container];
   return transcript;
@@ -108,8 +163,10 @@ test("streamText flushes completed markdown blocks and keeps the partial in the 
 
   repl.streamText("- 步骤一");
   assert.equal(log.children.length, 1, "partial block stays out of the log");
-  assert.ok(stream.children[0] instanceof Text);
-  assert.ok((stream.children[0] as Text).render(80).join("\n").includes("步骤一"));
+  assert.equal(stream.children.length, 2, "seam spacer + live tail");
+  assert.ok(stream.children[1] instanceof Text);
+  assert.equal((stream.children[0] as Text).render(80).join("\n").trim(), "", "seam blank line before the tail");
+  assert.ok((stream.children[1] as Text).render(80).join("\n").includes("步骤一"));
 });
 
 test("streamThinking shows an expanded live tail and folds into the log as collapsible reasoning", () => {
@@ -123,7 +180,7 @@ test("streamThinking shows an expanded live tail and folds into the log as colla
   repl.streamText("答案");
   assert.equal(log.children.length, 1, "thinking folds into the log as a collapsible entry");
   assert.ok(!(log.children[0] instanceof Markdown));
-  assert.ok(log.children[0].render(80).join("\n").includes("pi-swarm://think/1"));
+  assert.ok(log.children[0].render(80).join("\n").includes("思考（"), "folded entry keeps its summary label");
 });
 
 test("live thinking tail shows at most 3 lines and keeps the latest content", () => {
@@ -156,12 +213,395 @@ test("interleaved text and thinking commits in arrival order", () => {
   assert.ok(log.children[0] instanceof Markdown, "first text run is plain markdown");
   assert.ok((log.children[0] as Markdown).render(80).join("\n").includes("答案一"));
   assert.ok(!(log.children[1] instanceof Markdown), "first thinking run is collapsible");
-  assert.ok(log.children[1].render(80).join("\n").includes("pi-swarm://think/1"));
+  assert.ok(log.children[1].render(80).join("\n").includes("思考（"));
   assert.ok(log.children[2] instanceof Markdown, "second text run is plain markdown");
   assert.ok((log.children[2] as Markdown).render(80).join("\n").includes("答案二"));
   assert.ok(!(log.children[3] instanceof Markdown), "second thinking run is collapsible");
-  assert.ok(log.children[3].render(80).join("\n").includes("pi-swarm://think/2"));
+  assert.ok(log.children[3].render(80).join("\n").includes("思考（"));
   assert.equal(stream.children.length, 0, "tail clears after the stream ends");
+});
+
+test("notify mounts toasts as a bottom-right overlay above the editor, outside the layout flow", () => {
+  const { repl, ui, log } = makeRepl();
+  repl.streamText("转录里的聊天内容");
+  repl.endStream();
+  const chat = chatPanelOf(ui);
+  const before = chat.render(80);
+
+  repl.notify("已切换会话");
+  const after = chat.render(80);
+  assert.equal(after.length, before.length, "toast covers rows instead of pushing the transcript up");
+  assert.ok(after.join("\n").includes("转录里的聊天内容"), "transcript render output is unchanged by toasts");
+
+  assert.equal(ui.overlays.length, 2, "tab bar plus the toast overlay");
+  const entry = toastOverlayOf(ui);
+  assert.equal(entry.options?.anchor, "bottom-right", "pinned bottom-right");
+  assert.equal(entry.options?.nonCapturing, true, "toast never takes focus");
+  const editorRows = (chat as unknown as { editor: { render(w: number): string[] } }).editor.render(ui.terminal.columns).length;
+  assert.equal(entry.options?.offsetY, -editorRows, "overlay is lifted above the editor block");
+
+  const pill = entry.component.render(Number(entry.options?.width));
+  assert.ok(stripTerminalSequences(pill.join("\n")).includes("已切换会话"), "toast text renders");
+  assert.ok(pill.join("\n").includes("\x1b[48;5;236m"), "pill has a solid background, clearly distinct from chat");
+  assert.equal(entry.options?.width, toastsOf(ui).measureWidth(ui.terminal.columns), "overlay is sized to the pill block");
+
+  assert.equal(log.children.length, 1, "only the streamed text is in the transcript log");
+  assert.ok(!stripTerminalSequences(log.children[0].render(80).join("\n")).includes("已切换会话"), "toast text never lands in the transcript");
+});
+
+test("toast levels differ in icon and error/warning outlive info", async () => {
+  const { repl, ui } = makeRepl();
+  const toasts = toastsOf(ui);
+  repl.notify("出错了", "error");
+  repl.notify("注意一下", "warning");
+  // ttl 只有组件层暴露：REPL 门面用默认时长，测试直接驱动栈来验证过期。
+  toasts.notify("短暂提示", "info", 5);
+  const entry = toastOverlayOf(ui);
+  const pill = stripTerminalSequences(entry.component.render(Number(entry.options?.width)).join("\n"));
+  assert.match(pill, /✘/);
+  assert.match(pill, /出错了/);
+  assert.match(pill, /⚠/);
+  assert.match(pill, /注意一下/);
+  assert.match(pill, /短暂提示/);
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(entry.component.render(Number(entry.options?.width)).length, 2, "expired info toast disappears");
+});
+
+test("toast stack caps at 4 entries, repeats extend instead of stacking, and empty stack hides the overlay", () => {
+  const { repl, ui } = makeRepl();
+  const toasts = toastsOf(ui);
+  for (const index of [0, 1, 2, 3]) repl.notify(`提示 ${index}`);
+  repl.notify("提示 5");
+  assert.equal(toasts.render(80).length, 4, "oldest toast is dropped beyond the cap");
+  const lines = stripTerminalSequences(toasts.render(80).join("\n"));
+  assert.ok(!lines.includes("提示 0"), "the oldest entry is the one dropped");
+  assert.ok(lines.includes("提示 5"));
+
+  repl.notify("提示 5");
+  assert.equal(toasts.render(80).length, 4, "a repeat does not stack a second copy");
+  toasts.clear();
+  assert.equal(toasts.render(80).length, 0, "clear drops everything");
+  assert.ok(toastOverlayOf(ui).handle.isHidden(), "empty stack hides the toast overlay");
+});
+
+test("status bar below the editor renders model, context, and cache hit rate", () => {
+  const { repl, ui } = makeRepl();
+  const root = ui.layoutRoot! as Container;
+  const [, chatColumn] = root.children as [Container, Container];
+  const [chat, statusBar] = chatColumn.children as [Container, Container];
+  assert.equal(chatColumn.children.length, 2, "chat panel first, status bar below");
+  assert.ok(statusBar instanceof StatusBar, "the bar is the last chat-column child (below the editor)");
+
+  repl.setStatus({
+    model: "openai/gpt-4o",
+    thinkingLevel: "high",
+    contextTokens: 12000,
+    contextWindow: 128000,
+    contextPercent: 9.4,
+    inputTokens: 100,
+    outputTokens: 4500,
+    cacheRead: 800,
+    cacheWrite: 100,
+    cost: 0.1234
+  });
+  const line = stripTerminalSequences(statusBar.render(160).join("\n"));
+  assert.match(line, /模型 openai\/gpt-4o/);
+  assert.match(line, /thinking high/);
+  assert.match(line, /上下文 12\.0k\/128\.0k（9\.4%）/);
+  assert.match(line, /缓存命中 80\.0%/, "cache hit = cacheRead / (cacheRead + cacheWrite + input)");
+  assert.match(line, /\$0\.12/);
+  assert.ok(!line.includes("输出 "), "raw output token count is not shown (speed instead)");
+  assert.ok(!line.includes("任务执行中"), "idle state shows no busy flag");
+
+  repl.setStatus({ model: "openai/gpt-4o", busy: true });
+  assert.match(stripTerminalSequences(statusBar.render(160).join("\n")), /任务执行中/);
+});
+
+test("status bar without a model shows a placeholder and skips unknown segments", () => {
+  const { repl } = makeRepl();
+  repl.setStatus({});
+  const root = (repl as unknown as { ui: { layoutRoot: Container } }).ui.layoutRoot!;
+  const [, chatColumn] = root.children as [Container, Container];
+  const [, statusBar] = chatColumn.children as [Container, Container];
+  const line = stripTerminalSequences(statusBar.render(160).join("\n"));
+  assert.match(line, /模型 未选择/);
+  assert.ok(!line.includes("上下文"), "no context segment without data");
+  assert.ok(!line.includes("缓存命中"), "no cache segment without data");
+});
+
+test("status bar shows output speed (tok/s) while busy, not the token count", () => {
+  let now = 1_000;
+  const bar = new StatusBar(() => now);
+  const line = (): string => stripTerminalSequences(bar.render(200).join("\n"));
+
+  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 0 });
+  assert.ok(!line().includes("tok/s"), "no speed before the first sampling window");
+  assert.ok(!line().includes("输出 "), "raw output token count is not shown");
+
+  now = 2_000; // 1s 内产出 50 tokens → 50 tok/s
+  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 50 });
+  assert.match(line(), /速度 50\.0 tok\/s/);
+
+  now = 3_000; // 再 1s 产出 70 tokens → 瞬时 70，EMA(0.6/0.4) = 58
+  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 120 });
+  assert.match(line(), /速度 58\.0 tok\/s/);
+
+  bar.set({ model: "openai/gpt-4o", busy: false, outputTokens: 120 });
+  assert.ok(!line().includes("tok/s"), "speed disappears when idle");
+
+  // 会话切换后累计值回落：重新起算而不报负速度。
+  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 10 });
+  now = 4_000;
+  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 60 });
+  assert.match(line(), /速度 50\.0 tok\/s/);
+});
+
+test("editor Home/End jump to line start/end through the global key routing", () => {
+  const { repl, ui } = makeRepl();
+  const editor = editorOf(repl) as unknown as { handleInput(data: string): void; getCursor(): { line: number; col: number } };
+  editor.handleInput("你好世界 second");
+  assert.equal(editor.getCursor().col, 11, "cursor starts at the end of the input");
+
+  // 从监听器转发时 TUI 不会自动重绘，必须显式请求一帧（否则位置变了显示不刷）。
+  let renders = 0;
+  (ui as unknown as { requestRender: () => void }).requestRender = () => {
+    renders += 1;
+  };
+
+  // 关键路径：Home/End 必须穿过全局监听（不再被 alt-screen 视口滚动抢先消费）。
+  for (const home of ["\x1b[H", "\x1b[1~", "\x1bOH"]) {
+    const before = renders;
+    assert.equal(press(ui, home), true, `Home via ${JSON.stringify(home)} is consumed`);
+    assert.equal(editor.getCursor().col, 0, `Home via ${JSON.stringify(home)} jumps to column 0`);
+    assert.ok(renders > before, `Home via ${JSON.stringify(home)} requests a repaint`);
+  }
+  for (const end of ["\x1b[F", "\x1b[4~", "\x1bOF"]) {
+    const before = renders;
+    assert.equal(press(ui, end), true, `End via ${JSON.stringify(end)} is consumed`);
+    assert.equal(editor.getCursor().col, 11, `End via ${JSON.stringify(end)} jumps back to the end`);
+    assert.ok(renders > before, `End via ${JSON.stringify(end)} requests a repaint`);
+  }
+});
+
+test("stop({ preserveScreen: true }) leaves the alt screen without dumping content", () => {
+  const writes: string[] = [];
+  const terminal = {
+    write: (chunk: string) => writes.push(chunk),
+    columns: 80,
+    rows: 24,
+    start: () => undefined,
+    showCursor: () => undefined,
+    hideCursor: () => undefined,
+    stop: () => undefined
+  };
+  const ui = new TuiAltScreen(terminal as never, true, undefined);
+  ui.start();
+  writes.length = 0;
+  ui.stop({ preserveScreen: true });
+  const out = writes.join("");
+  assert.ok(out.includes("\x1b[?1049l"), "leaves the alternate screen buffer");
+  assert.ok(out.includes("\x1b[?25h"), "shows the cursor again");
+  assert.ok(!out.includes("\r\n\r\n"), "no document dump is written to the main screen");
+});
+
+test("double Esc while busy aborts; single Esc only hints, and the window expires", async () => {
+  const ui = makeFakeUi();
+  const busy = { value: true };
+  const aborted: number[] = [];
+  const repl = new TuiRepl({
+    ui: ui as never,
+    onSubmit: async () => undefined,
+    onExit: () => undefined,
+    isBusy: () => busy.value,
+    onAbort: () => {
+      aborted.push(1);
+    },
+    doubleEscWindowMs: 50
+  });
+  repl.registerAgent("supervisor");
+  const toastText = (): string => {
+    const entry = ui.overlays.find((overlay) => overlay.component instanceof ToastStack);
+    return entry ? stripTerminalSequences((entry.component as ToastStack).render(120).join("\n")) : "";
+  };
+
+  assert.equal(press(ui, "\x1b"), true, "first Esc is consumed while busy");
+  assert.match(toastText(), /再按一次 Esc 停止输出/, "first Esc shows the hint toast");
+  assert.equal(aborted.length, 0, "no abort on the first press");
+
+  press(ui, "\x1b");
+  assert.equal(aborted.length, 1, "second Esc inside the window aborts");
+  assert.match(toastText(), /已请求停止输出/, "abort is confirmed with a toast");
+
+  // 窗口外：重新武装，不触发中止。
+  press(ui, "\x1b");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  press(ui, "\x1b");
+  assert.equal(aborted.length, 1, "presses outside the window never abort");
+
+  // 非 busy 时 Esc 不被接管（落到编辑器）。
+  busy.value = false;
+  assert.equal(press(ui, "\x1b"), false, "Esc falls through to the editor when idle");
+});
+
+test("beginStatus shows a spinner line in the transcript that settles into ✔/✘", () => {
+  const { repl, log } = makeRepl();
+  const id = repl.beginStatus("压缩上下文");
+  assert.equal(log.children.length, 1, "status line lands in the transcript");
+  const line = log.children[0] as StatusLine;
+  const running = stripTerminalSequences(line.render(80).join("\n"));
+  assert.match(running, /压缩上下文/);
+  assert.match(running, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, "a spinner frame renders while running");
+
+  repl.endStatus(id, false);
+  assert.match(stripTerminalSequences(line.render(80).join("\n")), /✔/, "success flips to ✔ in place");
+
+  const second = repl.beginStatus("第二次压缩");
+  repl.endStatus(second, true);
+  assert.match(stripTerminalSequences((log.children[1] as StatusLine).render(80).join("\n")), /✘/, "failure flips to ✘");
+
+  repl.endStatus(id, false); // 重复收尾无副作用
+  line.stop();
+});
+
+test("stopStatuses clears animations when the REPL stops", () => {
+  const { repl } = makeRepl();
+  repl.beginStatus("压缩上下文");
+  const chat = (repl as unknown as { chat: { stopStatuses(): void; statusLines: Map<number, unknown> } }).chat;
+  chat.stopStatuses();
+  assert.equal(chat.statusLines.size, 0);
+});
+
+test("streamed text blocks keep their blank-line separator as a reload would", () => {
+  const { repl, log } = makeRepl();
+  repl.streamText("第一段。\n\n");
+  repl.streamText("第二段开头");
+  repl.endStream();
+  const rendered = log.children.map((child) => stripTerminalSequences(child.render(80).join("\n")));
+  assert.equal(rendered.length, 3, "block, spacer, block");
+  assert.match(rendered[0], /第一段/);
+  assert.equal(rendered[1].trim(), "", "a blank line separates the two streamed blocks");
+  assert.match(rendered[2], /第二段/);
+
+  // 下一条消息从干净状态开始：块间分隔不泄漏到消息边界之外。
+  repl.streamText("新消息首段");
+  repl.endStream();
+  assert.equal(log.children.length, 4, "no stray spacer before the next message");
+  assert.match(stripTerminalSequences(log.children[3].render(80).join("\n")), /新消息首段/);
+});
+
+test("the streaming tail is separated from committed blocks by a blank line", () => {
+  const { repl, log, stream } = makeRepl();
+  repl.streamText("第一段。\n\n");
+  assert.equal(log.children.length, 1, "first block committed on its blank line");
+
+  repl.streamText("第二段正在输出");
+  const tail = stream.children.map((child) => stripTerminalSequences(child.render(80).join("\n")));
+  assert.equal(tail.length, 2, "seam spacer + live tail");
+  assert.equal(tail[0].trim(), "", "the log/stream seam carries the blank line while streaming");
+  assert.match(tail[1], /第二段正在输出/);
+
+  // 提交后空行落在 log 里，stream 区清空。
+  repl.endStream();
+  assert.equal(log.children.length, 3);
+  assert.equal(stream.children.length, 0);
+});
+
+test("live streaming renders line-identical to history replay for the same message", () => {
+  // 用户报告的场景：标题（黄色行）与后续段落之间，实时缺空行、回放有。
+  const whole = [
+    "## 思考 token 算不算输出速度？",
+    "**算（口径上）**。速度的数据源是 usage.output。",
+    "## 但发现了一个真 bug",
+    "`tokens.output` 来自 getSessionStats 的累计统计。"
+  ].join("\n\n");
+
+  // 实时：按流式 chunk 逐段喂入（每段带尾随空行，最后一段不带）。
+  const { repl, log } = makeRepl();
+  const blocks = whole.split("\n\n");
+  for (let i = 0; i < blocks.length; i++) {
+    repl.streamText(i < blocks.length - 1 ? `${blocks[i]}\n\n` : blocks[i]);
+  }
+  repl.endStream();
+  const live = log.children.flatMap((child) => stripTerminalSequences(child.render(80).join("\n")).split("\n"));
+
+  // 回放：同一条消息一次性 append（历史回放的路径）。
+  const replayed = makeRepl();
+  replayed.repl.appendMarkdown(whole);
+  const replay = replayed.log.children.flatMap((child) => stripTerminalSequences(child.render(80).join("\n")).split("\n"));
+
+  // 行尾空白规范化：Markdown 的段落间空行是「整行空格」而流式分隔是真空行，
+  // 视觉等价；除此之外两路必须逐行一致。
+  const normalize = (lines: string[]) => lines.map((line) => line.replace(/\s+$/g, ""));
+  assert.deepEqual(normalize(live), normalize(replay), "live and replay must render the exact same lines");
+});
+
+test("char-by-char streaming (real delta granularity) still inserts block spacers", () => {
+  const { repl, log, stream } = makeRepl();
+  repl.streamThinking("先想一下");
+  const message = "## 标题一\n\n第一段。\n\n## 标题二\n\n第二段。";
+  for (const ch of message) repl.streamText(ch);
+  repl.endStream();
+
+  const lines = log.children.flatMap((child) => stripTerminalSequences(child.render(80).join("\n")).split("\n"));
+  const normalized = lines.map((line) => line.replace(/\s+$/g, ""));
+  assert.deepEqual(normalized, [
+    "▸ 思考（4 字）",
+    "标题一",
+    "",
+    "第一段。",
+    "",
+    "标题二",
+    "",
+    "第二段。"
+  ]);
+});
+
+test("end-to-end: the real alt-screen paints blank lines between streamed blocks", async () => {
+  const writes: string[] = [];
+  const terminal = {
+    write: (chunk: string) => writes.push(chunk),
+    columns: 80,
+    rows: 24,
+    start: () => undefined,
+    stop: () => undefined,
+    showCursor: () => undefined,
+    hideCursor: () => undefined
+  };
+  const ui = new TuiAltScreen(terminal as never, true, undefined);
+  const { TuiRepl } = await import("../src/cli/tui-repl.ts");
+  const repl = new TuiRepl({ ui, onSubmit: async () => undefined, onExit: () => undefined });
+  ui.start();
+  await new Promise((r) => setTimeout(r, 50)); // 首帧 fullRedraw
+  writes.length = 0;
+
+  repl.streamThinking("先想一下");
+  const message = "## 标题一\n\n第一段。\n\n## 标题二\n\n第二段。";
+  for (const ch of message) repl.streamText(ch);
+  repl.endStream();
+  await new Promise((r) => setTimeout(r, 120)); // 等差分帧落地
+  ui.stop();
+
+  // 从写入序列重建屏幕：每行变更都是 ESC[{row};1H ESC[2K {text}。
+  const all = writes.join("");
+  const screen: string[] = new Array(24).fill("");
+  const tokens = [...all.matchAll(/\x1b\[(\d+);1H\x1b\[2K/g)];
+  for (let i = 0; i < tokens.length; i++) {
+    const row = Number(tokens[i][1]) - 1;
+    const start = tokens[i].index! + tokens[i][0].length;
+    const end = i + 1 < tokens.length ? tokens[i + 1].index! : all.length;
+    const text = stripTerminalSequences(all.slice(start, end));
+    screen[row] = text.replace(/\s+$/g, "");
+  }
+
+  const headingRow = screen.findIndex((line) => line.includes("标题一"));
+  assert.ok(headingRow >= 0, `标题一 is on screen; got: ${JSON.stringify(screen)}`);
+  // 该行左侧是侧边栏内容，但聊天区必须是空白（不能粘贴下一段）。
+  assert.ok(
+    !(screen[headingRow + 1] ?? "").includes("第一段。"),
+    "no paragraph glued directly below the heading"
+  );
+  assert.ok((screen[headingRow + 2] ?? "").includes("第一段。"), "the next block starts two rows below");
 });
 
 /** A log line arriving mid-stream commits the pending tail before itself. */
@@ -245,7 +685,7 @@ test("flushed thinking tail leaves the stream area when a tool row arrives", () 
   assert.ok(!(log.children[0] instanceof Markdown), "thinking folds as collapsible reasoning");
   const text = log.children.map((child) => stripTerminalSequences(child.render(80).join("\n"))).join("\n");
   const rawText = log.children.map((child) => child.render(80).join("\n")).join("\n");
-  const occurrences = rawText.split("pi-swarm://think/1").length - 1;
+  const occurrences = rawText.split("思考（").length - 1;
   assert.equal(occurrences, 1, "folded reasoning appears exactly once (collapsed summary)");
   assert.ok(!text.includes("先分析一下失败原因"), "raw thinking is folded away, not left as a stale tail");
 });
@@ -279,7 +719,7 @@ test("appendLine adds a plain text row", () => {
 test("askQuestion collects one answer line and hands the prompt back", async () => {
   const { repl, log } = makeRepl();
   const answer = repl.askQuestion("[主 agent] 用哪个数据库？");
-  const editor = (repl as unknown as { editor: { handleInput(data: string): void } }).editor;
+  const editor = editorOf(repl);
   editor.handleInput("postgres");
   editor.handleInput("\r");
   assert.equal(await answer, "postgres");
@@ -299,7 +739,8 @@ test("busy mode keeps the editor mounted; Enter is swallowed until the task ends
       submitted.push(line);
       const root = ui.layoutRoot! as Container;
       const [, chatColumn] = root.children as [Container, Container];
-      const inputArea = chatColumn.children[1] as Container;
+      const [chat] = chatColumn.children as [Container];
+      const inputArea = chat.children[chat.children.length - 1] as Container;
       busyState = {
         editorMounted: inputArea.children.includes(editor as never),
         busyTextShown: stripTerminalSequences(inputArea.render(80).join("\n")).includes("任务执行中"),
@@ -309,7 +750,7 @@ test("busy mode keeps the editor mounted; Enter is swallowed until the task ends
     },
     onExit: () => undefined
   });
-  editor = (repl as unknown as { editor: typeof editor }).editor;
+  editor = editorOf(repl);
 
   editor.handleInput("第一件事");
   editor.handleInput("\r");
@@ -336,7 +777,7 @@ test("submitted user messages render as right-aligned bubbles with a background"
     },
     onExit: () => undefined
   });
-  const editor = (repl as unknown as { editor: { handleInput(data: string): void } }).editor;
+  const editor = editorOf(repl);
   const [log] = mountedChat(ui).children as [Container];
 
   editor.handleInput("帮我看一下这个报错");
@@ -349,6 +790,39 @@ test("submitted user messages render as right-aligned bubbles with a background"
   const plain = stripTerminalSequences(raw);
   assert.ok(plain.startsWith(" "), "bubble is right-aligned, not left-anchored");
   assert.ok(plain.trimEnd().endsWith("帮我看一下这个报错"), "bubble keeps one padding column at the right edge");
+});
+
+test("picker marks and preselects the current entry, hints render as descriptions", () => {
+  let settled: string | undefined;
+  const picker = new PickerComponent("选择 provider", [
+    { option: { value: "anthropic", label: "anthropic", hint: "Anthropic" }, searchable: "anthropic" },
+    { option: { value: "openai", label: "openai", hint: "OpenAI", current: true }, searchable: "openai" }
+  ], (value) => {
+    settled = value;
+  });
+  const raw = picker.render(100).join("\n");
+  const text = stripTerminalSequences(raw);
+  assert.match(text, /╭─ 选择 provider/, "panel has a titled top border");
+  assert.match(text, /╰/, "panel has a bottom border");
+  assert.ok(raw.includes("\x1b[48;5;234m"), "panel has a solid background, distinct from chat content");
+  assert.match(text, /● openai/, "current entry carries the ● marker");
+  assert.match(text, /Anthropic/, "hints render as descriptions (was silently dropped before)");
+  assert.ok(!text.includes("当前"), "no redundant 当前 suffix next to the ● marker");
+
+  const selectedRow = raw.split("\n").find((line) => line.includes("→"));
+  assert.ok(selectedRow?.includes("openai"), "the current entry is pre-selected (→ highlight)");
+
+  // 边框四边等宽：顶/底/内容行可见宽度完全一致。
+  const widths = new Set(raw.split("\n").map((line) => visibleWidth(line)));
+  assert.equal(widths.size, 1, `all panel rows share one width, got ${[...widths]}`);
+
+  // 所有选项的文字起点一致（● 标记列固定两格，垂直对齐）。
+  const rows = text.split("\n");
+  const labelCol = (needle: string): number => rows.find((row) => row.includes(needle))!.indexOf(needle);
+  assert.equal(labelCol("openai"), labelCol("anthropic"), "choices align vertically");
+
+  picker.handleInput("\r");
+  assert.equal(settled, "openai", "Enter picks the pre-selected current entry");
 });
 
 test("pick selects via Enter, filters by typing, and cancels with Esc", async () => {
@@ -379,7 +853,7 @@ test("pick selects via Enter, filters by typing, and cancels with Esc", async ()
   assert.equal(overlays.length, 1, "overlay closes on cancel");
 });
 
-test("agent tabs register, mark background activity unread, and switch via handleLink", () => {
+test("agent tabs register, mark background activity unread, and cycle via Alt+↓", () => {
   const { repl, ui, log, overlays } = makeRepl();
   repl.registerAgent("code-writer");
   const bar = overlays[0].component;
@@ -390,23 +864,22 @@ test("agent tabs register, mark background activity unread, and switch via handl
   assert.ok(plain().startsWith(" "), "tab row is right-aligned");
   const raw = bar.render(80)[0];
   assert.ok(raw.includes("\x1b[7msupervisor\x1b[27m"), "active tab is highlighted");
-  assert.ok(raw.includes("pi-swarm://agent/code-writer"), "tabs are OSC 8 links");
+  assert.ok(!raw.includes("\x1b]8;"), "tabs are plain text, not hyperlinks");
 
   repl.appendLine("后台输出", "code-writer");
   assert.ok(plain().includes("● code-writer"), "background output marks the tab unread");
   assert.equal(log.children.length, 0, "background output stays out of the active log");
 
   const mountedBefore = mountedChat(ui);
-  repl.handleLink("pi-swarm://agent/code-writer");
-  assert.notEqual(mountedChat(ui), mountedBefore, "switching replaces the mounted transcript");
+  assert.ok(press(ui, "\x1bn"), "Alt+↓ cycles agent tabs");
+  assert.notEqual(mountedChat(ui), mountedBefore, "cycling replaces the mounted transcript");
   assert.ok(!plain().includes("● code-writer"), "activation clears the unread marker");
   const [activeLog] = mountedChat(ui).children as [Container];
   assert.equal(activeLog.children.length, 1);
   assert.ok(activeLog.children[0].render(80).join("\n").includes("后台输出"));
 
-  const mounted = mountedChat(ui);
-  repl.handleLink("pi-swarm://agent/ghost");
-  assert.equal(mountedChat(ui), mounted, "links for unknown agents are ignored");
+  assert.ok(press(ui, "\x1bp"), "Alt+↑ cycles back");
+  assert.equal(mountedChat(ui), mountedBefore, "cycling wraps around to the supervisor");
 });
 
 test("streaming to a background agent stays silent and lands in its transcript", () => {
@@ -420,31 +893,36 @@ test("streaming to a background agent stays silent and lands in its transcript",
   assert.equal(log.children.length, 0, "supervisor log untouched");
   assert.equal(stream.children.length, 0, "active stream area untouched");
 
-  repl.handleLink("pi-swarm://agent/code-writer");
+  press(ui, "\x1bn"); // Alt+↓ → code-writer
   const [bgLog] = mountedChat(ui).children as [Container];
-  assert.equal(bgLog.children.length, 3, "collapsible reasoning + two markdown blocks");
+  assert.equal(bgLog.children.length, 4, "reasoning + markdown + blank separator + markdown");
   assert.ok(!(bgLog.children[0] instanceof Markdown), "thinking folds as collapsible reasoning");
   assert.ok(bgLog.children[1] instanceof Markdown);
+  assert.equal(
+    (bgLog.children[2] as Text).render(80).join("\n").trim(),
+    "",
+    "the split blocks keep their blank-line separator"
+  );
 });
 
-test("collapsible reasoning expands and collapses via pi-swarm://think links", () => {
-  const { repl, log } = makeRepl();
+test("collapsible reasoning expands and collapses via the transcript-mode f key", () => {
+  const { repl, ui, log } = makeRepl();
   repl.streamThinking("第一行推理\n第二行推理");
   repl.streamText("答案");
   const reasoning = log.children[0] as unknown as { render(width: number): string[] };
 
   const collapsed = reasoning.render(80);
   assert.equal(collapsed.length, 1, "collapsed to a single summary line");
-  assert.ok(collapsed[0].includes("pi-swarm://think/1"));
-  assert.ok(stripTerminalSequences(collapsed[0]).includes("思考（11 字）· 点击展开"));
+  assert.ok(stripTerminalSequences(collapsed[0]).includes("思考（11 字）"));
 
-  repl.handleLink("pi-swarm://think/1");
+  press(ui, "\x1bt"); // Alt+T → transcript browse mode
+  press(ui, "f");
   const expanded = reasoning.render(80).join("\n");
   assert.ok(stripTerminalSequences(expanded).includes("第一行推理"));
   assert.ok(stripTerminalSequences(expanded).includes("第二行推理"));
 
-  repl.handleLink("pi-swarm://think/1");
-  assert.equal(reasoning.render(80).length, 1, "second click collapses again");
+  press(ui, "f");
+  assert.equal(reasoning.render(80).length, 1, "second press collapses again");
 });
 
 /** Minimal SessionSummary for sessions-bar tests. */
@@ -486,8 +964,7 @@ test("sessions sidebar is a full-height bordered column with scrollable rows", (
   assert.ok(stripTerminalSequences(topBorder.render(22)[0]).startsWith("╭"), "top border hugs the left edge");
   const strippedTop = stripTerminalSequences(topBorder.render(22)[0]);
   assert.ok(strippedTop.includes("─ 会话"), "the title rides the top border");
-  assert.ok(strippedTop.includes("＋ 新建"), "the ＋ 新建 link rides the title edge to save a row");
-  assert.ok(topBorder.render(22)[0].includes("pi-swarm://session/draft"), "＋ 新建 stays a clickable link (draft id)");
+  assert.ok(strippedTop.includes("＋ 新建 (n)"), "the ＋ 新建 hint rides the title edge with its key");
   assert.ok(stripTerminalSequences(bottomBorder.render(22)[0]).startsWith("╰"), "bottom border closes the box");
 
   // Full-height wiring: the scroll viewport grows to absorb the spare height.
@@ -505,7 +982,9 @@ test("sessions sidebar is a full-height bordered column with scrollable rows", (
   // The transcript scrolls with a visible scrollbar too, and a one-column gap
   // keeps the sidebar's scrollbar from touching the chat content.
   const root = ui.layoutRoot! as Container;
-  const chatScroll = (root.children[1] as unknown as Container).children[0];
+  const [, chatColumn] = root.children as [Container, Container];
+  const [chat] = chatColumn.children as [Container];
+  const [chatScroll] = chat.children as [Container];
   assert.equal((chatScroll as unknown as { scrollbar: string }).scrollbar, "auto", "the transcript scrollbar is transient (auto-visible)");
   assert.equal((root as unknown as { gap: number }).gap, 1, "one blank column between sidebar and chat");
 });
@@ -515,8 +994,8 @@ test("sessions sidebar rows list current/closed/empty states and stay inside the
   const { topBorder, rows } = sidebarParts(ui);
   const plain = (width = 22) => stripTerminalSequences(rows.render(width).join("\n"));
 
-  // Lazy creation: nothing exists yet — the border ＋ link and the empty-state hint.
-  assert.ok(topBorder.render(22)[0].includes("pi-swarm://session/draft"), "＋ 新建 is always offered as a link");
+  // Lazy creation: nothing exists yet — the ＋ 新建 hint and the empty-state hint.
+  assert.ok(stripTerminalSequences(topBorder.render(22)[0]).includes("＋ 新建 (n)"), "＋ 新建 is always offered");
   assert.ok(plain().includes("暂无会话"), "empty state hints at lazy auto-create");
 
   repl.setSessions([
@@ -526,9 +1005,7 @@ test("sessions sidebar rows list current/closed/empty states and stay inside the
   ]);
   const rendered = rows.render(22);
   const raw = rendered.join("\n");
-  assert.ok(raw.includes("pi-swarm://session/s1"), "each session is its own OSC 8 link");
-  assert.ok(raw.includes("pi-swarm://session/s2"));
-  assert.ok(!plain().includes("暂无会话"), "hint disappears once sessions exist");
+  assert.ok(!raw.includes("\x1b]8;"), "rows are plain text, not hyperlinks");
   assert.ok(raw.includes("\x1b[7m● 会话甲\x1b[27m"), "current session is highlighted with a ● marker");
   assert.ok(plain().includes("✕ 会话丙"), "closed sessions show a ✕ marker");
   assert.ok(plain().includes("  会话乙"), "other sessions keep marker alignment");
@@ -551,7 +1028,6 @@ test("setDraftMode pins a highlighted ✎ 草稿 row at the top of the sidebar",
 
   repl.setDraftMode(true);
   const rendered = rows.render(22);
-  assert.ok(rendered.join("\n").includes("pi-swarm://session/draft"), "the draft row is its own OSC 8 link");
   assert.ok(plain().includes("✎ 草稿（未保存）"), "the draft row is visible");
   assert.ok(rendered.join("\n").includes("\x1b[7m"), "the draft row uses the current-session highlight");
 
@@ -579,7 +1055,7 @@ test("clearTranscript empties the active transcript (draft starts from a clean s
   assert.equal(log.children.length, 1);
 });
 
-test("handleLink routes pi-swarm://session clicks to onSessionClick", () => {
+test("sidebar keyboard navigation: ↑↓ select, Enter opens, n starts a draft, Esc returns to the editor", () => {
   const ui = makeFakeUi();
   const clicked: string[] = [];
   const repl = new TuiRepl({
@@ -590,23 +1066,92 @@ test("handleLink routes pi-swarm://session clicks to onSessionClick", () => {
       clicked.push(id);
     }
   });
-  repl.handleLink("pi-swarm://session/abc-123");
-  repl.handleLink("pi-swarm://session/draft");
-  repl.handleLink("pi-swarm://agent/supervisor"); // agent links stay agent switches
-  repl.handleLink("pi-swarm://unrelated/xyz");
-  assert.deepEqual(clicked, ["abc-123", "draft"]);
+  repl.setSessions([
+    makeSummary({ id: "s1", name: "会话甲" }),
+    makeSummary({ id: "s2", name: "会话乙" })
+  ]);
+
+  assert.ok(press(ui, "\x1bs"), "Alt+S focuses the sidebar");
+  const { rows } = sidebarParts(ui);
+  assert.ok(rows.render(22)[0].includes("\x1b[7m"), "the selected row is highlighted while focused");
+
+  press(ui, "\x1b[B"); // ↓ → 会话乙
+  press(ui, "\r"); // Enter opens it
+  press(ui, "n"); // n starts a draft
+  assert.deepEqual(clicked, ["s2", "draft"]);
+
+  press(ui, "\x1b"); // Esc → editor
+  const editor = editorOf(repl);
+  assert.equal(ui.focusTargets[ui.focusTargets.length - 1], editor, "Esc restores editor focus");
+  assert.ok(!rows.render(22).join("\n").includes("\x1b[7m● 会话甲"), "no selection highlight while unfocused");
 });
 
-test("parseRightClick keeps only right-button SGR mouse sequences", () => {
-  assert.deepEqual(parseRightClick("\x1b[<2;5;8M"), { x: 4, y: 7, release: false }, "press (1-based coords)");
-  assert.deepEqual(parseRightClick("\x1b[<2;5;8m"), { x: 4, y: 7, release: true }, "release");
-  assert.equal(parseRightClick("\x1b[<0;5;8M"), undefined, "left button is not a right-click");
-  assert.equal(parseRightClick("\x1b[<64;5;8M"), undefined, "wheel events are ignored");
-  assert.equal(parseRightClick("\x1b[<32;5;8M"), undefined, "motion events are ignored");
-  assert.equal(parseRightClick("\x1b[A"), undefined, "non-mouse input passes through");
+test("sidebar selection wraps around and follows into the scroll viewport", () => {
+  const { repl, ui } = makeRepl();
+  repl.setSessions(Array.from({ length: 30 }, (_, index) => makeSummary({ id: `s${index}`, name: `会话${index}号` })));
+  const { scroll, rows } = sidebarParts(ui);
+  (scroll as unknown as {
+    updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void;
+  }).updateLayout(30, 10, () => undefined);
+  press(ui, "\x1bs");
+  press(ui, "\x1b[A"); // ↑ from row 0 wraps to the last row
+  assert.equal((scroll as unknown as { scrollTop: number }).scrollTop, 20, "wrap scrolls so the selection stays visible");
+  assert.ok(rows.render(22)[29].includes("\x1b[7m"), "the wrapped selection is highlighted");
 });
 
-test("right-click on a sidebar session opens a context menu; items work by mouse link and keyboard", () => {
+test("Tab hops between sidebar and transcript; Esc returns to the editor", () => {
+  const { repl, ui } = makeRepl();
+  const editor = editorOf(repl);
+  const lastFocus = () => ui.focusTargets[ui.focusTargets.length - 1];
+
+  press(ui, "\x1bs"); // → sidebar
+  assert.equal(lastFocus(), null, "sidebar mode releases component focus");
+  const { bottomBorder } = sidebarParts(ui);
+  assert.ok(stripTerminalSequences(bottomBorder.render(22)[0]).includes("Enter 打开"), "focused sidebar shows key hints");
+
+  press(ui, "\t"); // → transcript
+  press(ui, "\t"); // → back to sidebar
+  assert.ok(stripTerminalSequences(bottomBorder.render(22)[0]).includes("Enter 打开"), "hints return with the sidebar");
+
+  press(ui, "\x1b"); // → editor
+  assert.equal(lastFocus(), editor, "Esc returns to the editor");
+  assert.ok(!stripTerminalSequences(bottomBorder.render(22)[0]).includes("Enter 打开"), "hints hide when unfocused");
+});
+
+test("typing in panel modes falls straight back to the editor", () => {
+  const { repl, ui } = makeRepl();
+  const editor = editorOf(repl);
+
+  press(ui, "\x1bs"); // sidebar
+  assert.equal(press(ui, "你"), false, "printable input is not consumed");
+  assert.equal(ui.focusTargets[ui.focusTargets.length - 1], editor, "focus returned to the editor");
+
+  press(ui, "\x1bt"); // transcript
+  assert.equal(press(ui, "x"), false);
+  assert.equal(ui.focusTargets[ui.focusTargets.length - 1], editor);
+});
+
+test("transcript browse mode scrolls the chat line by line", () => {
+  const { repl, ui } = makeRepl();
+  for (let i = 0; i < 50; i++) repl.appendLine(`第${i}行`);
+  const root = ui.layoutRoot! as Container;
+  const [, chatColumn] = root.children as [Container, Container];
+  const [chat] = chatColumn.children as [Container];
+  const chatScroll = chat.children[0] as unknown as {
+    scrollTop: number;
+    scrollBy(lines: number): unknown;
+    updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void;
+  };
+  chatScroll.updateLayout(200, 10, () => undefined);
+
+  press(ui, "\x1bt"); // Alt+T → transcript browse
+  press(ui, "\x1b[A"); // ↑
+  assert.equal(chatScroll.scrollTop, 189, "follow-end starts at the bottom; ↑ scrolls one line");
+  press(ui, "\x1b[B"); // ↓
+  assert.equal(chatScroll.scrollTop, 190, "↓ scrolls back down");
+});
+
+test("d on a sidebar session opens a delete confirmation driven by the keyboard", () => {
   const ui = makeFakeUi();
   const deleted: string[] = [];
   const repl = new TuiRepl({
@@ -621,57 +1166,81 @@ test("right-click on a sidebar session opens a context menu; items work by mouse
     makeSummary({ id: "s1", name: "会话甲" }),
     makeSummary({ id: "s2", name: "会话乙" })
   ]);
-  const rightClick = (x: number, y: number): void =>
-    (repl as unknown as { handleSidebarRightClick(x: number, y: number): void }).handleSidebarRightClick(x, y);
   // The constructor already shows the agent tab bar overlay; measure deltas.
   const baseline = ui.overlays.length;
+  const menuAt = () => ui.overlays[ui.overlays.length - 1]!.component as unknown as {
+    handleInput(data: string): void;
+    render(width: number): string[];
+  };
 
-  // Rows start at screen row 1: y=1 is the first session, y=0 the top border.
-  rightClick(1, 1);
-  assert.equal(ui.overlays.length, baseline + 1, "the context menu overlay is shown");
-  const menu = ui.overlays[ui.overlays.length - 1]!.component as unknown as { render(width: number): string[] };
-  assert.ok(menu.render(26).join("\n").includes("pi-swarm://menu/0"), "menu items are OSC 8 links (mouse-clickable)");
+  press(ui, "\x1bs"); // focus sidebar; selection = 会话甲
+  press(ui, "d");
+  assert.equal(ui.overlays.length, baseline + 1, "the confirmation menu opens");
+  assert.ok(stripTerminalSequences(menuAt().render(26).join("\n")).includes("删除会话"), "menu lists the delete action");
 
-  // Mouse click on the 删除 item routes through the hyperlink handler.
-  repl.handleLink("pi-swarm://menu/0");
-  assert.deepEqual(deleted, ["s1"], "the menu link runs the delete action");
+  menuAt().handleInput("\r"); // Enter on 删除
+  assert.deepEqual(deleted, ["s1"], "Enter confirms the delete");
   assert.equal(ui.overlays.length, baseline, "the menu closes after the action");
 
-  // Keyboard path: open again, arrow down to 取消, press Enter — nothing is deleted.
-  rightClick(1, 1);
-  const keyed = ui.overlays[ui.overlays.length - 1]!.component as unknown as { handleInput(data: string): void };
-  keyed.handleInput("\x1b[B"); // down → 取消
-  keyed.handleInput("\r"); // enter
+  press(ui, "d"); // open again, arrow down to 取消
+  menuAt().handleInput("\x1b[B");
+  menuAt().handleInput("\r");
   assert.deepEqual(deleted, ["s1"], "取消 runs no action");
-  assert.equal(ui.overlays.length, baseline, "enter closes the menu");
 
-  rightClick(30, 1);
-  rightClick(1, 0);
-  assert.equal(ui.overlays.length, baseline, "clicks outside the sidebar rows show no menu");
+  press(ui, "d"); // Esc cancels outright
+  menuAt().handleInput("\x1b");
+  assert.equal(ui.overlays.length, baseline, "Esc closes the menu");
+  assert.deepEqual(deleted, ["s1"]);
 });
 
 test("with a draft open the first sidebar row is the draft and the second is session one", () => {
   const ui = makeFakeUi();
+  const activated: string[] = [];
   const deleted: string[] = [];
   const repl = new TuiRepl({
     ui: ui as never,
     onSubmit: async () => undefined,
     onExit: () => undefined,
+    onSessionClick: (id) => {
+      activated.push(id);
+    },
     onDeleteSession: (id) => {
       deleted.push(id);
     }
   });
   repl.setSessions([makeSummary({ id: "s1", name: "会话甲" })]);
   repl.setDraftMode(true);
-  const rightClick = (x: number, y: number): void =>
-    (repl as unknown as { handleSidebarRightClick(x: number, y: number): void }).handleSidebarRightClick(x, y);
   const baseline = ui.overlays.length;
 
-  rightClick(1, 1); // the draft row: nothing to delete
-  assert.equal(ui.overlays.length, baseline, "the draft row has no context menu");
+  press(ui, "\x1bs"); // selection = draft row
+  press(ui, "d");
+  assert.equal(ui.overlays.length, baseline, "the draft row is not deletable");
 
-  rightClick(1, 2); // session one shifted down by the draft row
+  press(ui, "\r"); // Enter on the draft row
+  assert.deepEqual(activated, ["draft"]);
+
+  press(ui, "\x1b[B"); // ↓ → session one shifted down by the draft row
+  press(ui, "d");
   assert.equal(ui.overlays.length, baseline + 1);
-  repl.handleLink("pi-swarm://menu/0");
+  (ui.overlays[ui.overlays.length - 1]!.component as unknown as { handleInput(data: string): void }).handleInput("\r");
   assert.deepEqual(deleted, ["s1"]);
+});
+
+test("renders contain no OSC 8 hyperlinks anywhere (keyboard-only)", () => {
+  const { repl, ui, log } = makeRepl();
+  repl.setSessions([makeSummary({ id: "s1", name: "会话甲" })]);
+  repl.setDraftMode(true);
+  repl.appendThinking("推理内容");
+  repl.registerAgent("code-writer");
+  const parts = sidebarParts(ui);
+  const surfaces = [
+    ...parts.topBorder.render(22),
+    ...parts.rows.render(22),
+    ...parts.bottomBorder.render(22),
+    ...ui.overlays[0].component.render(80),
+    ...log.children[0].render(80)
+  ];
+  for (const line of surfaces) {
+    assert.ok(!line.includes("\x1b]8;"), "no hyperlink escape sequences remain");
+  }
 });

@@ -157,7 +157,7 @@ export class SessionManager {
 | `/sessions` / `/ls` | 列出（含 id、名称、状态、current 标记、更新时间、消息数） | 同左 |
 | `/switch <id\|序号\|draft>` | 校验后切换；序号取 /sessions 显示顺序；`draft` 开草稿 | 同左 |
 | `/close [id\|序号]` | 关闭（缺省当前）并提示“已关闭，输入任务将开启新草稿或 /switch 恢复” | 同左 |
-| `/delete <id\|序号>` | 删除会话（索引 + JSONL 文件）；删当前会话先解绑 agent，再打开侧栏同位会话（updatedAt 倒序：后一位顶替，末位取前一位），无其他活跃会话才落回草稿态；会话栏右键菜单共用此核心 | 同左 |
+| `/delete <id\|序号>` | 删除会话（索引 + JSONL 文件）；删当前会话先解绑 agent，再打开侧栏同位会话（updatedAt 倒序：后一位顶替，末位取前一位），无其他活跃会话才落回草稿态；边栏 `d` 键的删除确认菜单共用此核心 | 同左 |
 
 - 约束：当前会话不存在（草稿、从未创建或已关闭）且用户直接输入任务时，`materialize()` 把草稿物化为新会话承接（无缝体验）：草稿名优先，否则用首条消息摘要命名。
 - 草稿态：`SessionManager.startDraft()/isDraft()/materialize()`；agent 侧由 `Agent.detach()` 解绑会话，模型/thinking 作为待生效配置保留在 agent 上，物化 rebind 后自动应用。

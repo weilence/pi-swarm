@@ -1,39 +1,21 @@
-import {
-  Container,
-  Editor,
-  HStack,
-  type MarkdownTheme,
-  Markdown,
-  matchesKey,
-  type OverlayHandle,
-  ProcessTerminal,
-  ScrollView,
-  Text,
-  TuiAltScreen,
-  type ViewportTUI,
-  visibleWidth,
-  VStack
-} from "@earendil-works/pi-tui";
-import { getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, HStack, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, TuiAltScreen, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import type { SessionSummary } from "../core/session/session-types.ts";
 import { summarizeToolArgs } from "../core/tool-summary.ts";
 import type { CommandOutcome, PickerOption } from "./commands.ts";
+import { ChatPanel } from "./chat-panel.ts";
 import {
   AgentTabBar,
-  AgentTabState,
-  CollapsibleReasoning,
   PickerComponent,
   SESSION_SIDEBAR_WIDTH,
   SessionContextMenu,
   SessionEntryState,
   SessionSidebar,
   SidebarBorderLine,
-  ThinkingTail,
-  ToolCallLine,
-  UserMessage
+  StatusBar,
+  type ToastLevel
 } from "./components.ts";
-import { LinkDispatcher } from "./link-dispatcher.ts";
-import { interceptRightClick } from "./right-click.ts";
+import type { AgentStatusSnapshot } from "../pi/agent.ts";
 
 export { summarizeToolArgs };
 
@@ -43,92 +25,46 @@ export interface TuiReplOptions {
   /** Returns "exit" to end the process (e.g. the /exit command). */
   onSubmit: (line: string) => Promise<CommandOutcome | void>;
   onExit: () => void;
-  /** A sessions-bar entry was clicked; "draft" means the ＋ 新建/草稿 entry. */
+  /** A sidebar session was activated (Enter/n); "draft" means the ＋ 新建/草稿 entry. */
   onSessionClick?: (sessionId: string) => void | Promise<void>;
-  /** A session was picked for deletion from the sidebar's right-click menu. */
+  /** A session delete was confirmed from the sidebar's keyboard menu. */
   onDeleteSession?: (sessionId: string) => void | Promise<void>;
+  /** 模型输出中（busy）；双击 Esc 中止的第一下判断。 */
+  isBusy?: () => boolean;
+  /** 双击 Esc 确认后调用：中止当前输出。 */
+  onAbort?: () => void | Promise<void>;
+  /** 双击 Esc 的判定窗口（毫秒）；默认 2000。 */
+  doubleEscWindowMs?: number;
 }
 
-/** Agent that owns output when no explicit label is passed. */
-const DEFAULT_AGENT = "supervisor";
-
-/** Counts opening code fences so blocks inside ``` pairs stay together. */
-function countFences(text: string): number {
-  return (text.match(/^[ \t]{0,3}(```|~~~)/gm) ?? []).length;
-}
+/** The three focus regions; the editor is the home base. */
+type FocusMode = "editor" | "sidebar" | "transcript";
 
 /**
- * Splits a streaming markdown buffer into blocks that are safe to render now
- * (closed code fences, ended by a blank line) plus the incomplete remainder.
- */
-export function splitMarkdownBlocks(buffer: string): { blocks: string[]; rest: string } {
-  const blocks: string[] = [];
-  let rest = buffer;
-  const blankLine = /\n[ \t]*\n/g;
-  let searchFrom = 0;
-  while (rest.length > 0) {
-    blankLine.lastIndex = searchFrom;
-    const match = blankLine.exec(rest);
-    if (!match) break;
-    const candidate = rest.slice(0, match.index);
-    if (countFences(candidate) % 2 === 1) {
-      // blank line inside an open code fence: not a block boundary
-      searchFrom = match.index + 1;
-      continue;
-    }
-    blocks.push(candidate);
-    rest = rest.slice(match.index + match[0].length);
-    searchFrom = 0;
-  }
-  return { blocks: blocks.map((block) => block.trim()).filter((block) => block.length > 0), rest };
-}
-
-/** Per-agent transcript state: the chat window mounts only the active one. */
-interface AgentTranscript {
-  name: string;
-  /** Mounted in the chat window while active; holds log + stream containers. */
-  container: Container;
-  log: Container;
-  stream: Container;
-  /** Kind of the live tail: text or thinking; undefined when nothing streams. */
-  streamKind?: "text" | "thinking";
-  thinkingBuffer: string;
-  partialBlock: string;
-  unread: boolean;
-}
-
-/**
- * Interactive REPL built on pi-tui: one append-only transcript per agent (log
- * lines + streamed markdown blocks + collapsible thinking entries), a streaming
- * tail for in-progress output, a right-aligned agent tab bar overlay, a
- * multiline editor with history, and overlay pickers.
+ * Interactive REPL: the composition root around a {@link ChatPanel}.
  *
- * Interaction routing: pi-tui hands every OSC 8 hyperlink click to one global
- * callback (handleLink here) and swallows mouse events, so the components own
- * their link schemes — each registers its prefix (plus its actions and hit
- * geometry) with `links` at construction — while this class stays the
- * composition root: layout, transcripts, overlays, and the transient
- * context-menu plumbing.
+ * This class owns the chrome and the policies — the sessions sidebar, the
+ * agent tab bar overlay, pickers, the delete-confirmation menu, terminal
+ * setup — and, above all, the keyboard focus model. Interaction is fully
+ * keyboard-driven. Input routing relies on pi-tui's ordering — registered
+ * input listeners run before the focused component — so one global listener
+ * here owns the model:
+ *   Alt+S / Alt+T focus the sessions sidebar / transcript browse mode (press
+ *   again to return), Alt+↑/↓ cycle agent tabs, and while the sidebar or
+ *   transcript is focused, Tab hops between the two panels, Esc returns to
+ *   the editor, and any printable character falls through to the editor.
+ *   PageUp / PageDown / Home / End / Ctrl+↑↓ scroll the transcript via
+ *   pi-tui's own bindings.
+ *
+ * Transcripts, streaming, and the input editor live in the ChatPanel; output
+ * methods here are thin facades so callers (main, commands, history replay)
+ * keep one entry point.
  */
 export class TuiRepl {
   private readonly owned?: { terminal: ProcessTerminal; ui: TuiAltScreen };
   private readonly ui: ViewportTUI;
-  /** Prefix registry: activated links fan out to the component that rendered them. */
-  private readonly links = new LinkDispatcher();
-  private readonly inputArea = new Container();
-  /** Holds the active transcript; lives inside the scroll view. */
-  private readonly scrollBody = new Container();
-  /** Scrollable chat area that fills the space above the pinned editor. */
-  private readonly scrollView: ScrollView;
-  private readonly editor: Editor;
-  private readonly markdownTheme: MarkdownTheme;
-  private readonly tabs = new Map<string, AgentTranscript>();
-  private activeAgent = DEFAULT_AGENT;
-  private thinkSeq = 0;
-  /** Live tool calls by "agent/toolCallId"; removed when the call finishes. */
-  private readonly toolLines = new Map<string, ToolCallLine>();
-  private readonly tabBar: AgentTabBar;
-  private readonly tabBarOverlay?: OverlayHandle;
+  /** Chat content + input box: transcripts, streaming, editor, submit gating. */
+  private readonly chat: ChatPanel;
   /** Sessions sidebar rows; mounted inside sidebarScroll. */
   private readonly sidebar: SessionSidebar;
   /** Viewport that scrolls the sidebar rows; fills the terminal height. */
@@ -137,48 +73,48 @@ export class TuiRepl {
   private sessionList: readonly SessionEntryState[] = [];
   /** True while the unsaved draft (新建未发送) is the active view. */
   private draftMode = false;
-  /** Currently open right-click menu: item links + dismissal live on the component. */
+  /** Which region owns the keyboard right now. */
+  private focus: FocusMode = "editor";
+  private readonly tabBar: AgentTabBar;
+  private readonly tabBarOverlay?: OverlayHandle;
+  /** One-line agent status (model / context / cache), below the editor. */
+  private readonly statusBar = new StatusBar();
+  /** Currently open delete-confirmation menu: keyboard-driven, self-contained. */
   private openMenu?: { menu: SessionContextMenu; close(): void };
   private menuHandle?: OverlayHandle;
-  private pendingAnswer?: (answer: string) => void;
-  /** True while a submitted task is running; Enter is swallowed, text is kept. */
-  private busy = false;
+  /** 第一次 Esc（busy 中）的时刻；窗口内再按一次则中止输出。 */
+  private escapedArmedAt?: number;
 
   public constructor(private readonly options: TuiReplOptions) {
     initTheme();
-    this.markdownTheme = getMarkdownTheme();
     if (options.ui) {
       this.ui = options.ui;
     } else {
       const terminal = new ProcessTerminal();
       // Fullscreen (alternate-screen) mode: app owns the whole viewport with a
       // scrollable document that follows new output; screen is restored on stop.
-      // OSC 8 link clicks route through handleLink into the dispatcher; the
-      // terminal is wrapped so right-clicks reach the sidebar context menu
-      // before pi-tui consumes the mouse sequence (it never re-emits them).
-      const ui = new TuiAltScreen(
-        interceptRightClick(terminal, (x, y) => this.handleSidebarRightClick(x, y)),
-        true,
-        undefined,
-        { openUrl: (url) => this.handleLink(url) }
-      );
+      const ui = new TuiAltScreen(terminal, true, undefined);
       this.owned = { terminal, ui };
       this.ui = ui;
     }
-    this.editor = new Editor(this.ui, { borderColor: (text) => text, selectList: getSelectListTheme() });
-    this.editor.onSubmit = (text) => {
-      if (this.pendingAnswer) {
-        const settle = this.pendingAnswer;
-        this.pendingAnswer = undefined;
-        this.setBusy(true);
-        this.appendUserMessage(text);
-        settle(text);
-        return;
+    // Home/End 让给编辑器光标移动：pi-tui 默认把它们绑在 alt-screen 视口跳顶/底
+    // 上并在输入监听阶段抢先消费，编辑器永远收不到。改绑到 shift 组合键后，
+    // 视口跳转仍可用（转录模式下 shift+home/end），Home/End 落到下方路由。
+    getKeybindings().setUserBindings({
+      "tui.altScreen.top": "shift+home",
+      "tui.altScreen.bottom": "shift+end"
+    });
+
+    this.chat = new ChatPanel({
+      ui: this.ui,
+      onSubmit: options.onSubmit,
+      onExit: options.onExit,
+      isInputFocused: () => this.focus === "editor",
+      // Don't steal focus from an open menu when a task finishes.
+      onIdle: () => {
+        if (!this.openMenu) this.setFocusMode("editor");
       }
-      if (this.busy) return;
-      void this.handleSubmit(text);
-    };
-    this.inputArea.addChild(this.editor);
+    });
 
     // Layout: a full-height sessions sidebar sits on the left edge of the
     // whole app — borders stay fixed while a ScrollView scrolls the rows.
@@ -188,38 +124,33 @@ export class TuiRepl {
     // whenever an overflowing list is actually scrolled. A one-column gap
     // separates sidebar from the chat column, which fills the rest with its
     // own auto-visible scrollbar above the pinned editor.
-    this.scrollView = new ScrollView(this.scrollBody, { follow: "end", primary: true, scrollbar: "auto" });
     this.sidebar = new SessionSidebar(
       () => ({ entries: this.sessionList, draft: this.draftMode }),
-      this.links,
-      (id) => void this.options.onSessionClick?.(id),
-      (id) => void this.options.onDeleteSession?.(id)
+      {
+        onActivate: (id) => void this.options.onSessionClick?.(id),
+        onDeleteRequest: (entry) => this.confirmDelete(entry),
+        onLeave: () => this.setFocusMode("editor"),
+        onSwitchPanel: () => this.setFocusMode("transcript")
+      }
     );
     this.sidebarScroll = new ScrollView(this.sidebar, { scrollbar: "auto", overscroll: "contain" });
 
     const sidebarColumn = new VStack();
     sidebarColumn.addChild(new SidebarBorderLine(true), { shrink: 0 });
     sidebarColumn.addChild(this.sidebarScroll, { grow: 1 });
-    sidebarColumn.addChild(new SidebarBorderLine(false), { shrink: 0 });
+    sidebarColumn.addChild(new SidebarBorderLine(false, () => this.focus === "sidebar"), { shrink: 0 });
 
-    const chatColumn = new VStack();
-    chatColumn.addChild(this.scrollView, { grow: 1 });
-    chatColumn.addChild(this.inputArea, { shrink: 0 });
-
-    this.registerAgent(DEFAULT_AGENT);
-    this.tabBar = new AgentTabBar(() => this.tabStates(), this.links, (name) => this.setActiveAgent(name));
+    this.tabBar = new AgentTabBar(() => this.chat.tabStates());
     this.tabBarOverlay = this.ui.showOverlay(this.tabBar, { anchor: "top-right", nonCapturing: true });
-    this.ui.addInputListener((data) => {
-      if (matchesKey(data, "ctrl+c")) {
-        this.options.onExit();
-        return { consume: true };
-      }
-      return undefined;
-    });
-
+    this.ui.addInputListener((data) => this.handleGlobalInput(data));
 
     const root = new HStack([], { gap: 1 });
     root.addChild(sidebarColumn, { basis: SESSION_SIDEBAR_WIDTH, grow: 0, shrink: 0 });
+    // Chat column: the panel fills the space above the pinned editor, and a
+    // one-line status bar (model / context / cache) sits below the editor.
+    const chatColumn = new VStack();
+    chatColumn.addChild(this.chat, { grow: 1 });
+    chatColumn.addChild(this.statusBar, { shrink: 0 });
     root.addChild(chatColumn, { grow: 1 });
 
     this.ui.setLayoutRoot(root);
@@ -227,35 +158,28 @@ export class TuiRepl {
 
   public start(): void {
     this.ui.start();
-    this.ui.setFocus(this.editor);
+    this.ui.setFocus(this.chat.editor);
   }
 
   public stop(): void {
-    this.owned?.ui.stop();
+    // Drop pending toast timers and status-line animations before teardown.
+    this.chat.clearToasts();
+    this.chat.stopStatuses();
+    // preserveScreen：退出时只离开备用屏缓冲，完整还原进入前的终端内容，
+    // 不把最后一屏文档转存到主屏（默认行为会留下全屏残留）。
+    this.owned?.ui.stop({ preserveScreen: true });
   }
+
+  // ---- ChatPanel facades: output, streaming, transcripts, asking ----
 
   /** Registers a tab for an agent (idempotent); the first one becomes active. */
   public registerAgent(name: string): void {
-    if (this.tabs.has(name)) return;
-    const log = new Container();
-    const stream = new Container();
-    const container = new Container();
-    container.addChild(log);
-    container.addChild(stream);
-    this.tabs.set(name, {
-      name,
-      container,
-      log,
-      stream,
-      thinkingBuffer: "",
-      partialBlock: "",
-      unread: false
-    });
-    if (this.tabs.size === 1) {
-      this.activeAgent = name;
-      this.mountTranscript(container);
-    }
-    this.ui.requestRender();
+    this.chat.registerAgent(name);
+  }
+
+  /** Switches the mounted transcript to the given agent and clears its unread flag. */
+  public setActiveAgent(name: string): void {
+    this.chat.setActiveAgent(name);
   }
 
   /** Replaces the sidebar snapshot (already updatedAt-desc from the manager). */
@@ -269,24 +193,6 @@ export class TuiRepl {
     this.ui.requestRender();
   }
 
-  /** Switches the mounted transcript to the given agent and clears its unread flag. */
-  public setActiveAgent(name: string): void {
-    const tab = this.tabs.get(name);
-    if (!tab || name === this.activeAgent) return;
-    this.mountTranscript(tab.container);
-    this.activeAgent = name;
-    tab.unread = false;
-    this.refreshStreamArea();
-    this.ui.requestRender();
-  }
-
-  /** Shows the given transcript in the chat viewport and follows its latest output. */
-  private mountTranscript(container: Container): void {
-    this.scrollBody.clear();
-    this.scrollBody.addChild(container);
-    this.scrollView.scrollToEnd();
-  }
-
   /** Toggles the draft entry (✎ 草稿) at the top of the sessions sidebar. */
   public setDraftMode(active: boolean): void {
     if (this.draftMode === active) return;
@@ -294,145 +200,84 @@ export class TuiRepl {
     this.ui.requestRender();
   }
 
-  /**
-   * Empties one agent's transcript (log + live tail): used when entering the
-   * draft view so 「新建」 starts from a clean slate instead of appending to
-   * the previous session's output.
-   */
-  public clearTranscript(agent: string = this.activeAgent): void {
-    const tab = this.tabs.get(agent);
-    if (!tab) return;
-    this.flushStream(tab);
-    tab.log.clear();
-    tab.stream.clear();
-    this.ui.requestRender();
+  /** See {@link ChatPanel.clearTranscript}. */
+  public clearTranscript(agent?: string): void {
+    this.chat.clearTranscript(agent);
   }
 
-  /**
-   * Entry point for activated OSC 8 links (pi-tui's single openUrl callback):
-   * an open context menu consumes its own item links, any other link dismisses
-   * it first, and everything else fans out through the dispatcher to the
-   * component that rendered the link.
-   */
-  public handleLink(url: string): void {
-    if (this.openMenu) {
-      if (this.openMenu.menu.handleLink(url)) return;
-      this.openMenu.close();
-    }
-    this.links.dispatch(url);
+  /** See {@link ChatPanel.appendLine}. */
+  public appendLine(line: string, agent?: string): void {
+    this.chat.appendLine(line, agent);
   }
 
-  /** Opens the context menu for the sidebar session under (x, y), if any. */
-  private handleSidebarRightClick(x: number, y: number): void {
-    if (this.openMenu) this.openMenu.close();
-    const entry = this.sidebar.entryAt(x, y, this.sidebarScroll.scrollTop);
-    if (!entry) return;
-    const actions = this.sidebar.menuActions(entry);
-    const close = (): void => {
-      this.menuHandle?.hide();
-      this.menuHandle = undefined;
-      this.openMenu = undefined;
-      this.ui.setFocus(this.editor);
-    };
-    const menu = new SessionContextMenu(entry.name, actions, close, () => this.ui.requestRender());
-    this.openMenu = { menu, close };
-    // pi-tui renders overlays at min(80, terminal width) unless told otherwise;
-    // size the menu to its widest line so the highlight hugs the content.
-    const width = Math.min(
-      30,
-      Math.max(14, visibleWidth(entry.name) + 4, ...actions.map((action) => visibleWidth(action.label) + 4))
-    );
-    this.menuHandle = this.ui.showOverlay(
-      menu,
-      // pi-tui clamps absolute positions to stay on screen.
-      { col: x + 1, row: y + 1, width }
-    );
+  /** See {@link ChatPanel.streamThinking}. */
+  public streamThinking(delta: string, agent?: string): void {
+    this.chat.streamThinking(delta, agent);
   }
 
-  public appendLine(line: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
-    // A log line between stream chunks is later content: commit the live tail
-    // first so the transcript order matches arrival order.
-    this.flushStream(tab);
-    tab.log.addChild(new Text(line, 0, 0));
-    this.markUnread(tab, agent);
-    this.ui.requestRender();
+  /** See {@link ChatPanel.streamText}. */
+  public streamText(delta: string, agent?: string): void {
+    this.chat.streamText(delta, agent);
   }
 
-  public streamThinking(delta: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
-    // Text → thinking switch: the pending text tail is finished content, commit
-    // it so the transcript keeps the model's real interleaved order.
-    if (tab.streamKind === "text") this.flushStream(tab);
-    tab.streamKind = "thinking";
-    tab.thinkingBuffer += delta;
-    this.markUnread(tab, agent);
-    this.refreshStreamArea();
+  /** See {@link ChatPanel.endStream}. */
+  public endStream(agent?: string): void {
+    this.chat.endStream(agent);
   }
 
-  public streamText(delta: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
-    // Thinking → text switch: fold the thinking run into the transcript, collapsed.
-    if (tab.streamKind === "thinking") this.flushStream(tab);
-    tab.streamKind = "text";
-    const { blocks, rest } = splitMarkdownBlocks(tab.partialBlock + delta);
-    for (const block of blocks) this.addMarkdown(tab, block);
-    tab.partialBlock = rest;
-    this.markUnread(tab, agent);
-    this.refreshStreamArea();
-  }
-
-  public endStream(agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
-    this.flushStream(tab);
-    // Safety net: calls still marked running (e.g. after an abort without an
-    // end event) are shown as interrupted instead of spinning forever.
-    for (const [key, line] of this.toolLines) {
-      if (key.startsWith(`${agent}/`)) {
-        line.finish(true);
-        this.toolLines.delete(key);
-      }
-    }
-    this.markUnread(tab, agent);
-    this.refreshStreamArea();
-  }
-
-  /** A tool call started: commits the pending stream tail, shows a running line. */
+  /** See {@link ChatPanel.toolStart}. */
   public toolStart(agent: string, toolCallId: string, toolName: string, args: unknown): void {
-    const tab = this.tabFor(agent);
-    // Tools run between text segments: commit the live tail first so the
-    // transcript order matches what the model actually did.
-    this.flushStream(tab);
-    this.toolLines.set(`${agent}/${toolCallId}`, new ToolCallLine(toolName, summarizeToolArgs(args)));
-    tab.log.addChild(this.toolLines.get(`${agent}/${toolCallId}`)!);
-    this.markUnread(tab, agent);
-    this.ui.requestRender();
+    this.chat.toolStart(agent, toolCallId, toolName, args);
   }
 
-  /** A tool call finished: flip its line to ✔/✘ in place. */
+  /** See {@link ChatPanel.toolEnd}. */
   public toolEnd(agent: string, toolCallId: string, isError: boolean): void {
-    this.toolLines.get(`${agent}/${toolCallId}`)?.finish(isError);
-    this.toolLines.delete(`${agent}/${toolCallId}`);
-    const tab = this.tabs.get(agent);
-    if (tab) {
-      this.markUnread(tab, agent);
-      this.ui.requestRender();
-    }
+    this.chat.toolEnd(agent, toolCallId, isError);
   }
 
-  /** A finished tool-call row from history replay; renders like a settled live row. */
-  public appendToolCall(toolName: string, summary: string, isError: boolean, agent: string = DEFAULT_AGENT): void {
-    const line = new ToolCallLine(toolName, summary);
-    line.finish(isError);
-    this.tabFor(agent).log.addChild(line);
-    this.ui.requestRender();
+  /** See {@link ChatPanel.appendToolCall}. */
+  public appendToolCall(toolName: string, summary: string, isError: boolean, agent?: string): void {
+    this.chat.appendToolCall(toolName, summary, isError, agent);
   }
 
-  /** One finished thinking entry (collapsible), as the live stream would leave it. */
-  public appendThinking(text: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
-    this.flushStream(tab);
-    if (text.trim()) tab.log.addChild(this.newReasoning(text.trim()));
+  /** See {@link ChatPanel.appendThinking}. */
+  public appendThinking(text: string, agent?: string): void {
+    this.chat.appendThinking(text, agent);
+  }
+
+  /** See {@link ChatPanel.appendUserMessage}. */
+  public appendUserMessage(message: string): void {
+    this.chat.appendUserMessage(message);
+  }
+
+  /** See {@link ChatPanel.beginStatus}: spinner line for long-running commands. */
+  public beginStatus(label: string): number {
+    return this.chat.beginStatus(label);
+  }
+
+  /** See {@link ChatPanel.endStatus}. */
+  public endStatus(id: number, isError: boolean): void {
+    this.chat.endStatus(id, isError);
+  }
+
+  /** See {@link ChatPanel.notify}: transient hints above the editor. */
+  public notify(message: string, level: ToastLevel = "info"): void {
+    this.chat.notify(message, level);
+  }
+
+  /** See {@link ChatPanel.appendMarkdown}. */
+  public appendMarkdown(markdown: string, agent?: string): void {
+    this.chat.appendMarkdown(markdown, agent);
+  }
+
+  /** See {@link ChatPanel.askQuestion}. */
+  public askQuestion(question: string): Promise<string> {
+    return this.chat.askQuestion(question);
+  }
+
+  /** Pushes a structured agent snapshot to the status bar below the editor. */
+  public setStatus(snapshot: AgentStatusSnapshot): void {
+    this.statusBar.set(snapshot);
     this.ui.requestRender();
   }
 
@@ -448,125 +293,170 @@ export class TuiRepl {
         if (settled) return;
         settled = true;
         handle.hide();
-        this.ui.setFocus(this.editor);
+        this.setFocusMode("editor");
         resolve(value);
       });
       const handle = this.ui.showOverlay(component, { anchor: "center" });
     });
   }
 
+  // ---- Focus model and global keyboard routing ----
+
   /**
-   * Asks the user one question mid-task: the question lands in the log, the
-   * input line comes back for one answer line, then busy mode resumes.
+   * The keyboard focus model. Sidebar and transcript modes release the
+   * pi-tui focus (null) — the global input listener routes their keys — while
+   * the editor mode restores the real editor focus and its cursor.
    */
-  public askQuestion(question: string): Promise<string> {
-    return new Promise<string>((resolve) => {
-      this.appendLine(question);
-      this.setBusy(false);
-      this.pendingAnswer = resolve;
-    });
-  }
-
-  /** Echoes a submitted user message as a right-aligned bubble in the active tab. */
-  public appendUserMessage(message: string): void {
-    if (!message.trim()) return;
-    const tab = this.activeTab();
-    this.flushStream(tab);
-    tab.log.addChild(new UserMessage(message));
+  private setFocusMode(mode: FocusMode): void {
+    if (this.openMenu && mode !== "editor") return;
+    this.focus = mode;
+    this.sidebar.setFocused(mode === "sidebar");
+    if (mode === "editor") this.ui.setFocus(this.chat.editor);
+    else this.ui.setFocus(null);
+    if (mode === "transcript") this.notify("转录浏览：↑↓ 滚动 · f 展开思考 · Tab 侧栏 · Esc 返回输入");
     this.ui.requestRender();
   }
 
-  public appendMarkdown(markdown: string, agent: string = DEFAULT_AGENT): void {
-    if (!markdown.trim()) return;
-    const tab = this.tabFor(agent);
-    this.flushStream(tab);
-    this.addMarkdown(tab, markdown);
-  }
-
-  /** Commits the live tail (thinking run or partial text) into the log. */
-  private flushStream(tab: AgentTranscript): void {
-    if (tab.streamKind === "thinking") {
-      if (tab.thinkingBuffer.trim()) tab.log.addChild(this.newReasoning(tab.thinkingBuffer));
-      tab.thinkingBuffer = "";
-    } else if (tab.streamKind === "text") {
-      this.addMarkdown(tab, tab.partialBlock);
-      tab.partialBlock = "";
+  /**
+   * Global keyboard routing. Runs before the focused component (pi-tui runs
+   * input listeners first), so panel keys never collide with editor bindings.
+   * While a menu overlay is open it owns the keyboard (except Ctrl+C).
+   */
+  private handleGlobalInput(data: string): { consume: boolean } | undefined {
+    if (matchesKey(data, "ctrl+c")) {
+      this.options.onExit();
+      return { consume: true };
     }
-    tab.streamKind = undefined;
-    // The committed tail must leave the stream area at the same time, or the
-    // raw copy lingers below the newly added line (tool row/log entry) and the
-    // content shows twice until the next stream event rebuilds the area.
-    tab.stream.clear();
-  }
-
-  /** Adds one finalized markdown block to the transcript (no stream flush). */
-  private addMarkdown(tab: AgentTranscript, markdown: string): void {
-    if (!markdown.trim()) return;
-    tab.log.addChild(new Markdown(markdown, 0, 0, this.markdownTheme));
-    this.markUnread(tab, tab.name);
-    this.ui.requestRender();
-  }
-
-  private activeTab(): AgentTranscript {
-    return this.tabs.get(this.activeAgent)!;
-  }
-
-  /** Returns the agent's transcript, registering a tab on first use. */
-  private tabFor(agent: string): AgentTranscript {
-    let tab = this.tabs.get(agent);
-    if (!tab) {
-      this.registerAgent(agent);
-      tab = this.tabs.get(agent)!;
+    if (this.openMenu) return undefined;
+    // Typing can change the editor's height; keep the toast overlay above it
+    // (no-op while no toasts are visible).
+    this.chat.syncToastOverlay();
+    // 双击 Esc 停止输出：第一下提示，窗口内再按一下才真的中止（防误触）。
+    // 只在编辑器焦点 + busy 时接管 Esc，不影响侧栏/转录模式的 Esc 导航。
+    if (
+      this.focus === "editor" &&
+      matchesKey(data, "escape") &&
+      this.options.isBusy?.()
+    ) {
+      const now = Date.now();
+      const window = this.options.doubleEscWindowMs ?? 2000;
+      if (this.escapedArmedAt !== undefined && now - this.escapedArmedAt <= window) {
+        this.escapedArmedAt = undefined;
+        this.notify("已请求停止输出", "warning");
+        void this.options.onAbort?.();
+      } else {
+        this.escapedArmedAt = now;
+        this.notify("再按一次 Esc 停止输出");
+      }
+      return { consume: true };
     }
-    return tab;
-  }
-
-  private markUnread(tab: AgentTranscript, agent: string): void {
-    if (agent !== this.activeAgent) tab.unread = true;
-  }
-
-  private newReasoning(buffer: string): CollapsibleReasoning {
-    // Per-REPL ids: the think/{id} link registration is owned by the component.
-    return new CollapsibleReasoning(++this.thinkSeq, buffer, this.links, () => this.ui.requestRender());
-  }
-
-  private tabStates(): readonly AgentTabState[] {
-    return [...this.tabs.values()].map((tab) => ({
-      name: tab.name,
-      active: tab.name === this.activeAgent,
-      unread: tab.unread
-    }));
-  }
-
-  private refreshStreamArea(): void {
-    const tab = this.activeTab();
-    tab.stream.clear();
-    if (tab.thinkingBuffer.trim()) {
-      tab.stream.addChild(new ThinkingTail(tab.thinkingBuffer));
-    } else if (tab.partialBlock.trim().length > 0) {
-      tab.stream.addChild(new Text(tab.partialBlock, 0, 0));
+    // Home/End → 编辑器光标行首/行尾：转发给编辑器自身的键位处理（视口跳转
+    // 已重绑到 shift 组合键，见构造函数），不再被 alt-screen 滚动抢先消费。
+    // 注意：正常按键由 TUI 在焦点组件处理后自动触发重绘，而从监听器直接转发
+    // 不会有这一步，必须显式请求一帧，否则光标位置变了但显示不刷新。
+    if (this.focus === "editor" && (matchesKey(data, "home") || matchesKey(data, "end"))) {
+      this.chat.editor.handleInput(data);
+      this.ui.requestRender();
+      return { consume: true };
     }
-    this.ui.requestRender();
-  }
-
-  private setBusy(busy: boolean): void {
-    this.busy = busy;
-    // The editor stays mounted and focused; Enter is ignored while busy so the
-    // queued text survives until the running task finishes.
-    this.editor.disableSubmit = busy;
-    this.ui.requestRender();
-    if (!busy) this.ui.setFocus(this.editor);
-  }
-
-  private async handleSubmit(text: string): Promise<void> {
-    // 斜杠命令是 UI 操作且可能含密钥（/apikey），不作为聊天气泡回显。
-    if (!text.startsWith("/")) this.appendUserMessage(text);
-    this.setBusy(true);
-    try {
-      const outcome = await this.options.onSubmit(text);
-      if (outcome === "exit") this.options.onExit();
-    } finally {
-      this.setBusy(false);
+    if (matchesKey(data, "alt+s")) {
+      this.setFocusMode(this.focus === "sidebar" ? "editor" : "sidebar");
+      return { consume: true };
     }
+    if (matchesKey(data, "alt+t")) {
+      this.setFocusMode(this.focus === "transcript" ? "editor" : "transcript");
+      return { consume: true };
+    }
+    if (matchesKey(data, "alt+up")) {
+      this.chat.cycleAgent(-1);
+      return { consume: true };
+    }
+    if (matchesKey(data, "alt+down")) {
+      this.chat.cycleAgent(1);
+      return { consume: true };
+    }
+    if (this.focus === "sidebar") {
+      if (this.sidebar.handleInput(data)) {
+        this.followSidebarSelection();
+        this.ui.requestRender();
+        return { consume: true };
+      }
+      // Printable input means the user wants to type: hand focus (and the
+      // pending keystroke) back to the editor.
+      if (!data.startsWith("\x1b")) {
+        this.setFocusMode("editor");
+        return undefined;
+      }
+      return { consume: true };
+    }
+    if (this.focus === "transcript") {
+      if (matchesKey(data, "up")) {
+        this.chat.scrollTranscript(-1);
+        return { consume: true };
+      }
+      if (matchesKey(data, "down")) {
+        this.chat.scrollTranscript(1);
+        return { consume: true };
+      }
+      if (matchesKey(data, "f")) {
+        this.chat.toggleAllFolds();
+        return { consume: true };
+      }
+      if (matchesKey(data, "escape")) {
+        this.setFocusMode("editor");
+        return { consume: true };
+      }
+      if (matchesKey(data, "tab")) {
+        this.setFocusMode("sidebar");
+        return { consume: true };
+      }
+      if (!data.startsWith("\x1b")) {
+        this.setFocusMode("editor");
+        return undefined;
+      }
+      return { consume: true };
+    }
+    return undefined;
+  }
+
+  /** Keeps the sidebar selection inside the rows viewport after navigation. */
+  private followSidebarSelection(): void {
+    const row = this.sidebar.selectedRowIndex();
+    const top = this.sidebarScroll.scrollTop;
+    const height = this.sidebarScroll.viewportHeight;
+    if (row < top) this.sidebarScroll.scrollTo(row);
+    else if (height > 0 && row >= top + height) this.sidebarScroll.scrollTo(row - height + 1);
+  }
+
+  /**
+   * Opens the keyboard-driven delete confirmation for a sidebar entry, next to
+   * its row. Enter confirms (runs onDeleteSession), Esc cancels; focus returns
+   * to the sidebar either way.
+   */
+  private confirmDelete(entry: SessionEntryState): void {
+    if (this.openMenu) this.openMenu.close();
+    const actions = [
+      { label: "删除会话（含记录文件）", run: () => void this.options.onDeleteSession?.(entry.id) },
+      { label: "取消", run: () => undefined }
+    ];
+    const close = (): void => {
+      this.menuHandle?.hide();
+      this.menuHandle = undefined;
+      this.openMenu = undefined;
+      this.setFocusMode("sidebar");
+    };
+    const menu = new SessionContextMenu(entry.name, actions, close, () => this.ui.requestRender());
+    this.openMenu = { menu, close };
+    // pi-tui renders overlays at min(80, terminal width) unless told otherwise;
+    // size the menu to its widest line so the highlight hugs the content.
+    const width = Math.min(
+      30,
+      Math.max(14, visibleWidth(entry.name) + 4, ...actions.map((action) => visibleWidth(action.label) + 4))
+    );
+    this.menuHandle = this.ui.showOverlay(
+      menu,
+      // Next to the selected row; pi-tui clamps absolute positions on screen.
+      { col: 2, row: this.sidebar.screenRowOfSelected(this.sidebarScroll.scrollTop), width }
+    );
   }
 }

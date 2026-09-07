@@ -58,10 +58,11 @@ function makeRepl(): { repl: TuiRepl; log: Container } {
     hasOverlay: () => false
   };
   const repl = new TuiRepl({ ui: ui as never, onSubmit: async () => undefined, onExit: () => undefined });
-  // layoutRoot → HStack[sidebar, VStack[ScrollView(scrollBody → transcript), inputArea]]; transcript = [log, stream].
+  // layoutRoot → HStack[sidebar, VStack[ChatPanel(VStack[ScrollView(scrollBody → transcript), inputArea]), statusBar]]; transcript = [log, stream].
   const root = ui.layoutRoot! as Container;
   const [, chatColumn] = root.children as [Container, Container];
-  const [scrollView] = chatColumn.children as [Container];
+  const [chat] = chatColumn.children as [Container];
+  const [scrollView] = chat.children as [Container];
   const [scrollBody] = scrollView.children as [Container];
   const [transcript] = scrollBody.children as [Container];
   const [log] = transcript.children as [Container];
@@ -100,7 +101,7 @@ test("assistant thinking replays as a collapsible entry, text as headerless mark
   replayHistory(repl, [assistant]);
 
   assert.equal(log.children.length, 3);
-  assert.ok(log.children[1].render(80).join("\n").includes("pi-swarm://think/1"), "thinking folds as collapsible reasoning");
+  assert.ok(log.children[1].render(80).join("\n").includes("思考（"), "thinking folds as collapsible reasoning");
   assert.ok(log.children[2] instanceof Markdown, "text is plain markdown like the live stream");
   assert.ok(plain(log.children[2]).includes("这是答案"));
   assert.ok(!plain(log.children[2]).includes("▸ 助手"), "no speaker header — live output has none either");

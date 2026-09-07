@@ -25,6 +25,30 @@ import {
   type ToolDefinition
 } from "@earendil-works/pi-coding-agent";
 
+/**
+ * Structured status snapshot for the editor status bar (see StatusBar):
+ * best-effort — fields are absent when unknown, and the session may not
+ * exist yet (draft mode), in which case only pending preferences show.
+ */
+export interface AgentStatusSnapshot {
+  /** provider/model of the live (or requested) model. */
+  model?: string;
+  thinkingLevel?: string;
+  /** Current context estimate and the model's context window (tokens). */
+  contextTokens?: number;
+  contextWindow?: number;
+  contextPercent?: number;
+  /** Cumulative session token accounting (input excludes cached reads/writes). */
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  /** Cumulative session cost in USD. */
+  cost?: number;
+  /** True while a prompt is streaming. */
+  busy?: boolean;
+}
+
 /** Stream sinks every agent forwards its session events to, labeled with the agent name. */
 export interface AgentStreamSinks {
   /** Streams assistant text (the model's answer), labeled with the agent name. */
@@ -93,10 +117,17 @@ export class Agent {
   private piSession?: PiSessionManager;
   /** Set while a prompt is streaming; rebind() rejects concurrent switches. */
   private prompting = false;
+  /** 流式中当前 assistant 消息的 running 输出 token（message_update 持续更新；
+   *  消息落盘后清零——那时会话统计已包含它，避免重复计数）。 */
+  private runningOutputTokens = 0;
   private providerConfig?: Parameters<ModelRuntime["registerProvider"]>[1];
   private providerId = "models-dev";
   private requestedModel?: string;
   private requestedThinkingLevel?: ModelThinkingLevel;
+  /** 手动上下文容量（token）：覆盖模型自带 contextWindow；undefined = 模型默认。 */
+  private contextWindowOverride?: number;
+  /** 用户主动请求停止（双击 Esc）：把中止当正常结束而非错误。 */
+  private abortRequested = false;
   private collector?: ToolObservationCollector;
   /** Holder the delegate tool reads; swapped per task in runTask(). */
   private readonly delegateState: DelegateState = {};
@@ -118,6 +149,32 @@ export class Agent {
   /** Effective thinking level: the session's live value, else the pending preference. */
   public get currentThinkingLevel(): ModelThinkingLevel | undefined {
     return this.session?.thinkingLevel ?? this.requestedThinkingLevel;
+  }
+
+  /**
+   * Structured snapshot for the editor status bar: live session stats
+   * (context usage, cumulative token accounting, cost) plus the pending
+   * model preference when no session exists yet. Best-effort by design.
+   */
+  public get statusSnapshot(): AgentStatusSnapshot {
+    const session = this.session;
+    const model = session?.model;
+    if (!session || !model) return { model: this.requestedModel, busy: this.prompting };
+    const stats = session.getSessionStats();
+    const usage = stats.contextUsage;
+    return {
+      model: `${model.provider}/${model.id}`,
+      thinkingLevel: session.thinkingLevel,
+      contextTokens: usage?.tokens ?? undefined,
+      contextWindow: usage?.contextWindow,
+      contextPercent: usage?.percent ?? undefined,
+      inputTokens: stats.tokens.input,
+      outputTokens: stats.tokens.output + this.runningOutputTokens,
+      cacheRead: stats.tokens.cacheRead,
+      cacheWrite: stats.tokens.cacheWrite,
+      cost: stats.cost,
+      busy: this.prompting
+    };
   }
 
   /** Applies a previously persisted snapshot; returns a human-readable summary. */
@@ -150,6 +207,10 @@ export class Agent {
         // Pending preference: validated and clamped against the model once the session opens.
         this.requestedThinkingLevel = saved.thinkingLevel as ModelThinkingLevel;
         parts.push(`thinking ${saved.thinkingLevel}`);
+      }
+      if (saved.contextWindow && saved.contextWindow > 0) {
+        this.contextWindowOverride = saved.contextWindow;
+        parts.push(`上下文容量 ${saved.contextWindow}`);
       }
     } catch (error) {
       parts.push(`部分配置恢复失败：${error instanceof Error ? error.message : String(error)}`);
@@ -195,6 +256,17 @@ export class Agent {
     this.piSession = sessionManager;
     this.unsubscribe = session.subscribe((event) => {
       this.collector?.handle(event);
+      // 流式 usage：message_update 携带进行中消息的累计输出 token（Anthropic
+      // 每个 message_delta 更新一次，思考/正文都包含在 output_tokens 里），
+      // 供状态栏实时速度采样；会话统计只在消息落盘时更新，单靠它速度表
+      // 在整个生成期间都是 Δ=0。message_end 时统计已包含该消息，清零防重复。
+      if (event.type === "message_update" && event.message.role === "assistant") {
+        this.runningOutputTokens = event.message.usage?.output ?? this.runningOutputTokens;
+      } else if (event.type === "message_end" && event.message.role === "assistant") {
+        this.runningOutputTokens = 0;
+      } else if (event.type === "agent_end") {
+        this.runningOutputTokens = 0; // 中断等未走 message_end 的兑底
+      }
       forwardAssistantEvent(event, {
         appendText: (delta) => {
           this.responseBuffer += delta;
@@ -256,6 +328,16 @@ export class Agent {
   }
 
   /**
+   * 用户主动中止当前输出（双击 Esc）：中止当次 prompt，已流式输出的部分文本
+   * 保留在会话与 UI 中；结束后 runTask 正常返回（不报错）。
+   */
+  public async abort(): Promise<void> {
+    if (!this.prompting || !this.session) return;
+    this.abortRequested = true;
+    await this.session.abort().catch(() => undefined);
+  }
+
+  /**
    * Runs one model turn and returns the full assistant text. Intermediate
    * turns (analysis, planning) stay quiet; set stream to show the reply live.
    * With a timeoutMs the turn races the wall clock: a timeout aborts the
@@ -284,6 +366,11 @@ export class Agent {
       this.responseBuffer = "";
       return text;
     } catch (error) {
+      if (this.abortRequested) {
+        // 用户主动停止：不算错误，返回已生成的部分文本。
+        this.abortRequested = false;
+        return this.responseBuffer.trim();
+      }
       if (error instanceof StepTimeoutError) {
         await session.abort().catch(() => undefined);
         await run.catch(() => undefined);
@@ -292,6 +379,7 @@ export class Agent {
     } finally {
       clearTimeout(timer);
       this.prompting = false;
+      this.abortRequested = false;
       this.streamToUi = previous;
       this.options.onStreamEnd(this.options.name);
     }
@@ -435,9 +523,47 @@ export class Agent {
     const modelId = specifier.slice(separator + 1);
     const model = this.modelRuntime!.getModel(provider, modelId);
     if (!model) throw new Error(`找不到模型：${specifier}`);
-    await this.session.setModel(model);
+    await this.session.setModel(this.patchContextWindow(model));
     this.requestedModel = specifier;
     return `当前模型：${specifier}`;
+  }
+
+  /**
+   * 手动设置上下文容量（token）：克隆模型定义改写 contextWindow，Pi 的自动
+   * 压缩阈值与用量百分比都按新容量计算（如给 1M 模型设 200k）。undefined
+   * 恢复模型默认。
+   */
+  public async setContextWindow(tokens?: number): Promise<string> {
+    this.contextWindowOverride = tokens && tokens > 0 ? tokens : undefined;
+    await this.persist({ contextWindow: this.contextWindowOverride });
+    const model = this.session?.model;
+    if (model) {
+      try {
+        await this.applyModel(`${model.provider}/${model.id}`);
+      } catch {
+        // 模型重应用失败：覆盖保持待生效，下次会话打开时生效。
+      }
+    }
+    return this.contextWindowOverride
+      ? `上下文容量已设为 ${this.contextWindowOverride} tokens${model ? `（模型上限 ${model.contextWindow}）` : ""}；自动压缩按新容量触发`
+      : "上下文容量已恢复为模型默认";
+  }
+
+  /**
+   * 手动压缩上下文（/compact）：调用 Pi 会话的手动压缩入口（与自动压缩
+   * 阈值相互独立），用当前模型生成会话摘要并重载上下文。草稿态（无会话）
+   * 没有可压缩的内容。
+   */
+  public async compact(customInstructions?: string): Promise<string> {
+    if (!this.session) throw new Error("会话尚未建立（草稿态），没有可压缩的上下文");
+    const result = await this.session.compact(customInstructions);
+    const after = result.estimatedTokensAfter !== undefined ? `，压缩后约 ${result.estimatedTokensAfter} tokens` : "";
+    return `已压缩上下文：${result.tokensBefore} tokens${after}；摘要 ${[...result.summary].length} 字`;
+  }
+
+  /** 手动容量覆盖模型的 contextWindow（仅数据克隆，不修改共享模型表）。 */
+  private patchContextWindow<M extends { contextWindow: number }>(model: M): M {
+    return this.contextWindowOverride ? { ...model, contextWindow: this.contextWindowOverride } : model;
   }
 
   /** Thinking levels the current model supports (ascending); before a session exists, resolved from the pending model preference. */

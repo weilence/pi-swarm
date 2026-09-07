@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { executeCommand, type AgentController, type CommandServices, type CommandState } from "../src/cli/commands.ts";
+import type { TuiRepl } from "../src/cli/tui-repl.ts";
 import type { ModelsDevProvider } from "../src/cli/../models-dev/catalog.ts";
 
 /** Levels of a reasoning model without xhigh/max support, as pi-ai would report. */
@@ -126,6 +127,140 @@ test("/provider with an unknown id reports a failure", async () => {
   const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
   await executeCommand("/provider nobody", services, {});
   assert.match(services.logs.join("\n"), /provider 配置失败：models\.dev 中找不到 provider：nobody/);
+});
+
+test("/provider and /model pickers preselect and mark the current choice", async () => {
+  const recording = { providerConfigs: [], models: [], thinkingLevels: [] };
+  const services = makeServices(recording, ["openai", "gpt-4o"], true);
+  const seen: Array<readonly { value: unknown; current?: boolean }[]> = [];
+  const original = services.pick.bind(services);
+  services.pick = async (title, options) => {
+    seen.push(options as never);
+    return await original(title, options);
+  };
+
+  const state: CommandState = { selectedProvider: makeProviders()[1], selectedModelId: "gpt-4o" };
+  await executeCommand("/provider", services, state);
+  const providers = seen[0];
+  assert.equal(providers[0].value, "openai", "the current provider sorts first");
+  assert.equal(providers[0].current, true, "the current provider is marked");
+  assert.equal(providers.at(-1)?.current, false, "others are not marked");
+
+  // seen[1] 是接口类型选择器（bare /provider 的链式弹窗），模型选择器是 seen[2]。
+  const models = seen[2];
+  assert.equal(models[0].value, "gpt-4o", "the current model sorts first");
+  assert.equal(models[0].current, true, "the current model is marked");
+});
+
+test("/context sets, reports, and resets the manual context window", async () => {
+  const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
+  const calls: Array<number | undefined> = [];
+  services.agent = {
+    ...makeAgent({ providerConfigs: [], models: [], thinkingLevels: [] }),
+    async setContextWindow(tokens?: number) {
+      calls.push(tokens);
+      return tokens ? `上下文容量已设为 ${tokens} tokens` : "上下文容量已恢复为模型默认";
+    },
+    get statusSnapshot() {
+      return { model: "openai/gpt-4o", contextWindow: 200000, contextTokens: 12000 };
+    }
+  } as AgentController;
+
+  await executeCommand("/context", services, {});
+  assert.match(services.logs.join("\n"), /当前上下文容量：200000 tokens/);
+
+  // k/w/m 后缀都能解析到同一容量。
+  await executeCommand("/context 20w", services, {});
+  await executeCommand("/context 200k", services, {});
+  await executeCommand("/context 0.2m", services, {});
+  assert.deepEqual(calls, [200000, 200000, 200000]);
+
+  await executeCommand("/context reset", services, {});
+  assert.equal(calls.at(-1), undefined, "reset restores the model default");
+
+  await executeCommand("/context abc", services, {});
+  assert.match(services.logs.join("\n"), /用法：\/context/);
+  await executeCommand("/context 1", services, {});
+  assert.match(services.logs.join("\n"), /最小 1024/);
+  assert.equal(calls.length, 4, "invalid input never reaches the agent");
+});
+
+test("/compact compacts the session and supports custom instructions", async () => {
+  const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
+  const calls: Array<string | undefined> = [];
+  services.agent = {
+    ...makeAgent({ providerConfigs: [], models: [], thinkingLevels: [] }),
+    async compact(instructions?: string) {
+      calls.push(instructions);
+      return "已压缩上下文：38000 tokens，压缩后约 8700 tokens；摘要 512 字";
+    }
+  } as AgentController;
+
+  await executeCommand("/compact", services, {});
+  assert.deepEqual(calls, [undefined], "bare /compact uses default summary instructions");
+  assert.match(services.logs.join("\n"), /已压缩上下文：38000 tokens/);
+
+  await executeCommand("/compact 只保留结论和文件改动", services, {});
+  assert.equal(calls[1], "只保留结论和文件改动", "trailing text passes as custom instructions");
+});
+
+test("/compact shows a spinner status line and settles it with the outcome", async () => {
+  const services = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
+  const events: string[] = [];
+  services.agent = {
+    ...makeAgent({ providerConfigs: [], models: [], thinkingLevels: [] }),
+    async compact() {
+      return "已压缩上下文：38000 tokens";
+    }
+  } as AgentController;
+  services.repl = {
+    beginStatus: (label: string) => {
+      events.push(`begin:${label}`);
+      return 1;
+    },
+    endStatus: (id: number, isError: boolean) => {
+      events.push(`end:${id}:${isError ? "error" : "ok"}`);
+    }
+  } as unknown as TuiRepl;
+
+  await executeCommand("/compact", services, {});
+  assert.deepEqual(events, ["begin:压缩上下文", "end:1:ok"], "spinner line starts and settles");
+  assert.match(services.logs.join("\n"), /已压缩上下文/);
+});
+
+test("/compact reports unsupported agents and compaction failures", async () => {
+  const plain = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
+  await executeCommand("/compact", plain, {});
+  assert.match(plain.logs.join("\n"), /不支持手动压缩/);
+
+  const failing = makeServices({ providerConfigs: [], models: [], thinkingLevels: [] });
+  failing.agent = {
+    ...makeAgent({ providerConfigs: [], models: [], thinkingLevels: [] }),
+    async compact() {
+      throw new Error("会话尚未建立（草稿态），没有可压缩的上下文");
+    }
+  } as AgentController;
+  await executeCommand("/compact", failing, {});
+  assert.match(failing.logs.join("\n"), /压缩失败：会话尚未建立/);
+});
+
+test("transient hints prefer the notify channel; list output stays in the transcript", async () => {
+  const notes: Array<{ message: string; level?: "info" | "warning" | "error" }> = [];
+  const services = Object.assign(makeServices({ providerConfigs: [], models: [], thinkingLevels: [] }), {
+    notify: (message: string, level?: "info" | "warning" | "error") => {
+      notes.push({ message, level });
+    }
+  });
+  await executeCommand("/provider nobody", services, {});
+  assert.deepEqual(services.logs, [], "failure hints do not write to the transcript");
+  assert.equal(notes.length, 1);
+  assert.match(notes[0].message, /provider 配置失败/);
+  assert.equal(notes[0].level, "error");
+
+  // 枚举类输出保留在 transcript（用户需要回看），不走 toast。
+  await executeCommand("/provider", services, {});
+  assert.match(services.logs.join("\n"), /providers：anthropic/);
+  assert.ok(notes.every((note) => !note.message.includes("providers：")), "listing never becomes a toast");
 });
 
 test("interactive /provider chains provider, api, and model pickers", async () => {
