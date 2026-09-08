@@ -1,6 +1,6 @@
 import { stdin as input, stdout as output } from "node:process";
 import { loadEnvFile } from "node:process";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { EventBus } from "../core/event-bus.ts";
 import { Supervisor } from "../core/supervisor.ts";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
@@ -16,6 +16,7 @@ import { TuiRepl, summarizeToolArgs } from "./tui-repl.ts";
 import { TOAST_ICONS, type ToastLevel } from "./components.ts";
 import { AgentRegistry, defaultAgentDirs } from "../core/agent-registry.ts";
 import { openDraftSession, deleteSessionById, executeCommand, switchToSessionId, type CommandServices, type CommandState } from "./commands.ts";
+import { resetTerminalTitle, setTerminalTitle } from "./terminal-title.ts";
 
 try {
   loadEnvFile(resolve(process.cwd(), ".env"));
@@ -27,7 +28,7 @@ try {
 // Streams and log lines route into the interactive REPL once it exists; before
 // that they fall back to plain stdout.
 let repl: TuiRepl | undefined;
-// 输出中每秒推送一次状态栏快照，StatusBar 据此计算输出速度（tok/s）。
+// 输出中每秒推送一次状态栏快照：任务平均输出速度随时间窗推进，其余统计保持最新。
 let statusTimer: ReturnType<typeof setInterval> | undefined;
 const startStatusPolling = (): void => {
   if (statusTimer) return;
@@ -59,7 +60,7 @@ const streamThinking = (delta: string, agent = "supervisor"): void => {
 };
 const endStream = (agent = "supervisor"): void => {
   repl?.endStream(agent);
-  // 每轮流结束都可能更新 token/上下文统计，刷新状态栏并停止速度采样。
+  // 每轮流结束都可能更新 token/上下文统计，并定格任务级平均速度。
   stopStatusPolling();
 };
 
@@ -211,6 +212,14 @@ const sharedServices = {
     },
     pick: (title, options) => repl!.pick(title, options)
   };
+  // 窗口标题：swarm - 会话名 - 项目目录；草稿/未命名时省略会话段。会话的
+  // 延迟创建与切换都经过 refreshBars（/new /switch /close /delete、点侧栏、
+  // 首个任务物化），repl 起来后的首次调用即启动标题。
+  const updateTerminalTitle = (): void => {
+    const name = sessionManager.isDraft() ? "草稿" : sessionManager.current()?.name;
+    const cwd = basename(process.cwd());
+    setTerminalTitle(name ? `swarm - ${name} - ${cwd}` : `swarm - ${cwd}`);
+  };
   // 会话栏与状态栏快照：会话是延迟创建的（启动不建会话、「＋ 新建」只开草稿），
   // 草稿激活时列表顶部多一行「✎ 草稿」；首个任务物化、/new /switch /close
   // 或点击会话之后，都统一在这里刷新。状态栏（模型/上下文/缓存）同批刷新。
@@ -219,6 +228,7 @@ const sharedServices = {
     repl.setDraftMode(sessionManager.isDraft());
     repl.setSessions(await sessionManager.list());
     refreshStatusBar();
+    updateTerminalTitle();
   };
   repl = new TuiRepl({
     onSubmit: async (line) => {
@@ -250,6 +260,8 @@ const sharedServices = {
   await refreshBars();
   await exited;
   repl.stop();
+  // 离开备用屏后清掉标题，避免退出后外层 shell 沿用 swarm 的标题。
+  resetTerminalTitle();
 }
 
 await supervisor.close();

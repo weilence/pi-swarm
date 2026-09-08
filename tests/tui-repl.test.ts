@@ -330,31 +330,32 @@ test("status bar without a model shows a placeholder and skips unknown segments"
   assert.ok(!line.includes("缓存命中"), "no cache segment without data");
 });
 
-test("status bar shows output speed (tok/s) while busy, not the token count", () => {
-  let now = 1_000;
-  const bar = new StatusBar(() => now);
+test("status bar shows TTFT and the task-average output speed from the snapshot", () => {
+  const bar = new StatusBar();
   const line = (): string => stripTerminalSequences(bar.render(200).join("\n"));
 
-  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 0 });
-  assert.ok(!line().includes("tok/s"), "no speed before the first sampling window");
-  assert.ok(!line().includes("输出 "), "raw output token count is not shown");
+  bar.set({ model: "openai/gpt-4o", busy: true });
+  assert.ok(!line().includes("tok/s"), "no speed before the first streamed token");
+  assert.ok(!line().includes("首字"), "no TTFT before the first streamed token");
+  assert.match(line(), /任务执行中/);
 
-  now = 2_000; // 1s 内产出 50 tokens → 50 tok/s
-  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 50 });
+  bar.set({ model: "openai/gpt-4o", busy: true, ttftMs: 800, avgOutputSpeed: 50 });
+  assert.match(line(), /首字 0\.8s/);
   assert.match(line(), /速度 50\.0 tok\/s/);
 
-  now = 3_000; // 再 1s 产出 70 tokens → 瞬时 70，EMA(0.6/0.4) = 58
-  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 120 });
-  assert.match(line(), /速度 58\.0 tok\/s/);
+  bar.set({ model: "openai/gpt-4o", busy: false, ttftMs: 800, avgOutputSpeed: 62.5 });
+  assert.match(line(), /首字 0\.8s/, "final TTFT stays visible after the task ends");
+  assert.match(line(), /速度 62\.5 tok\/s/, "final task average stays visible after the task ends");
 
-  bar.set({ model: "openai/gpt-4o", busy: false, outputTokens: 120 });
-  assert.ok(!line().includes("tok/s"), "speed disappears when idle");
+  // 下一任务首字符到达前，agent 继续推送上一任务的定格指标 → 原样展示。
+  bar.set({ model: "openai/gpt-4o", busy: true, ttftMs: 800, avgOutputSpeed: 62.5 });
+  assert.match(line(), /首字 0\.8s/, "carry-over TTFT stays until the new task's first token");
+  assert.match(line(), /速度 62\.5 tok\/s/, "carry-over average stays until the new task's first token");
 
-  // 会话切换后累计值回落：重新起算而不报负速度。
-  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 10 });
-  now = 4_000;
-  bar.set({ model: "openai/gpt-4o", busy: true, outputTokens: 60 });
-  assert.match(line(), /速度 50\.0 tok\/s/);
+  // 新任务首字符一到即刷新为本任务的值。
+  bar.set({ model: "openai/gpt-4o", busy: true, ttftMs: 420, avgOutputSpeed: 48 });
+  assert.match(line(), /首字 0\.4s/);
+  assert.match(line(), /速度 48\.0 tok\/s/);
 });
 
 test("editor Home/End jump to line start/end through the global key routing", () => {
@@ -1259,4 +1260,78 @@ test("renders contain no OSC 8 hyperlinks anywhere (keyboard-only)", () => {
   for (const line of surfaces) {
     assert.ok(!line.includes("\x1b]8;"), "no hyperlink escape sequences remain");
   }
+});
+
+test("transcriptText keeps logical plain text for whole-transcript copy", () => {
+  const { repl, ui } = makeRepl();
+  const chat = chatPanelOf(ui);
+  repl.appendLine("[主 agent] 启动");
+  repl.appendUserMessage("帮我跑测试");
+  repl.streamThinking("先看失败原因");
+  repl.streamText("结果如下：\n\n- A");
+  repl.endStream();
+  repl.toolStart("supervisor", "t1", "bash", { command: "npm test" });
+  repl.toolEnd("supervisor", "t1", false);
+
+  const text = chat.transcriptText();
+  assert.ok(text.includes("[主 agent] 启动"), "log lines are kept verbatim");
+  assert.ok(text.includes("帮我跑测试"), "user bubbles keep their text");
+  assert.ok(text.includes("先看失败原因"), "flushed thinking keeps full content");
+  assert.ok(text.includes("结果如下"), "markdown blocks keep their source");
+  assert.ok(!text.includes("⏳"), "running tool line is rewritten to the settled mark");
+  assert.ok(text.includes("✔ bash"), "settled tool line carries the ok mark");
+
+  chat.clearTranscript();
+  assert.equal(chat.transcriptText(), "", "clearTranscript also empties the plain log");
+});
+
+test("visibleText returns the current viewport slice with styles stripped", () => {
+  const { repl, ui } = makeRepl();
+  const chat = chatPanelOf(ui);
+  for (let i = 0; i < 50; i++) repl.appendLine(i === 45 ? `\x1b[2m暗色第45行\x1b[0m` : `第${i}行`);
+  const root = ui.layoutRoot! as Container;
+  const [, chatColumn] = root.children as [Container, Container];
+  const [chatNode] = chatColumn.children as [Container];
+  const chatScroll = chatNode.children[0] as unknown as {
+    updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void;
+  };
+  chatScroll.updateLayout(50, 10, () => undefined); // follow-end → scrollTop = 40
+
+  const text = chat.visibleText();
+  const lines = text.split("\n");
+  assert.equal(lines.length, 10, "exactly the viewport height is copied");
+  assert.ok(lines[0].includes("第40行"), "slice starts at the scroll position");
+  assert.ok(text.includes("第49行"), "slice ends at the bottom");
+  assert.ok(!text.includes("第39行"), "content above the viewport is excluded");
+  assert.ok(text.includes("暗色第45行"), "ANSI styles are stripped but text remains");
+  assert.ok(!text.includes("\x1b["), "no escape sequences leak into the clipboard payload");
+});
+
+test("y/a in transcript mode and ctrl+o in the editor run the clipboard copy path", async () => {
+  const { repl, ui } = makeRepl();
+  const editor = editorOf(repl) as unknown as { setText(text: string): void };
+  const toastText = (): string => {
+    const entry = ui.overlays.find((overlay) => overlay.component instanceof ToastStack);
+    return entry ? stripTerminalSequences((entry.component as ToastStack).render(120).join("\n")) : "";
+  };
+
+  repl.appendLine("有一条内容");
+  const root = ui.layoutRoot! as Container;
+  const [, chatColumn] = root.children as [Container, Container];
+  const [chatNode] = chatColumn.children as [Container];
+  (chatNode.children[0] as unknown as {
+    updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void;
+  }).updateLayout(1, 10, () => undefined);
+  assert.equal(press(ui, "\x1bt"), true); // Alt+T → transcript
+  assert.equal(press(ui, "a"), true, "a is consumed by the copy binding");
+  // 测试进程 stdout 非 TTY，writeClipboard 必然失败：走的是告警 toast 分支。
+  assert.match(toastText(), /整个转录复制失败：终端不支持 OSC 52/, "a copies the whole transcript");
+
+  assert.equal(press(ui, "y"), true, "y is consumed by the copy binding");
+  assert.match(toastText(), /可见区域已复制：1 行|可见区域复制失败/, "y copies the visible slice");
+
+  press(ui, "\x1b"); // → editor
+  editor.setText("草稿第一行");
+  assert.equal(press(ui, "\x0f"), true, "ctrl+o is consumed by the copy binding");
+  assert.match(toastText(), /输入框内容复制失败|输入框内容已复制/, "ctrl+o copies the editor content");
 });

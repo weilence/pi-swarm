@@ -19,6 +19,7 @@ import { clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel
 import {
   type AgentSession,
   createAgentSession,
+  createBashToolDefinition,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager as PiSessionManager,
@@ -45,6 +46,10 @@ export interface AgentStatusSnapshot {
   cacheWrite?: number;
   /** Cumulative session cost in USD. */
   cost?: number;
+  /** 首字符响应时间（毫秒）：prompt 派发 → 首个流式输出；定格保留到下一任务首字符到达。 */
+  ttftMs?: number;
+  /** 任务级平均输出速度（tok/s）：首字符 → 结束（输出中为当前时刻）；结束后定格保留。 */
+  avgOutputSpeed?: number;
   /** True while a prompt is streaming. */
   busy?: boolean;
 }
@@ -100,10 +105,37 @@ export interface AgentOptions extends AgentStreamSinks {
   };
   /** Per-attempt wall-clock limit for runStep; the session is aborted when it fires. */
   timeoutMs?: number;
+  /** Wall clock for status metrics (TTFT, average output speed); defaults to Date.now. */
+  now?: () => number;
 }
 
 /**
- * The one model-backed agent: a lazily created Pi session, streaming event
+ * 内置 bash 工具的替身：克隆 Pi 的定义，重写工具描述 —— 明确禁止 grep，
+ * 要求一律用 rg（ripgrep）替代，并给出常用等价写法；另在系统提示
+ * Guidelines 区追加一条同向的硬性规则强化约束。schema、执行逻辑与
+ * 内置一致。同名 custom tool 在 createAgentSession 中按名字覆盖内置定义。
+ */
+export function createRgBashToolOverride(cwd: string): ToolDefinition {
+  const base = createBashToolDefinition(cwd);
+  return {
+    ...base,
+    description: `${base.description}
+
+Search policy (mandatory): NEVER use grep, egrep, or fgrep. Use rg (ripgrep) for all text search:
+- Content search: rg -n "pattern" path  (flags: -i ignore case, -g glob, -C context, -uuu include ignored files)
+- List files: rg --files (pipe through a second rg to filter) instead of find -name
+- Count matches: rg -c or rg --count-matches
+
+grep is slower, ignores .gitignore, and noisier. Commands containing grep waste a turn — rewrite them with rg before submitting.`,
+    promptGuidelines: [
+      ...(base.promptGuidelines ?? []),
+      "Never run grep, egrep, or fgrep in bash commands. Use rg (ripgrep) for every content search; use rg --files instead of find -name."
+    ],
+    promptSnippet: base.promptSnippet?.replace("grep", "rg")
+  } as ToolDefinition;
+}
+
+/** The one model-backed agent: a lazily created Pi session, streaming event
  * forwarding, model/thinking management, delegate-step execution, and optional
  * config persistence — one class, roles differ by prompt and capabilities.
  */
@@ -126,6 +158,16 @@ export class Agent {
   private requestedThinkingLevel?: ModelThinkingLevel;
   /** 手动上下文容量（token）：覆盖模型自带 contextWindow；undefined = 模型默认。 */
   private contextWindowOverride?: number;
+  /** 任务级速度窗口：本轮 prompt 派发 → 首个流式输出 → 本轮结束。 */
+  private promptStartedAt?: number;
+  private firstOutputAt?: number;
+  /** 首字符时刻的累计输出 token 基线：窗口起点之前的产出不计入平均速度。 */
+  private outputAtFirst = 0;
+  private generationEndedAt?: number;
+  /** 定格的首字符响应时间：下一个任务的首字符到达前保持不变。 */
+  private lastTtftMs?: number;
+  /** 可注入时钟（测试用）；所有状态指标的计时都走这里。 */
+  private readonly clock: () => number;
   /** 用户主动请求停止（双击 Esc）：把中止当正常结束而非错误。 */
   private abortRequested = false;
   private collector?: ToolObservationCollector;
@@ -135,6 +177,7 @@ export class Agent {
   private readonly agentDir: string;
 
   public constructor(private readonly options: AgentOptions) {
+    this.clock = options.now ?? Date.now;
     this.cwd = options.cwd ?? process.cwd();
     this.agentDir = options.agentDir ?? join(getUserDataDir(), "agents", options.name);
     this.modelRuntime = options.modelRuntime;
@@ -173,8 +216,27 @@ export class Agent {
       cacheRead: stats.tokens.cacheRead,
       cacheWrite: stats.tokens.cacheWrite,
       cost: stats.cost,
+      ttftMs: this.lastTtftMs,
+      avgOutputSpeed: this.generationSpeed(),
       busy: this.prompting
     };
+  }
+
+  /**
+   * 任务级平均输出速度（tok/s）：时间窗从首个流式输出到本轮结束，分子是
+   * 窗口基线之后的累计输出 token。本轮首字符未到（firstOutputAt 早于本轮
+   * 派发时刻，仍是上一任务的旧窗口）时沿用在上一任务终点定格的值，不随新
+   * 任务的等待时间摊薄；首字符从未到达或窗长为零时 undefined。
+   */
+  private generationSpeed(): number | undefined {
+    if (this.firstOutputAt === undefined) return undefined;
+    const liveWindow = this.prompting && this.promptStartedAt !== undefined
+      && this.firstOutputAt >= this.promptStartedAt;
+    const end = liveWindow ? this.clock() : this.generationEndedAt ?? this.firstOutputAt;
+    const seconds = (end - this.firstOutputAt) / 1000;
+    if (seconds <= 0) return undefined;
+    const output = this.session?.getSessionStats().tokens.output ?? 0;
+    return Math.max(0, output + this.runningOutputTokens - this.outputAtFirst) / seconds;
   }
 
   /** Applies a previously persisted snapshot; returns a human-readable summary. */
@@ -262,6 +324,17 @@ export class Agent {
       // 在整个生成期间都是 Δ=0。message_end 时统计已包含该消息，清零防重复。
       if (event.type === "message_update" && event.message.role === "assistant") {
         this.runningOutputTokens = event.message.usage?.output ?? this.runningOutputTokens;
+        // 本轮的首个流式输出事件＝首字符到达（firstOutputAt 早于本轮派发
+        // 时刻说明还是上一任务的旧窗口）：刷新 TTFT 定格值、重开速度窗口；
+        // 基线取此刻累计输出（含本消息已报的 usage，起始 token 不进平均）。
+        if (this.firstOutputAt === undefined
+          || (this.promptStartedAt !== undefined && this.firstOutputAt < this.promptStartedAt)) {
+          const at = this.clock();
+          this.lastTtftMs = this.promptStartedAt !== undefined ? at - this.promptStartedAt : undefined;
+          this.firstOutputAt = at;
+          this.outputAtFirst = (this.session?.getSessionStats().tokens.output ?? 0) + this.runningOutputTokens;
+          this.generationEndedAt = undefined;
+        }
       } else if (event.type === "message_end" && event.message.role === "assistant") {
         this.runningOutputTokens = 0;
       } else if (event.type === "agent_end") {
@@ -350,6 +423,9 @@ export class Agent {
     this.streamToUi = options.stream === true;
     this.responseBuffer = "";
     this.prompting = true;
+    // 新任务只刷新派发时刻；上一任务的指标保持定格展示，等本轮首字符到
+    // 达才刷新（事件里以 firstOutputAt < promptStartedAt 识别旧窗口）。
+    this.promptStartedAt = this.clock();
     const run = session.prompt(prompt);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = options.timeoutMs
@@ -379,6 +455,8 @@ export class Agent {
     } finally {
       clearTimeout(timer);
       this.prompting = false;
+      // 定格窗口终点：最终平均速度随流结束后的最后一次快照推送展示。
+      this.generationEndedAt = this.clock();
       this.abortRequested = false;
       this.streamToUi = previous;
       this.options.onStreamEnd(this.options.name);
@@ -450,6 +528,12 @@ export class Agent {
   /** The delegate tool when the delegate capability is wired and agents exist. */
   private customTools(): ToolDefinition[] {
     const tools = [...(this.options.customTools ?? [])];
+    // 内置 bash 描述不约束搜索工具，模型偶尔仍会用 grep：换成明确禁用
+    // grep、强制 rg 的同名替身（custom tool 在 createAgentSession 中按名字
+    // 覆盖内置定义）。调用方显式传入的 bash 工具优先，此时不注入。
+    if (!tools.some((tool) => tool.name === "bash")) {
+      tools.unshift(createRgBashToolOverride(this.cwd));
+    }
     if (this.delegateAvailable()) tools.push(createDelegateTool(this.delegateServices(), this.delegateState));
     return tools;
   }

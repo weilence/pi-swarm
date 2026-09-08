@@ -80,6 +80,28 @@ export class FloatingEditor extends Editor {
     this.placement = options.placement;
   }
 
+  /**
+   * 应用候选后的继续下钻：pi-tui Editor 应用补全（Enter/Tab）后一律取消
+   * 补全且不重新触发，选中目录（插入 @dir/）后必须再敲一个字符才会列出
+   * 目录内容。这里在应用发生且光标前仍是完整 @ 词元时主动重新触发，行为
+   * 等同用户手动键入这些字符。纯取消（Esc，文本未变）不重新弹出。
+   */
+  public handleInput(data: string): void {
+    const internals = this as unknown as AutocompleteInternals;
+    const popupWasOpen = internals.autocompleteState !== null;
+    const textBefore = this.getText();
+    super.handleInput(data);
+    if (!popupWasOpen) return;
+    if (internals.autocompleteState !== null) return; // 列表内导航等，补全仍开着
+    if (this.getText() === textBefore) return; // 纯取消（如 Esc）：文本未变
+    const cursor = (this as unknown as { state?: { lines: string[]; cursorLine: number; cursorCol: number } }).state;
+    const line = cursor?.lines[cursor.cursorLine] ?? "";
+    const beforeCursor = line.slice(0, cursor?.cursorCol ?? 0);
+    if (/(?:^|\s)@[^\s]*$/.test(beforeCursor)) {
+      (this as unknown as { tryTriggerAutocomplete(): void }).tryTriggerAutocomplete();
+    }
+  }
+
   public render(width: number): string[] {
     const lines = super.render(width);
     const placement = this.placement;

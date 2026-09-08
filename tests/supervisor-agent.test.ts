@@ -30,8 +30,17 @@ const silentSinks = {
 };
 
 /** A supervisor wired to the fake store; the Pi session is never created in these tests. */
-function makeAgent(store: ConfigStore): Agent {
-  return createSupervisorAgent({ ...silentSinks, configStore: store, cwd: process.cwd(), agentDir: "not-created-in-tests" });
+function makeAgent(
+  store: ConfigStore,
+  extra: Partial<Parameters<typeof createSupervisorAgent>[0]> = {}
+): Agent {
+  return createSupervisorAgent({
+    ...silentSinks,
+    configStore: store,
+    cwd: process.cwd(),
+    agentDir: "not-created-in-tests",
+    ...extra
+  });
 }
 
 test("configureProvider persists the provider without opening a session", async () => {
@@ -172,4 +181,73 @@ test("rebind refuses to switch while a prompt is streaming", async () => {
   (agent as unknown as { prompting: boolean }).prompting = true;
   assert.equal(agent.isBusy(), true);
   await assert.rejects(agent.rebind(PiSessionManager.inMemory()), SessionBusyError);
+});
+
+test("statusSnapshot reports TTFT and the task-average output speed", () => {
+  let now = 5_600;
+  const agent = makeAgent(makeStore(), { now: () => now });
+  const internals = agent as unknown as {
+    prompting: boolean;
+    session: unknown;
+    promptStartedAt?: number;
+    firstOutputAt?: number;
+    outputAtFirst: number;
+    generationEndedAt?: number;
+    lastTtftMs?: number;
+    runningOutputTokens: number;
+  };
+  // 快照只读 session 的这几块表面，用最小假体替代真实 Pi 会话。
+  internals.session = {
+    model: { provider: "openai", id: "gpt-4o" },
+    thinkingLevel: "high",
+    getSessionStats: () => ({
+      contextUsage: { tokens: 12_000, contextWindow: 128_000, percent: 9.4 },
+      tokens: { input: 10, output: 100, cacheRead: 40, cacheWrite: 0 },
+      cost: 0.01
+    })
+  };
+
+  // 首 token 未到：两个指标都 undefined（状态栏对应段省略）。
+  internals.prompting = true;
+  internals.promptStartedAt = 1_000;
+  const waiting = agent.statusSnapshot;
+  assert.equal(waiting.ttftMs, undefined);
+  assert.equal(waiting.avgOutputSpeed, undefined);
+
+  // 输出中：窗口 = 首字符(1.6s) → now(5.6s) = 4s；窗口内产出 = 100 + 50 - 30 = 120。
+  internals.firstOutputAt = 1_600;
+  internals.lastTtftMs = 600;
+  internals.outputAtFirst = 30;
+  internals.runningOutputTokens = 50;
+  const busy = agent.statusSnapshot;
+  assert.equal(busy.ttftMs, 600);
+  assert.equal(busy.avgOutputSpeed, 30);
+  assert.equal(busy.busy, true);
+
+  // 结束后：窗口定格在结束时刻，running 已并入会话统计；指标保留展示。
+  internals.prompting = false;
+  internals.generationEndedAt = 8_600;
+  internals.runningOutputTokens = 0;
+  const done = agent.statusSnapshot;
+  assert.equal(done.ttftMs, 600);
+  assert.equal(done.avgOutputSpeed, 10); // (100 - 30) / 7s
+  assert.equal(done.busy, false);
+
+  // 下一任务已派发（9s）但首字符未到：沿用上一任务的定格指标，不随等待摊薄。
+  internals.prompting = true;
+  internals.promptStartedAt = 9_000;
+  const carry = agent.statusSnapshot;
+  assert.equal(carry.ttftMs, 600);
+  assert.equal(carry.avgOutputSpeed, 10);
+
+  // 新任务首字符到达（9.5s）：TTFT 刷新，速度窗口重开（now=10.5s，产出 20 tokens）。
+  internals.firstOutputAt = 9_500;
+  internals.lastTtftMs = 500;
+  internals.outputAtFirst = 100; // 基线 = 此刻会话累计输出
+  internals.generationEndedAt = undefined;
+  internals.runningOutputTokens = 20;
+  now = 10_500;
+  const fresh = agent.statusSnapshot;
+  assert.equal(fresh.ttftMs, 500);
+  assert.equal(fresh.avgOutputSpeed, 20); // (100 + 20 - 100) / 1s
 });

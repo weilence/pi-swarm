@@ -63,6 +63,8 @@ export interface SupervisorAgentOptions {
   log?: (line: string) => void;
   /** Overrides the coordinator prompt; defaults to the built-in supervisor definition. */
   definition?: AgentDefinition;
+  /** Wall clock for status metrics (TTFT, average output speed); defaults to Date.now. */
+  now?: () => number;
 }
 
 /**
@@ -86,6 +88,7 @@ export function createSupervisorAgent(options: SupervisorAgentOptions): Agent {
     ],
     configStore: options.configStore,
     sessionManager: options.sessionManager,
+    now: options.now,
     ...(options.stepExecutor
       ? { delegate: { agents, stepExecutor: options.stepExecutor, log: options.log } }
       : {}),

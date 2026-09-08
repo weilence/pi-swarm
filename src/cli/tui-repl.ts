@@ -1,5 +1,6 @@
-import { getKeybindings, type AutocompleteProvider, HStack, isKeyRelease, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, TuiAltScreen, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
+import { getKeybindings, type AutocompleteProvider, HStack, isKeyRelease, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
+import { SwarmAltScreen } from "./alt-screen.ts";
 import type { SessionSummary } from "../core/session/session-types.ts";
 import { macAltKeyHint } from "./alt-key-hint.ts";
 import { summarizeToolArgs } from "../core/tool-summary.ts";
@@ -17,11 +18,12 @@ import {
   type ToastLevel
 } from "./components.ts";
 import type { AgentStatusSnapshot } from "../pi/agent.ts";
+import { writeClipboard } from "./clipboard.ts";
 
 export { summarizeToolArgs };
 
 export interface TuiReplOptions {
-  /** Injected viewport TUI for tests; defaults to a ProcessTerminal + TuiAltScreen (fullscreen) pair. */
+  /** Injected viewport TUI for tests; defaults to a ProcessTerminal + SwarmAltScreen (fullscreen) pair. */
   ui?: ViewportTUI;
   /** Returns "exit" to end the process (e.g. the /exit command). */
   onSubmit: (line: string) => Promise<CommandOutcome | void>;
@@ -64,7 +66,7 @@ type FocusMode = "editor" | "sidebar" | "transcript";
  * keep one entry point.
  */
 export class TuiRepl {
-  private readonly owned?: { terminal: ProcessTerminal; ui: TuiAltScreen };
+  private readonly owned?: { terminal: ProcessTerminal; ui: SwarmAltScreen };
   private readonly ui: ViewportTUI;
   /** Chat content + input box: transcripts, streaming, editor, submit gating. */
   private readonly chat: ChatPanel;
@@ -96,7 +98,8 @@ export class TuiRepl {
       const terminal = new ProcessTerminal();
       // Fullscreen (alternate-screen) mode: app owns the whole viewport with a
       // scrollable document that follows new output; screen is restored on stop.
-      const ui = new TuiAltScreen(terminal, true, undefined);
+      // SwarmAltScreen：鼠标拖选 + 右键复制选区（见 alt-screen.ts）。
+      const ui = new SwarmAltScreen(terminal, true, undefined);
       this.owned = { terminal, ui };
       this.ui = ui;
     }
@@ -346,7 +349,7 @@ export class TuiRepl {
     this.sidebar.setFocused(mode === "sidebar");
     if (mode === "editor") this.ui.setFocus(this.chat.editor);
     else this.ui.setFocus(null);
-    if (mode === "transcript") this.notify("转录浏览：↑↓ 滚动 · f 展开思考 · Tab 侧栏 · Esc 返回输入");
+    if (mode === "transcript") this.notify("转录浏览：↑↓ 滚动 · y 复制可见 · a 复制全部 · f 展开思考 · Tab 侧栏 · Esc 返回输入");
     this.ui.requestRender();
   }
 
@@ -364,6 +367,12 @@ export class TuiRepl {
     if (isKeyRelease(data)) return { consume: true };
     if (matchesKey(data, "ctrl+c")) {
       this.options.onExit();
+      return { consume: true };
+    }
+    // Ctrl+O：把输入框当前内容复制到系统剪贴板（OSC 52）。终端原生选择对
+    // 折行编辑器内容只能按字符网格框选，应用端复制才能拿到完整逻辑文本。
+    if (this.focus === "editor" && matchesKey(data, "ctrl+o")) {
+      this.copyToClipboard(this.chat.editor.getExpandedText(), "输入框内容");
       return { consume: true };
     }
     if (this.openMenu) return undefined;
@@ -441,6 +450,16 @@ export class TuiRepl {
         this.chat.toggleAllFolds();
         return { consume: true };
       }
+      // y/a：应用端复制（OSC 52 写系统剪贴板）。终端原生选择只作用于字符
+      // 网格，跨屏行、跨分栏的选择无法按 UI 逻辑块进行；这里由应用提供。
+      if (matchesKey(data, "y")) {
+        this.copyToClipboard(this.chat.visibleText(), "可见区域");
+        return { consume: true };
+      }
+      if (matchesKey(data, "a")) {
+        this.copyToClipboard(this.chat.transcriptText(), "整个转录");
+        return { consume: true };
+      }
       if (matchesKey(data, "escape")) {
         this.setFocusMode("editor");
         return { consume: true };
@@ -456,6 +475,20 @@ export class TuiRepl {
       return { consume: true };
     }
     return undefined;
+  }
+
+  /**
+   * 应用端复制：OSC 52 写系统剪贴板 + toast 反馈。终端若不支持（或未放行）
+   * OSC 52，剪贴板不会有变化，这里只能提示失败原因。
+   */
+  private copyToClipboard(text: string, label: string): void {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      this.notify(`${label}没有可复制的内容`);
+      return;
+    }
+    if (writeClipboard(trimmed)) this.notify(`${label}已复制：${trimmed.split("\n").length} 行`);
+    else this.notify(`${label}复制失败：终端不支持 OSC 52 或内容过大`, "warning");
   }
 
   /** Keeps the sidebar selection inside the rows viewport after navigation. */

@@ -464,6 +464,12 @@ export function formatTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
+/** 秒的紧凑格式：0.8s / 12.3s / 125s（状态栏首字响应时间用）。 */
+export function formatSeconds(ms: number): string {
+  const s = ms / 1000;
+  return s >= 100 ? `${Math.round(s)}s` : `${s.toFixed(1)}s`;
+}
+
 /**
  * 缓存命中率：缓存读取占全部输入侧 token（读取 + 写入 + 未缓存输入）的
  * 比例；没有输入侧数据时 undefined（状态栏整段省略）。
@@ -474,43 +480,19 @@ export function cacheHitRate(snapshot: AgentStatusSnapshot): number | undefined 
 }
 
 /**
- * 编辑器下方的一行状态栏：模型、thinking、上下文占用、缓存命中率、输出
- * 速度、花费、忙碌状态。dim 单行（超宽截断），快照由 main.ts 在流结束、
- * 命令与会话切换后推送；输出中另由定时器推送以计算输出速度。数据缺失的段
- * 整段省略；未选模型时显示占位文本，栏高恒为一行不跳动。
+ * 编辑器下方的一行状态栏：模型、thinking、上下文占用、缓存命中率、首字
+ * 响应时间、任务平均输出速度、花费、忙碌状态。dim 单行（超宽截断），快照
+ * 由 main.ts 在流结束、命令与会话切换后推送；输出中另由定时器每秒推送，
+ * 让平均速度随窗口推进。TTFT 与平均速度由 Agent 在快照里算好：窗口从首
+ * 字符到本轮结束，任务结束后指标定格保留，直到下一个任务的首字符到达才
+ * 刷新。数据缺
+ * 失的段整段省略；未选模型时显示占位文本，栏高恒为一行不跳动。
  */
 export class StatusBar implements Component {
   private snapshot: AgentStatusSnapshot = {};
-  private lastSample?: { at: number; output: number };
-  private speed?: number;
 
-  public constructor(private readonly now: () => number = Date.now) { }
-
-  /** Replaces the snapshot; busy 流中连续采样，计算输出速度（EMA 平滑）。 */
   public set(snapshot: AgentStatusSnapshot): void {
-    this.sample(snapshot);
     this.snapshot = snapshot;
-  }
-
-  /** 速度采样：非 busy 清零；busy 中按相邻快照的 token 增量 / 时间差计算。 */
-  private sample(snapshot: AgentStatusSnapshot): void {
-    if (!snapshot.busy || snapshot.outputTokens === undefined) {
-      this.lastSample = undefined;
-      this.speed = undefined;
-      return;
-    }
-    const now = this.now();
-    const previous = this.lastSample;
-    this.lastSample = { at: now, output: snapshot.outputTokens };
-    if (!previous || snapshot.outputTokens <= previous.output) {
-      // 新任务或会话切换（累计值回落）：重新起算，等下一个采样窗。
-      this.speed = undefined;
-      return;
-    }
-    const seconds = (now - previous.at) / 1000;
-    if (seconds < 0.2) return; // 采样过密：跳过噪声样本
-    const instant = (snapshot.outputTokens - previous.output) / seconds;
-    this.speed = this.speed === undefined ? instant : this.speed * 0.6 + instant * 0.4;
   }
 
   public render(width: number): string[] {
@@ -530,8 +512,10 @@ export class StatusBar implements Component {
     }
     const rate = cacheHitRate(s);
     if (rate !== undefined) parts.push(`缓存命中 ${rate.toFixed(1)}%`);
-    if (s.busy && this.speed !== undefined) {
-      parts.push(`速度 ${this.speed >= 100 ? this.speed.toFixed(0) : this.speed.toFixed(1)} tok/s`);
+    if (s.ttftMs !== undefined) parts.push(`首字 ${formatSeconds(s.ttftMs)}`);
+    if (s.avgOutputSpeed !== undefined) {
+      const speed = s.avgOutputSpeed;
+      parts.push(`速度 ${speed >= 100 ? speed.toFixed(0) : speed.toFixed(1)} tok/s`);
     }
     if (s.cost && s.cost > 0) parts.push(`$${s.cost.toFixed(2)}`);
     if (s.busy) parts.push("任务执行中");

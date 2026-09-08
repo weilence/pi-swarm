@@ -1,4 +1,4 @@
-import { Container, Markdown, type AutocompleteProvider, type MarkdownTheme, type OverlayHandle, ScrollView, Text, VStack, type ViewportTUI } from "@earendil-works/pi-tui";
+import { Container, Markdown, stripTerminalSequences, type AutocompleteProvider, type MarkdownTheme, type OverlayHandle, ScrollView, Text, VStack, type ViewportTUI } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { dim } from "../core/ansi.ts";
 import { fdInstallHint, readOsRelease } from "../core/install-hint.ts";
@@ -6,7 +6,7 @@ import { summarizeToolArgs } from "../core/tool-summary.ts";
 import type { CommandOutcome } from "./commands.ts";
 import { ChatAutocompleteProvider } from "./chat-autocomplete.ts";
 import { FloatingEditor, type FloatingCompletionPlacement } from "./floating-editor.ts";
-import { AgentTabState, BlankLine, CollapsibleReasoning, StatusLine, ThinkingTail, ToastStack, ToolCallLine, UserMessage, type ToastLevel } from "./components.ts";
+import { AgentTabState, BlankLine, CollapsibleReasoning, SESSION_SIDEBAR_WIDTH, StatusLine, ThinkingTail, ToastStack, ToolCallLine, UserMessage, type ToastLevel } from "./components.ts";
 
 export interface ChatPanelOptions {
   ui: ViewportTUI;
@@ -73,6 +73,8 @@ interface AgentTranscript {
   unread: boolean;
   /** Collapsible reasoning entries in arrival order (transcript-mode f key). */
   reasonings: CollapsibleReasoning[];
+  /** 转录纯文本（逻辑行，未按屏宽折行）；transcriptText / 复制的数据源。 */
+  plain: string[];
 }
 
 /**
@@ -110,6 +112,8 @@ export class ChatPanel extends VStack {
   private pendingAnswer?: (answer: string) => void;
   /** True while a submitted task is running; Enter is swallowed, text is kept. */
   private busy = false;
+  /** 运行中的工具行 → 纯文本下标；结束时把 ⏳ 行原地改写为 ✔/✘。 */
+  private readonly pendingPlain = new Map<string, { tab: AgentTranscript; index: number; toolName: string }>();
 
   public constructor(private readonly options: ChatPanelOptions) {
     super();
@@ -181,7 +185,8 @@ export class ChatPanel extends VStack {
       partialBlock: "",
       streamBlankPending: false,
       unread: false,
-      reasonings: []
+      reasonings: [],
+      plain: []
     });
     if (this.tabs.size === 1) {
       this.activeAgent = name;
@@ -230,6 +235,8 @@ export class ChatPanel extends VStack {
     tab.log.clear();
     tab.stream.clear();
     tab.reasonings.length = 0;
+    tab.plain.length = 0;
+    for (const [key, pending] of this.pendingPlain) if (pending.tab === tab) this.pendingPlain.delete(key);
     this.options.ui.requestRender();
   }
 
@@ -255,6 +262,7 @@ export class ChatPanel extends VStack {
     // first so the transcript order matches arrival order.
     this.flushStream(tab);
     tab.log.addChild(new Text(line, 0, 0));
+    tab.plain.push(stripTerminalSequences(line));
     this.markUnread(tab, agent);
     this.options.ui.requestRender();
   }
@@ -291,6 +299,11 @@ export class ChatPanel extends VStack {
       if (key.startsWith(`${agent}/`)) {
         line.finish(true);
         this.toolLines.delete(key);
+        const pending = this.pendingPlain.get(key);
+        if (pending) {
+          pending.tab.plain[pending.index] = `✘ ${pending.toolName}`;
+          this.pendingPlain.delete(key);
+        }
       }
     }
     this.markUnread(tab, agent);
@@ -303,8 +316,11 @@ export class ChatPanel extends VStack {
     // Tools run between text segments: commit the live tail first so the
     // transcript order matches what the model actually did.
     this.flushStream(tab);
-    this.toolLines.set(`${agent}/${toolCallId}`, new ToolCallLine(toolName, summarizeToolArgs(args)));
+    const summary = summarizeToolArgs(args);
+    this.toolLines.set(`${agent}/${toolCallId}`, new ToolCallLine(toolName, summary));
     tab.log.addChild(this.toolLines.get(`${agent}/${toolCallId}`)!);
+    const label = `${toolName}${summary ? ` ${summary}` : ""}`;
+    this.pendingPlain.set(`${agent}/${toolCallId}`, { tab, index: tab.plain.push(`⏳ ${label}`) - 1, toolName: label });
     this.markUnread(tab, agent);
     this.options.ui.requestRender();
   }
@@ -313,6 +329,11 @@ export class ChatPanel extends VStack {
   public toolEnd(agent: string, toolCallId: string, isError: boolean): void {
     this.toolLines.get(`${agent}/${toolCallId}`)?.finish(isError);
     this.toolLines.delete(`${agent}/${toolCallId}`);
+    const pending = this.pendingPlain.get(`${agent}/${toolCallId}`);
+    if (pending) {
+      pending.tab.plain[pending.index] = `${isError ? "✘" : "✔"} ${pending.toolName}`;
+      this.pendingPlain.delete(`${agent}/${toolCallId}`);
+    }
     const tab = this.tabs.get(agent);
     if (tab) {
       this.markUnread(tab, agent);
@@ -324,7 +345,9 @@ export class ChatPanel extends VStack {
   public appendToolCall(toolName: string, summary: string, isError: boolean, agent: string = DEFAULT_AGENT): void {
     const line = new ToolCallLine(toolName, summary);
     line.finish(isError);
-    this.tabFor(agent).log.addChild(line);
+    const tab = this.tabFor(agent);
+    tab.log.addChild(line);
+    tab.plain.push(`${isError ? "✘" : "✔"} ${toolName}${summary ? ` ${summary}` : ""}`);
     this.options.ui.requestRender();
   }
 
@@ -342,6 +365,7 @@ export class ChatPanel extends VStack {
     const tab = this.activeTab();
     this.flushStream(tab);
     tab.log.addChild(new UserMessage(message));
+    tab.plain.push(message);
     this.options.ui.requestRender();
   }
 
@@ -478,6 +502,7 @@ export class ChatPanel extends VStack {
   private addMarkdown(tab: AgentTranscript, markdown: string): void {
     if (!markdown.trim()) return;
     tab.log.addChild(new Markdown(markdown, 0, 0, this.markdownTheme));
+    tab.plain.push(markdown);
     this.markUnread(tab, tab.name);
     this.options.ui.requestRender();
   }
@@ -492,9 +517,39 @@ export class ChatPanel extends VStack {
     if (!markdown.trim()) return;
     // 注意：分隔符必须是含一个空格的 Text —— pi-tui 的 Text 对纯空文本渲染
     // 零行，Text("") 作为空行是无效的（曾导致流式空行全部丢失）。
-    if (tab.streamBlankPending) tab.log.addChild(new BlankLine());
+    if (tab.streamBlankPending) {
+      tab.log.addChild(new BlankLine());
+      tab.plain.push("");
+    }
     tab.streamBlankPending = true;
     this.addMarkdown(tab, markdown);
+  }
+
+  /**
+   * 当前 agent 转录的纯文本：每条逻辑行一项（markdown 源码、完整思考、
+   * 用户消息、工具行），不按屏宽折行、无样式与边框 —— 整个转录复制的数据源。
+   * 流式尾部（未提交块）不含在内。
+   */
+  public transcriptText(): string {
+    return this.activeTab().plain.join("\n");
+  }
+
+  /**
+   * 当前聊天视口可见内容的纯文本（所见即所得）：按布局同款宽度渲染转录、
+   * 按 scrollTop 截取视口行，再去掉 ANSI 样式。绕开了终端原生选择只能按
+   * 字符网格框选的限制 —— 跨屏行/折行内容仍按逻辑行完整复制。
+   */
+  public visibleText(): string {
+    const width = Math.max(20, this.options.ui.terminal.columns - SESSION_SIDEBAR_WIDTH - 1);
+    const body = this.scrollBody.children[0];
+    const lines = body ? body.render(this.scrollView.getContentWidth(width)) : [];
+    const top = Math.max(0, Math.min(Math.floor(this.scrollView.scrollTop), lines.length));
+    const height = Math.max(0, this.scrollView.viewportHeight);
+    return lines
+      .slice(top, top + height)
+      .map(stripTerminalSequences)
+      .join("\n")
+      .replace(/[ \n]+$/, "");
   }
 
   private activeTab(): AgentTranscript {
@@ -518,6 +573,7 @@ export class ChatPanel extends VStack {
   private newReasoning(buffer: string, tab: AgentTranscript): CollapsibleReasoning {
     const reasoning = new CollapsibleReasoning(++this.thinkSeq, buffer);
     tab.reasonings.push(reasoning);
+    tab.plain.push(buffer.trim());
     return reasoning;
   }
 

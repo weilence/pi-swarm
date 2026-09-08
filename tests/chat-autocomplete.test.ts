@@ -245,6 +245,46 @@ function completionOverlaysOf(ui: ReturnType<typeof makeFakeUi>): FakeOverlay[] 
   return ui.overlays.filter((overlay) => overlay.component instanceof CompletionPopup);
 }
 
+test("editor：选中目录后自动继续下钻（apply 后重新触发 @ 补全）", async () => {
+  // 目录补全引擎：@ 列出 docs/，@docs/ 列出目录内文件；apply 插入 value
+  // （目录不带尾随空格，可继续下钻）——模拟 Combined 的真实行为。
+  const calls: string[] = [];
+  const drillEngine: AutocompleteProvider = {
+    async getSuggestions(lines, cursorLine, cursorCol) {
+      const token = (lines[cursorLine] ?? "").slice(0, cursorCol);
+      calls.push(token);
+      if (token === "@") return { items: [{ value: "@docs/", label: "docs/" }], prefix: "@" };
+      if (token === "@docs/") return { items: [{ value: "@docs/a.md", label: "a.md" }], prefix: "@docs/" };
+      return null;
+    },
+    applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+      const line = lines[cursorLine] ?? "";
+      const start = line.slice(0, cursorCol - prefix.length);
+      return { lines: [start + item.value], cursorLine: 0, cursorCol: start.length + item.value.length };
+    }
+  };
+  const { repl, editor, ui } = makeRepl(undefined, drillEngine);
+
+  editor.handleInput("@");
+  await waitFor(() => editor.isShowingAutocomplete(), "键入 @ 后应出现补全");
+
+  // Enter 选中 @docs/：apply 后应自动重新触发，列出目录内容。
+  editor.handleInput("\r");
+  await waitFor(() => {
+    renderEditor(repl);
+    const current = completionOverlaysOf(ui);
+    if (current.length !== 1) return false;
+    return stripTerminalSequences((current[0].component as unknown as CompletionPopup).render(current[0].options?.width as number).join("\n")).includes("a.md");
+  }, "选中目录后应继续列出目录内容");
+  assert.equal(editor.getText(), "@docs/", "目录补全不带尾随空格");
+  assert.ok(calls.includes("@docs/"), "重新触发的请求应携带下钻词元");
+
+  // Esc 取消后不应重新弹出：
+  editor.handleInput("\x1b");
+  renderEditor(repl);
+  assert.ok(!editor.isShowingAutocomplete(), "Esc 应关闭补全且不重新弹出");
+});
+
 /** 触发一次编辑器渲染：浮层的挂载/剥离发生在渲染时。 */
 function renderEditor(repl: TuiRepl): string[] {
   const editor = editorOf(repl);
