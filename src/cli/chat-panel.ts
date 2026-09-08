@@ -1,8 +1,10 @@
-import { Container, Editor, Markdown, type MarkdownTheme, type OverlayHandle, ScrollView, Text, VStack, type ViewportTUI } from "@earendil-works/pi-tui";
+import { Container, Markdown, type MarkdownTheme, type OverlayHandle, ScrollView, Text, VStack, type ViewportTUI } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { dim } from "../core/ansi.ts";
 import { summarizeToolArgs } from "../core/tool-summary.ts";
 import type { CommandOutcome } from "./commands.ts";
+import { ChatAutocompleteProvider } from "./chat-autocomplete.ts";
+import { FloatingEditor, type FloatingCompletionPlacement } from "./floating-editor.ts";
 import { AgentTabState, BlankLine, CollapsibleReasoning, StatusLine, ThinkingTail, ToastStack, ToolCallLine, UserMessage, type ToastLevel } from "./components.ts";
 
 export interface ChatPanelOptions {
@@ -14,6 +16,8 @@ export interface ChatPanelOptions {
   isInputFocused: () => boolean;
   /** A submitted task finished (or input is wanted again); the owner applies its focus policy. */
   onIdle: () => void;
+  /** VSCode 式浮层补全的定位；缺省时补全下拉内嵌在编辑器框内。 */
+  editorPlacement?: FloatingCompletionPlacement;
 }
 
 /** Agent that owns output when no explicit label is passed. */
@@ -81,7 +85,7 @@ interface AgentTranscript {
  * finishes (onIdle).
  */
 export class ChatPanel extends VStack {
-  public readonly editor: Editor;
+  public readonly editor: FloatingEditor;
   /** Holds the active transcript; lives inside the scroll view. */
   private readonly scrollBody = new Container();
   /** Scrollable chat area that fills the space above the pinned editor. */
@@ -108,10 +112,22 @@ export class ChatPanel extends VStack {
     super();
     this.markdownTheme = getMarkdownTheme();
     // The dimmed border is the visual cue that keystrokes go elsewhere.
-    this.editor = new Editor(options.ui, {
+    // 浮层补全：编辑器框高度恒定，下拉列表浮动在框上方（VSCode 式）。
+    // 未提供 placement（如单测）时退化为 pi-tui 原生内嵌渲染。
+    this.editor = new FloatingEditor(options.ui, {
       borderColor: (text) => (options.isInputFocused() ? text : dim(text)),
-      selectList: getSelectListTheme()
+      selectList: getSelectListTheme(),
+      placement: options.editorPlacement
     });
+    // 补全：空编辑器键入 / 弹出命令下拉，空白后键入 @ 弹出文件引用
+    // （触发与键位由 pi-tui Editor 内建，这里只提供候选来源）。@ 补全
+    // 以 fd 为唯一引擎，缺失时提示一次，不做降级兜底。
+    this.editor.setAutocompleteProvider(
+      new ChatAutocompleteProvider({
+        onFdMissing: () =>
+          this.notify("未找到 fd 命令，@ 文件补全不可用；安装后重启生效（brew install fd / apt install fd-find）。", "warning")
+      })
+    );
     this.editor.onSubmit = (text) => {
       if (this.pendingAnswer) {
         const settle = this.pendingAnswer;

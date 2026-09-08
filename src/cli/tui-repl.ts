@@ -114,6 +114,12 @@ export class TuiRepl {
       // Don't steal focus from an open menu when a task finishes.
       onIdle: () => {
         if (!this.openMenu) this.setFocusMode("editor");
+      },
+      // 浮层补全定位：chat 列起点在侧栏（22 列）+ 1 列 gap 之后；编辑器
+      // 之下还有一行状态栏，浮层（框上方）计算时需扣除。
+      editorPlacement: {
+        col: SESSION_SIDEBAR_WIDTH + 1,
+        bottomRows: () => this.statusBar.render(this.ui.terminal.columns).length
       }
     });
 

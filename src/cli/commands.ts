@@ -5,6 +5,7 @@ import type { TuiRepl } from "./tui-repl.ts";
 import type { AgentStatusSnapshot } from "../pi/agent.ts";
 import type { ToastLevel } from "./components.ts";
 import { replayHistory } from "./history-replay.ts";
+import { fuzzyFilter, type AutocompleteItem, type SlashCommand } from "@earendil-works/pi-tui";
 import type { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
 import {
   PI_API_TYPES,
@@ -93,6 +94,47 @@ function hint(services: CommandServices, message: string, level: ToastLevel = "i
   if (services.notify) services.notify(message, level);
   else services.log(`[主 agent] ${message}`);
 }
+
+/**
+ * 静态参数候选：按已输入的参数前缀模糊过滤（供 SLASH_COMMANDS 的
+ * getArgumentCompletions 复用）。
+ */
+function staticArgCompletions(items: readonly AutocompleteItem[]): (prefix: string) => AutocompleteItem[] {
+  return (prefix) => fuzzyFilter([...items], prefix, (item) => `${item.value} ${item.description ?? ""}`);
+}
+
+/**
+ * 斜杠命令索引：编辑器补全提示（SlashAutocompleteProvider）的数据源，
+ * 须与下方 executeCommand 的分发保持同步（含别名）。argumentHint 仅用于
+ * 提示列展示；参数可枚举的命令可声明 getArgumentCompletions（如 /context）。
+ */
+export const SLASH_COMMANDS: readonly SlashCommand[] = [
+  { name: "exit", description: "退出 pi-swarm" },
+  { name: "quit", description: "退出（/exit 别名）" },
+  { name: "status", description: "查看 supervisor / 会话 / 子 agent 状态" },
+  { name: "provider", argumentHint: "[id] [api]", description: "选择模型 provider 与接口类型" },
+  { name: "model", argumentHint: "[provider/]model", description: "切换模型" },
+  { name: "thinking", argumentHint: "[level]", description: "调整思考深度（thinking level）" },
+  { name: "apikey", argumentHint: "<key>", description: "设置 API key（明文存于 config.json）" },
+  {
+    name: "context",
+    argumentHint: "<tokens|reset>",
+    description: "查看/设置上下文容量",
+    getArgumentCompletions: staticArgCompletions([{ value: "reset", label: "reset", description: "恢复模型默认容量" }])
+  },
+  { name: "compact", argumentHint: "[侧重点]", description: "手动压缩上下文" },
+  { name: "new", argumentHint: "[名称]", description: "新建会话（草稿，首次发送时创建）" },
+  { name: "sessions", description: "列出全部会话" },
+  { name: "ls", description: "列出全部会话（/sessions 别名）" },
+  {
+    name: "switch",
+    argumentHint: "<id|序号|draft>",
+    description: "切换会话",
+    getArgumentCompletions: staticArgCompletions([{ value: "draft", label: "draft", description: "切到未保存草稿（等同 ＋ 新建）" }])
+  },
+  { name: "close", argumentHint: "[id|序号]", description: "关闭会话" },
+  { name: "delete", argumentHint: "<id|序号>", description: "删除会话（含记录文件）" }
+];
 
 export async function executeCommand(line: string, services: CommandServices, state: CommandState): Promise<CommandOutcome> {
   const goal = line.trim();
