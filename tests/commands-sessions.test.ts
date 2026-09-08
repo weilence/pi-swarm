@@ -45,13 +45,18 @@ function makeAgent(stub: AgentStub) {
   } as unknown as CommandServices["agent"];
 }
 
-function makeServices(sessions: SessionManager, agent?: CommandServices["agent"]): CommandServices {
+function makeServices(
+  sessions: SessionManager,
+  agent?: CommandServices["agent"],
+  repl?: CommandServices["repl"]
+): CommandServices {
   return {
     agent,
     catalog: { load: async () => [] },
     log: (line: string) => logs.push(line),
     interactive: false,
     pick: async () => undefined,
+    repl,
     sessions,
     agents: { list: () => [] }
   };
@@ -263,6 +268,34 @@ test("switchToSessionId shares the /switch core: no-op on current, unknown ids r
   await switchToSessionId(first.id, services);
   assert.equal(stub.rebindCalls.length, 3, "clicking the current session must not rebind again");
   assert.ok(logs.some((line) => line.includes("已是当前会话")));
+});
+
+test("switching clears the transcript even when the target session is empty", async () => {
+  const { sessions } = await makeSessions();
+  const stub: AgentStub = { rebindCalls: [], detachCalls: 0, busy: false };
+  const repl = {
+    cleared: 0,
+    appended: [] as string[],
+    clearTranscript(): void {
+      repl.cleared += 1;
+    },
+    appendMarkdown(markdown: string): void {
+      repl.appended.push(markdown);
+    }
+  };
+  const services = makeServices(sessions, makeAgent(stub), repl as unknown as CommandServices["repl"]);
+  const first = await sessions.create({ name: "first" });
+  await sessions.create({ name: "empty" });
+
+  await switchToSessionId(first.id, services);
+  assert.equal(repl.cleared, 1, "a successful switch wipes the transcript before replay");
+  assert.ok(repl.appended.some((line) => line.includes("空会话")), "an empty target gets an explicit note");
+
+  repl.cleared = 0;
+  await switchToSessionId("ghost", services);
+  assert.equal(repl.cleared, 0, "a failed switch keeps the current transcript");
+  await switchToSessionId(first.id, services);
+  assert.equal(repl.cleared, 0, "a no-op switch (current session) keeps the transcript");
 });
 
 test("deleteSessionById removes a non-current session without touching the pointer", async () => {

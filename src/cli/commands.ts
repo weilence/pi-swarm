@@ -568,7 +568,14 @@ export async function switchToSessionId(id: string, services: CommandServices): 
   try {
     const pi = await sessions.bind(target.id);
     await sessions.switch(target.id);
-    hint(services, (await services.agent?.rebind?.(pi)) ?? `已切换会话（agent 不支持运行时切换，仅更新指针）：${target.name ?? target.id}`);
+    const message =
+      (await services.agent?.rebind?.(pi)) ?? `已切换会话（agent 不支持运行时切换，仅更新指针）：${target.name ?? target.id}`;
+    // transcript 属于会话内容，切换成功后必须整体替换而不是追加：否则旧会话
+    // 的消息残留（切到空会话时回放 0 条，屏幕看起来纹丝不动，尤其明显）。
+    // 放在 rebind 成功之后：rebind 失败会走 catch 回滚指针留在原会话，
+    // 此时屏幕内容仍然有效，不应被清掉。
+    services.repl?.clearTranscript();
+    hint(services, message);
     replaySessionHistory(pi, services);
   } catch (error) {
     const now = sessions.current();
@@ -603,12 +610,14 @@ async function commandSwitch(ref: string, services: CommandServices): Promise<vo
 /**
  * 切换成功后回放目标会话历史（compaction-aware）：直接驱动 TUI 组件，与实时
  * 显示同源（气泡/折叠思考/✔✘ 工具行）。整个过程不抛错——回放失败只提示，
- * 不影响切换结果。/new 不回放（新会话没有历史）。
+ * 不影响切换结果。/new 不回放（新会话没有历史）。目标会话为空时回放 0 条，
+ * 补一行占位说明，避免清屏后看起来像没切换。
  */
 function replaySessionHistory(pi: PiSessionManager, services: CommandServices): void {
   if (!services.repl) return;
   try {
-    replayHistory(services.repl, pi.buildContextEntries());
+    const count = replayHistory(services.repl, pi.buildContextEntries());
+    if (count === 0) services.repl.appendMarkdown("*（空会话：暂无历史记录）*");
   } catch (error) {
     hint(services, `历史回放失败：${error instanceof Error ? error.message : String(error)}`, "error");
   }
