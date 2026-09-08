@@ -1,4 +1,4 @@
-import { getKeybindings, HStack, isKeyRelease, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, TuiAltScreen, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
+import { getKeybindings, type AutocompleteProvider, HStack, isKeyRelease, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, TuiAltScreen, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import type { SessionSummary } from "../core/session/session-types.ts";
 import { macAltKeyHint } from "./alt-key-hint.ts";
@@ -36,6 +36,8 @@ export interface TuiReplOptions {
   onAbort?: () => void | Promise<void>;
   /** 双击 Esc 的判定窗口（毫秒）；默认 2000。 */
   doubleEscWindowMs?: number;
+  /** 注入文件补全引擎（测试 mock / 未来扩展）；缺省按 fd 探测 PATH。 */
+  autocompleteEngine?: AutocompleteProvider | null;
 }
 
 /** The three focus regions; the editor is the home base. */
@@ -111,6 +113,7 @@ export class TuiRepl {
       onSubmit: options.onSubmit,
       onExit: options.onExit,
       isInputFocused: () => this.focus === "editor",
+      autocompleteEngine: options.autocompleteEngine,
       // Don't steal focus from an open menu when a task finishes.
       onIdle: () => {
         if (!this.openMenu) this.setFocusMode("editor");

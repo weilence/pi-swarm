@@ -1,6 +1,7 @@
-import { Container, Markdown, type MarkdownTheme, type OverlayHandle, ScrollView, Text, VStack, type ViewportTUI } from "@earendil-works/pi-tui";
+import { Container, Markdown, type AutocompleteProvider, type MarkdownTheme, type OverlayHandle, ScrollView, Text, VStack, type ViewportTUI } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { dim } from "../core/ansi.ts";
+import { fdInstallHint, readOsRelease } from "../core/install-hint.ts";
 import { summarizeToolArgs } from "../core/tool-summary.ts";
 import type { CommandOutcome } from "./commands.ts";
 import { ChatAutocompleteProvider } from "./chat-autocomplete.ts";
@@ -18,6 +19,8 @@ export interface ChatPanelOptions {
   onIdle: () => void;
   /** VSCode 式浮层补全的定位；缺省时补全下拉内嵌在编辑器框内。 */
   editorPlacement?: FloatingCompletionPlacement;
+  /** 注入文件补全引擎（测试 mock / 未来扩展）；缺省按 fd 探测 PATH。 */
+  autocompleteEngine?: AutocompleteProvider | null;
 }
 
 /** Agent that owns output when no explicit label is passed. */
@@ -124,8 +127,12 @@ export class ChatPanel extends VStack {
     // 以 fd 为唯一引擎，缺失时提示一次，不做降级兜底。
     this.editor.setAutocompleteProvider(
       new ChatAutocompleteProvider({
+        fdEngine: options.autocompleteEngine,
         onFdMissing: () =>
-          this.notify("未找到 fd 命令，@ 文件补全不可用；安装后重启生效（brew install fd / apt install fd-find）。", "warning")
+          this.notify(
+            `未找到 fd 命令，@ 文件补全不可用；安装：${fdInstallHint(process.platform, readOsRelease())}（重启生效）`,
+            "warning"
+          )
       })
     );
     this.editor.onSubmit = (text) => {
