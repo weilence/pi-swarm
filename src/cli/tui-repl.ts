@@ -1,6 +1,7 @@
-import { getKeybindings, HStack, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, TuiAltScreen, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
+import { getKeybindings, HStack, isKeyRelease, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, TuiAltScreen, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import type { SessionSummary } from "../core/session/session-types.ts";
+import { macAltKeyHint } from "./alt-key-hint.ts";
 import { summarizeToolArgs } from "../core/tool-summary.ts";
 import type { CommandOutcome, PickerOption } from "./commands.ts";
 import { ChatPanel } from "./chat-panel.ts";
@@ -159,6 +160,29 @@ export class TuiRepl {
   public start(): void {
     this.ui.start();
     this.ui.setFocus(this.chat.editor);
+    this.scheduleAltKeyHint();
+  }
+
+  /**
+   * macOS 一次性兼容性提示：Option 键默认输入特殊字符而非 Alt 修饰键，
+   * 不支持 Kitty 键盘协议的终端（如 Terminal.app）永远发不出 alt+s/t。
+   * ProcessTerminal 启动时已自动做协议握手，握手成功的终端能正确上报
+   * 修饰键，无需提示。延迟 600ms 是给握手回复留的窗口（本地通常几十
+   * 毫秒）；只在自有终端时检查——注入 ui 的测试环境不提示。
+   */
+  private scheduleAltKeyHint(): void {
+    const owned = this.owned;
+    if (!owned || process.platform !== "darwin") return;
+    const timer = setTimeout(() => {
+      if (owned.terminal.kittyProtocolActive) return;
+      const hint = macAltKeyHint({
+        platform: process.platform,
+        env: process.env,
+        kittyProtocolActive: owned.terminal.kittyProtocolActive
+      });
+      if (hint) this.notify(hint, "warning", 15_000);
+    }, 600);
+    timer.unref?.();
   }
 
   public stop(): void {
@@ -261,8 +285,8 @@ export class TuiRepl {
   }
 
   /** See {@link ChatPanel.notify}: transient hints above the editor. */
-  public notify(message: string, level: ToastLevel = "info"): void {
-    this.chat.notify(message, level);
+  public notify(message: string, level: ToastLevel = "info", ttlMs?: number): void {
+    this.chat.notify(message, level, ttlMs);
   }
 
   /** See {@link ChatPanel.appendMarkdown}. */
@@ -323,6 +347,12 @@ export class TuiRepl {
    * While a menu overlay is open it owns the keyboard (except Ctrl+C).
    */
   private handleGlobalInput(data: string): { consume: boolean } | undefined {
+    // Kitty 键盘协议（flag 2）会把一次按键拆成按下/释放两个事件，且
+    // matchesKey 对两者都返回同一个键位（释放事件长成 \x1b[<code>;3:3u）。
+    // 全局绑定若不过滤释放，按一次 ⌥S 会切到边栏又立刻切回来；双击 Esc
+    // 的中止判定也会被 Esc 的释放误触成立即中止。与 pi-tui 自身约定一致：
+    // 只响应按下，释放事件直接消费丢弃（长按重复仍照常处理）。
+    if (isKeyRelease(data)) return { consume: true };
     if (matchesKey(data, "ctrl+c")) {
       this.options.onExit();
       return { consume: true };

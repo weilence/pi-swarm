@@ -81,6 +81,12 @@ REPL 由 Pi 同源的 [pi-tui](node_modules/@earendil-works/pi-tui) 渲染（Mar
   `Esc` 返回输入框；`PageUp`/`PageDown`/`Home`/`End` 翻页跳转（pi-tui 内置）。
 - **`Alt+↑`/`Alt+↓` 循环切换 agent 标签**（右上角标签栏）。
 
+> macOS 提示：Option 键默认用于输入特殊字符（⌥T → "†"），Alt 组合键可能发不出来。
+> 程序启动时会自动检测（Kitty 键盘协议握手失败且在 macOS 上时）并用 toast 提示。
+> 修复方式：Terminal.app 勾选设置 → 描述文件 → 键盘 →「将 Option 键用作 Meta 键」；
+> iTerm2 把 Option 键设为 Esc+；Ghostty 配置 `macos-option-as-alt = true`；
+> 或改用支持 Kitty 键盘协议的终端（kitty/Ghostty/WezTerm/VS Code 1.109+）。
+
 会话是**草稿式懒创建**：启动不建会话，
 边栏显示「暂无会话」占位提示；「＋ 新建」（等同 `/new`）只打开一张**未保存草稿**
 （清空 transcript、边栏顶部出现「✎ 草稿」行，可先 /model /thinking 配置），

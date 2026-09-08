@@ -1131,6 +1131,22 @@ test("typing in panel modes falls straight back to the editor", () => {
   assert.equal(ui.focusTargets[ui.focusTargets.length - 1], editor);
 });
 
+test("kitty key-release events are consumed and never toggle global bindings", () => {
+  const { repl, ui } = makeRepl();
+  const lastFocus = () => ui.focusTargets[ui.focusTargets.length - 1];
+
+  // iTerm2 启用 Option-as-Esc+ 后，⌥S 以 Kitty 协议上报按下+释放两个事件。
+  assert.equal(press(ui, "\x1b[115;3:1u"), true, "alt+s press toggles to the sidebar");
+  assert.equal(lastFocus(), null, "press lands in sidebar mode");
+  assert.equal(press(ui, "\x1b[115;3:3u"), true, "release is consumed");
+  assert.equal(lastFocus(), null, "release must not toggle back to the editor");
+
+  // 释放事件也不得落到编辑器或面板路由（否则会误触回退/导航）。
+  const transcriptRelease = "\x1b[102;3:3u"; // alt+f release
+  assert.equal(press(ui, "\x1bt"), true); // → transcript
+  assert.equal(press(ui, transcriptRelease), true, "random release is consumed");
+});
+
 test("transcript browse mode scrolls the chat line by line", () => {
   const { repl, ui } = makeRepl();
   for (let i = 0; i < 50; i++) repl.appendLine(`第${i}行`);
