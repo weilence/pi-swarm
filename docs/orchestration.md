@@ -77,11 +77,14 @@ StepRecord { id, agent, goal, status: completed|failed|timeout, summary, changed
 | `src/core/task-run.ts` | TaskRun/StepRecord 类型、预算常量、dependencyLayers、错误分类、格式化 |
 | `src/core/tool-observation.ts` | 事件侧观察采集（纯函数，可独立测试） |
 | `src/core/supervisor.ts` | runner 注册表 + 单步执行 + 失败收容 + 事件发布 |
-| `src/pi/agent.ts` | 唯一的 `Agent` 类：会话生命周期、流式转发、timeout/abort/重试（runStep）、runTask 换入 TaskRun、配置持久化与 delegate 能力 |
+| `src/pi/agent.ts` | 唯一的 `Agent` 类（门面）：prompt 循环、timeout/abort/重试（runStep）、runTask 换入 TaskRun |
+| `src/pi/session-host.ts` | 会话生命周期、工具装配、事件扇出与流式闸门 |
+| `src/pi/model-settings.ts` | provider/model/thinking/容量偏好与持久化 |
 | `src/pi/delegate-tool.ts` | delegate 工具：校验→分层→并发池→观察汇总→预算执行 |
-| `src/pi/sub-agent.ts` | `createSubAgent`：按定义装配提示词、tools 允许名单、模型/thinking 拉取 |
-| `src/pi/supervisor-agent.ts` | `createSupervisorAgent`：协调者提示词（内置定义 + 花名册 + 准则）与 delegate 装配 |
-| `src/cli/commands.ts` | dispatchTask：busy 守卫、自动建会话、调 `runTask` |
+| `src/pi/agent-factory.ts` | 唯一的 `createAgent` 工厂：协调者（delegate 花名册 + 准则）与子 agent（身份行 + tools 允许名单 + 模型/thinking 拉取）都是能力组合 |
+| `src/core/session/session-flows.ts` | 会话用例核心：openDraft / switch（含指针回滚）/ delete（同位顶替）/ dispatchTask（草稿物化、touch 记账） |
+| `src/cli/commands.ts` | 命令注册表（唯一真相：元数据 + 分发 + 补全）与参数解析；会话用例经端口委托给 core 流程 |
+| `src/cli/output-router.ts` | agent 事件流 / 日志 / 提示的唯一输出出口（REPL 或 console 降级）+ 状态栏轮询 |
 | `src/cli/main.ts` | 装配：Supervisor + supervisor Agent 互相前向引用（stepExecutor 转发器） |
 
 测试：`tests/task-run.test.ts`、`tests/tool-observation.test.ts`、`tests/delegate-tool.test.ts`

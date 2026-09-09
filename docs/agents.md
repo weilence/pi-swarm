@@ -58,10 +58,12 @@ frontmatter 的 `tools:` 已生效：作为子 agent 会话的工具允许名单
 - `src/core/agent-format.ts` — 定义解析与校验（parser/validator）
 - `src/core/agent-registry.ts` — 双目录注册表（项目覆盖全局、损坏容错、list/get）、内置 supervisor 定义与覆盖
 - `src/core/task-run.ts` — StepRecord/TaskRun、预算护栏、依赖分层
-- `src/pi/agent.ts` — 唯一的 `Agent` 类：会话生命周期、流式转发、模型/thinking、runStep/runTask、配置持久化与 delegate 能力
+- `src/pi/agent.ts` — 唯一的 `Agent` 类（门面）：prompt 循环、runStep/runTask 执行语义、busy/abort 并发守卫、配置 API 与状态快照组装
+- `src/pi/session-host.ts` — 会话生命周期、工具装配（含内置 bash 的 rg 替身）、事件扇出与流式闸门
+- `src/pi/model-settings.ts` — provider/model/thinking/容量待生效偏好与持久化
+- `src/pi/stream-metrics.ts` — TTFT 与任务级平均速度观测器（仿 ToolObservationCollector 的事件消费模式）
+- `src/pi/agent-factory.ts` — 唯一的 `createAgent` 工厂：角色差异表达为能力组合（delegate 花名册 vs 工具允许名单）
 - `src/pi/delegate-tool.ts` — delegate 工具：校验、分层并行、观察汇总
-- `src/pi/supervisor-agent.ts` — `createSupervisorAgent`：协调者提示词装配（定义 + 花名册 + 准则）与 delegate 装配
-- `src/pi/sub-agent.ts` — `createSubAgent`：按定义装配提示词、工具允许名单与模型/thinking 拉取
 - `src/cli/main.ts` — 启动时加载 agent 注册表，按需懒创建子 agent
 - 示例：`.pi-swarm/agents/code-reviewer.md`、`.pi-swarm/agents/test-writer.md`、`.pi-swarm/agents/code-writer.md`
 - 测试：`tests/agent-format.test.ts`、`tests/agent-registry.test.ts`、`tests/delegate-tool.test.ts`、`tests/task-run.test.ts`

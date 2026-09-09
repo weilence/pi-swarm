@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { SessionManager as PiSessionManager } from "@earendil-works/pi-coding-agent";
 import { JsonFileSessionStore } from "../src/core/session/json-file-session-store.ts";
 import { InMemorySessionStore } from "../src/core/session/session-store.ts";
-import { DEFAULT_CLEANUP_TTL_MS, SessionManager } from "../src/core/session/session-manager.ts";
+import { DEFAULT_CLEANUP_TTL_MS, SessionRegistry } from "../src/core/session/session-registry.ts";
 import {
   SessionClosedError,
   SessionError,
@@ -46,7 +46,7 @@ interface OpenCall {
 }
 
 interface Harness {
-  manager: SessionManager;
+  manager: SessionRegistry;
   store: InMemorySessionStore;
   dir: string;
   sessionDir: string;
@@ -54,14 +54,14 @@ interface Harness {
   opened: OpenCall[];
 }
 
-/** A SessionManager over a temp dir + in-memory index, with an injected clock. */
+/** A SessionRegistry over a temp dir + in-memory index, with an injected clock. */
 async function makeHarness(options: { cleanupTtlMs?: number } = {}): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), "pi-swarm-session-"));
   const sessionDir = join(dir, "sessions");
   const store = new InMemorySessionStore();
   let clockMs = T0;
   const opened: OpenCall[] = [];
-  const manager = new SessionManager({
+  const manager = new SessionRegistry({
     cwd: dir,
     store,
     sessionDir,
@@ -92,7 +92,7 @@ async function makeHarness(options: { cleanupTtlMs?: number } = {}): Promise<Har
 test("constructor rejects a blank cwd", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-swarm-session-"));
   assert.throws(
-    () => new SessionManager({ cwd: "   ", store: new InMemorySessionStore(), sessionDir: join(dir, "sessions") }),
+    () => new SessionRegistry({ cwd: "   ", store: new InMemorySessionStore(), sessionDir: join(dir, "sessions") }),
     SessionError
   );
 });
@@ -110,7 +110,7 @@ test("initialize loads records but never resumes the current pointer", async () 
     seedRecord("closed-newer", { updatedAt: recordAt(-1 * DAY_MS), closedAt: recordAt(-1 * DAY_MS) }),
     seedRecord("active-new", { updatedAt: recordAt(-2 * DAY_MS) })
   ]);
-  const manager = new SessionManager({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
+  const manager = new SessionRegistry({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
   await manager.initialize();
   assert.equal(manager.current(), undefined, "startup has no current session; the first dispatch auto-creates one");
   const listed = (await manager.list()).map((summary) => summary.id);
@@ -120,7 +120,7 @@ test("initialize loads records but never resumes the current pointer", async () 
 test("initialize with only closed sessions leaves no current session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-swarm-session-"));
   const store = new InMemorySessionStore([seedRecord("closed", { closedAt: recordAt(-1) })]);
-  const manager = new SessionManager({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
+  const manager = new SessionRegistry({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
   await manager.initialize();
   assert.equal(manager.current(), undefined);
   assert.equal((await manager.list()).length, 1);
@@ -172,7 +172,7 @@ test("create returns defensive copies", async () => {
 test("create fails cleanly when the pi session cannot provide a usable id", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-swarm-session-"));
   const store = new InMemorySessionStore([seedRecord("existing")]);
-  const manager = new SessionManager({
+  const manager = new SessionRegistry({
     cwd: dir,
     store,
     sessionDir: join(dir, "sessions"),
@@ -255,7 +255,7 @@ test("bind re-creates an unflushed session with the same id and syncs the index 
   const dir = await mkdtemp(join(tmpdir(), "pi-swarm-session-"));
   const ghost = join(dir, "sessions", "ghost-path.jsonl");
   const store = new InMemorySessionStore([seedRecord("11111111-1111-4111-8111-111111111111", { sessionFile: ghost })]);
-  const manager = new SessionManager({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
+  const manager = new SessionRegistry({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
   await manager.initialize();
 
   const pi = await manager.bind("11111111-1111-4111-8111-111111111111");
@@ -427,7 +427,7 @@ test("initialize + cleanup remove only closed records past the ttl; active ones 
     seedRecord("ancient-active", { updatedAt: recordAt(-365 * DAY_MS) }),
     seedRecord("invalid-closedAt", { closedAt: "not-a-date", updatedAt: recordAt(-31 * DAY_MS) })
   ]);
-  const manager = new SessionManager({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
+  const manager = new SessionRegistry({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: () => new Date(T0) });
   await manager.initialize();
 
   const remaining = (await manager.list()).map((summary) => summary.id);
@@ -447,7 +447,7 @@ test("cleanup is disabled when the ttl is zero or negative", async () => {
     const store = new InMemorySessionStore([
       seedRecord(`ancient-${cleanupTtlMs}`, { closedAt: recordAt(-400 * DAY_MS), updatedAt: recordAt(-400 * DAY_MS) })
     ]);
-    const manager = new SessionManager({ cwd: dir, store, sessionDir: join(dir, "sessions"), cleanupTtlMs, now: () => new Date(T0) });
+    const manager = new SessionRegistry({ cwd: dir, store, sessionDir: join(dir, "sessions"), cleanupTtlMs, now: () => new Date(T0) });
     await manager.initialize();
     assert.ok(manager.get(`ancient-${cleanupTtlMs}`));
     assert.equal(await manager.cleanup(), 0);
@@ -484,7 +484,7 @@ test("sessions survive a restart through the json file store", async () => {
   const sessionDir = join(dir, "sessions");
   let clockMs = T0;
 
-  const first = new SessionManager({
+  const first = new SessionRegistry({
     cwd: dir,
     store: new JsonFileSessionStore(file),
     sessionDir,
@@ -496,7 +496,7 @@ test("sessions survive a restart through the json file store", async () => {
   await first.create({ name: "beta" });
   await first.close(alpha.id);
 
-  const second = new SessionManager({
+  const second = new SessionRegistry({
     cwd: dir,
     store: new JsonFileSessionStore(file),
     sessionDir,

@@ -15,7 +15,7 @@
 ## Future seams
 
 1. Use `PiSdkWorker` for credentialed runs; keep `MockPiWorker` for deterministic orchestration tests.
-2. Replace the in-memory `EventBus` with a durable store only when a real recovery requirement appears.
+2. `EventBus` is a plain pub-sub seam over task lifecycle events; swap in a durable store only when a real recovery requirement appears.
 3. Add a worktree manager before allowing real code changes.
 4. Add MCP tools for module-specific code search, tests, logs, and contracts.
 

@@ -21,7 +21,7 @@ export type PiSessionOpener = (
   cwdOverride?: string
 ) => PiSessionManager;
 
-export interface SessionManagerOptions {
+export interface SessionRegistryOptions {
   cwd: string;
   store: SessionStore;
   /** 会话 JSONL 目录；默认 <用户数据目录>/sessions。 */
@@ -45,7 +45,7 @@ export const DEFAULT_CLEANUP_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  * 管理元数据；实际把 AgentSession 绑定到某个会话文件由 supervisor agent
  * 的 rebind 流程完成（见 docs/session-design.md）。
  */
-export class SessionManager {
+export class SessionRegistry {
   private readonly cwd: string;
   private readonly store: SessionStore;
   private readonly sessionDir: string;
@@ -62,7 +62,7 @@ export class SessionManager {
   /** 串行化索引变更的互斥队列：并发 switch/create/close/touch 不会交错写。 */
   private tail: Promise<unknown> = Promise.resolve();
 
-  public constructor(options: SessionManagerOptions) {
+  public constructor(options: SessionRegistryOptions) {
     if (!options.cwd.trim()) throw new SessionError("cwd 不能为空");
     this.cwd = options.cwd;
     this.store = options.store;

@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDraftSession, deleteSessionById, executeCommand, switchToSessionId, type CommandServices } from "../src/cli/commands.ts";
-import { SessionManager } from "../src/core/session/session-manager.ts";
+import { SessionRegistry } from "../src/core/session/session-registry.ts";
 import { InMemorySessionStore, type SessionStore } from "../src/core/session/session-store.ts";
 import type { SessionRecord } from "../src/core/session/session-types.ts";
 
@@ -18,7 +18,7 @@ function makeClock() {
 
 async function makeSessions(store: SessionStore = new InMemorySessionStore(), clock = makeClock()) {
   const dir = await mkdtemp(join(tmpdir(), "pi-swarm-cmd-sessions-"));
-  const sessions = new SessionManager({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: clock.now });
+  const sessions = new SessionRegistry({ cwd: dir, store, sessionDir: join(dir, "sessions"), now: clock.now });
   await sessions.initialize();
   return { sessions, clock };
 }
@@ -46,7 +46,7 @@ function makeAgent(stub: AgentStub) {
 }
 
 function makeServices(
-  sessions: SessionManager,
+  sessions: SessionRegistry,
   agent?: CommandServices["agent"],
   repl?: CommandServices["repl"]
 ): CommandServices {
@@ -236,7 +236,7 @@ test("create leaves memory untouched when the store cannot persist", async () =>
     }
   })();
   const clock = makeClock();
-  const sessions = new SessionManager({ cwd: dir, store: failing, sessionDir: join(dir, "sessions"), now: clock.now });
+  const sessions = new SessionRegistry({ cwd: dir, store: failing, sessionDir: join(dir, "sessions"), now: clock.now });
   await sessions.initialize();
 
   await assert.rejects(() => sessions.materialize(), /disk full/);

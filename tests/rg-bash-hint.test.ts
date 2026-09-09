@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
-import { createRgBashToolOverride } from "../src/pi/agent.ts";
+import { createRgBashToolOverride } from "../src/pi/session-host.ts";
 
 test("bash tool override rewrites the description to forbid grep and mandate rg", () => {
   const cwd = process.cwd();

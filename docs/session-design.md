@@ -2,8 +2,8 @@
 
 ## 1. 现状与问题
 
-- supervisor agent（`src/pi/supervisor-agent.ts` 的 `createSupervisorAgent`）在 `ensureSession()` 中硬编码 `SessionManager.inMemory()`（Pi SDK），会话不落盘，进程退出即丢失。
-- 子 agent（`src/pi/sub-agent.ts` 的 `createSubAgent`）同样只用 in-memory 会话。
+- supervisor agent（`src/pi/agent-factory.ts` 的 `createAgent`）在 `ensureSession()` 中硬编码 `SessionManager.inMemory()`（Pi SDK），会话不落盘，进程退出即丢失。
+- 子 agent（同样经 `createAgent` 创建）也只用 in-memory 会话。
 - CLI（`src/cli/commands.ts`）只有 `/provider /model /thinking /apikey /status /exit`，没有多会话、列表、切换、恢复能力。
 - Pi SDK 本身已具备持久化会话能力：`SessionManager.create / open / continueRecent / list`（JSONL 文件），见 `node_modules/@earendil-works/pi-coding-agent/docs/sdk.md` 与 `session-format.md`。**缺的是 pi-swarm 自己的会话管理层**（元数据、当前指针、关闭状态、生命周期），以及把 supervisor agent 从 in-memory 切到持久化会话的注入点。
 
@@ -20,7 +20,7 @@
   - `session-types.ts` — 数据结构与错误类型
   - `session-store.ts` — 存储抽象接口
   - `json-file-session-store.ts` — JSON 文件实现（默认）
-  - `session-manager.ts` — pi-swarm 的 `SessionManager` 门面
+  - `session-registry.ts` — pi-swarm 的 `SessionRegistry` 门面
 - Pi SDK 的 `SessionManager` 在我们的代码中一律 `import { SessionManager as PiSessionManager }` 别名导入，避免同名冲突。
 
 ## 4. 数据结构（session-types.ts）
@@ -80,10 +80,10 @@ export interface SessionStore {
 - 会话正文持久化由 Pi SDK 负责：`PiSessionManager.create(cwd, sessionDir)` 写 JSONL；pi-swarm 的 `sessionDir = <userDataDir>/sessions/`，把所有项目的会话集中到用户数据目录，不污染 repo。
 - 测试实现 `InMemorySessionStore`（测试文件内定义即可，不必单独文件）。
 
-## 6. SessionManager 门面（session-manager.ts）
+## 6. SessionRegistry 门面（session-registry.ts）
 
 ```ts
-export interface SessionManagerOptions {
+export interface SessionRegistryOptions {
   cwd: string;
   store: SessionStore;
   /** 会话 JSONL 目录；默认 <userDataDir>/sessions。 */
@@ -94,7 +94,7 @@ export interface SessionManagerOptions {
   now?: () => Date;
 }
 
-export class SessionManager {
+export class SessionRegistry {
   /** 载入索引、执行过期清理、恢复 current 指针（索引中最新的 active 会话）。 */
   async initialize(): Promise<void>;
 
@@ -160,15 +160,15 @@ export class SessionManager {
 | `/delete <id\|序号>` | 删除会话（索引 + JSONL 文件）；删当前会话先解绑 agent，再打开侧栏同位会话（updatedAt 倒序：后一位顶替，末位取前一位），无其他活跃会话才落回草稿态；边栏 `d` 键的删除确认菜单共用此核心 | 同左 |
 
 - 约束：当前会话不存在（草稿、从未创建或已关闭）且用户直接输入任务时，`materialize()` 把草稿物化为新会话承接（无缝体验）：草稿名优先，否则用首条消息摘要命名。
-- 草稿态：`SessionManager.startDraft()/isDraft()/materialize()`；agent 侧由 `Agent.detach()` 解绑会话，模型/thinking 作为待生效配置保留在 agent 上，物化 rebind 后自动应用。
+- 草稿态：`SessionRegistry.startDraft()/isDraft()/materialize()`；agent 侧由 `Agent.detach()` 解绑会话，模型/thinking 作为待生效配置保留在 agent 上，物化 rebind 后自动应用。
 
 ## 8. 集成点（main.ts）
 
 ```
 const sessionStore = new JsonFileSessionStore();
-const sessionMgr = new SessionManager({ cwd: process.cwd(), store: sessionStore });
+const sessionMgr = new SessionRegistry({ cwd: process.cwd(), store: sessionStore });
 await sessionMgr.initialize();           // 载入索引 + 清理；不创建会话、不恢复指针
-const supervisorAgent = createSupervisorAgent({ ... });  // 不注入 sessionManager，首次派发时 rebind
+const supervisorAgent = createAgent({ definition: agentRegistry.supervisor, ... });  // 不注入 sessionManager，首次派发时 rebind
 sharedServices.sessions = sessionMgr;    // commands.ts 使用（dispatchTask 物化草稿）
 ```
 

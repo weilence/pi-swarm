@@ -10,6 +10,9 @@ export type { KnownApi };
 /** API types offered in the picker, derived from Pi's runtime api registry. */
 export const PI_API_TYPES: readonly KnownApi[] = getApiProviders().map((provider) => provider.api as KnownApi);
 
+/** models.dev 派生 provider 在 ModelRuntime 中的注册 id（未执行 /provider 前的默认值）。 */
+export const DEFAULT_PROVIDER_ID = "models-dev";
+
 interface ModelsDevReasoningOptionToggle {
   type: "toggle";
 }

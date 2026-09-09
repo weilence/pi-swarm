@@ -14,17 +14,17 @@ import {
 } from "../core/task-run.ts";
 import type { StepJob } from "../core/supervisor.ts";
 import { createDelegateTool, type DelegateState } from "./delegate-tool.ts";
-import { forwardAssistantEvent } from "./assistant-stream.ts";
-import { clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
-  createAgentSession,
-  createBashToolDefinition,
-  DefaultResourceLoader,
   ModelRuntime,
   SessionManager as PiSessionManager,
   type ToolDefinition
 } from "@earendil-works/pi-coding-agent";
+import { SessionHost } from "./session-host.ts";
+import { AgentEventEmitter, type AgentListener } from "./agent-events.ts";
+import { StreamMetrics } from "./stream-metrics.ts";
+import { maskKey, ModelSettings, type ProviderConfig } from "./model-settings.ts";
 
 /**
  * Structured status snapshot for the editor status bar (see StatusBar):
@@ -54,28 +54,21 @@ export interface AgentStatusSnapshot {
   busy?: boolean;
 }
 
-/** Stream sinks every agent forwards its session events to, labeled with the agent name. */
-export interface AgentStreamSinks {
-  /** Streams assistant text (the model's answer), labeled with the agent name. */
-  onText: (delta: string, agent: string) => void;
-  /** Streams reasoning/thinking deltas, labeled with the agent name. */
-  onThinking: (delta: string, agent: string) => void;
-  /** Called when a streaming response finishes (or fails) to flush UI tails. */
-  onStreamEnd: (agent: string) => void;
-  /** A tool call started in this agent's session (args as delivered). */
-  onToolStart: (toolCallId: string, toolName: string, args: unknown, agent: string) => void;
-  /** A tool call finished; isError marks failed calls. */
-  onToolEnd: (toolCallId: string, toolName: string, isError: boolean, agent: string) => void;
-}
+/**
+ * Stream sinks 每个 agent 的会话事件都通过 {@link Agent.on} 以 AgentEvent
+ * 形式发出（文本/思考流、工具生命周期、流结束）——消费者订阅事件而不是
+ * 穿透构造选项传回调。
+ */
 
 /**
  * Everything that distinguishes one agent from another is configuration: the
  * role lives in `systemPrompt`, capabilities arrive as optional groups
  * (delegate wiring, config persistence, tool allowlist, pulled model/thinking
- * defaults). There is no supervisor/sub-agent subclass split.
+ * defaults). There is no supervisor/sub-agent subclass split — see
+ * agent-factory.ts for the single createAgent entry.
  */
-export interface AgentOptions extends AgentStreamSinks {
-  /** UI 标签，也是流式回调收到的 agent 标注。 */
+export interface AgentOptions {
+  /** UI 标签，也是事件流里携带的 agent 标注。 */
   name: string;
   /** Shared Pi runtime; created lazily when omitted. */
   modelRuntime?: ModelRuntime;
@@ -85,7 +78,7 @@ export interface AgentOptions extends AgentStreamSinks {
   agentDir?: string;
   /** Role prompt: entries appended after the resource loader's base prompt. A function is rebuilt per session open. */
   systemPrompt?: string[] | (() => string[]);
-  /** Tool allowlist (a sub-agent's frontmatter tools); omitted means Pi's defaults. */
+  /** Tool allowlist (an agent's frontmatter tools); omitted means Pi's defaults. */
   tools?: string[];
   /** SDK custom tools beyond the delegate tool. */
   customTools?: ToolDefinition[];
@@ -93,9 +86,9 @@ export interface AgentOptions extends AgentStreamSinks {
   sessionManager?: PiSessionManager;
   /** Config persistence capability; without it the config API keeps in-memory state only. */
   configStore?: ConfigStore;
-  /** Pulled once per session creation when no explicit model was set (sub-agents follow the global default). */
+  /** Pulled once per session creation when no explicit model was set (agents follow the global default). */
   resolveModel?: () => string | undefined;
-  /** Pulled once per session creation when no explicit thinking level was set (sub-agents follow the supervisor). */
+  /** Pulled once per session creation when no explicit thinking level was set (agents follow the supervisor). */
   resolveThinkingLevel?: () => ModelThinkingLevel | undefined;
   /** Delegate capability: attaches the delegate tool and gives runTask its task budget. */
   delegate?: {
@@ -110,88 +103,63 @@ export interface AgentOptions extends AgentStreamSinks {
 }
 
 /**
- * 内置 bash 工具的替身：克隆 Pi 的定义，重写工具描述 —— 明确禁止 grep，
- * 要求一律用 rg（ripgrep）替代，并给出常用等价写法；另在系统提示
- * Guidelines 区追加一条同向的硬性规则强化约束。schema、执行逻辑与
- * 内置一致。同名 custom tool 在 createAgentSession 中按名字覆盖内置定义。
- */
-export function createRgBashToolOverride(cwd: string): ToolDefinition {
-  const base = createBashToolDefinition(cwd);
-  return {
-    ...base,
-    description: `${base.description}
-
-Search policy (mandatory): NEVER use grep, egrep, or fgrep. Use rg (ripgrep) for all text search:
-- Content search: rg -n "pattern" path  (flags: -i ignore case, -g glob, -C context, -uuu include ignored files)
-- List files: rg --files (pipe through a second rg to filter) instead of find -name
-- Count matches: rg -c or rg --count-matches
-
-grep is slower, ignores .gitignore, and noisier. Commands containing grep waste a turn — rewrite them with rg before submitting.`,
-    promptGuidelines: [
-      ...(base.promptGuidelines ?? []),
-      "Never run grep, egrep, or fgrep in bash commands. Use rg (ripgrep) for every content search; use rg --files instead of find -name."
-    ],
-    promptSnippet: base.promptSnippet?.replace("grep", "rg")
-  } as ToolDefinition;
-}
-
-/** The one model-backed agent: a lazily created Pi session, streaming event
- * forwarding, model/thinking management, delegate-step execution, and optional
- * config persistence — one class, roles differ by prompt and capabilities.
+ * The one model-backed agent — a thin facade over three cohesive parts:
+ * - SessionHost：会话生命周期、工具装配、事件扇出、流式闸门与回答缓冲；
+ * - ModelSettings：provider/model/thinking/容量偏好与持久化；
+ * - StreamMetrics：TTFT 与任务级平均速度观测。
+ * The facade itself owns the execution semantics（prompt 循环、runStep 重试、
+ * runTask 预算换装、abort/busy 并发守卫）和面向 UI 的状态快照组装。
  */
 export class Agent {
-  private session?: AgentSession;
-  private unsubscribe?: () => void;
-  private responseBuffer = "";
-  private streamToUi = true;
-  private snapshot: AgentConfigSnapshot = {};
+  private readonly events = new AgentEventEmitter();
+  private readonly host: SessionHost;
+  private readonly metrics: StreamMetrics;
+  private readonly settings: ModelSettings;
   private modelRuntime?: ModelRuntime;
-  private piSession?: PiSessionManager;
   /** Set while a prompt is streaming; rebind() rejects concurrent switches. */
   private prompting = false;
-  /** 流式中当前 assistant 消息的 running 输出 token（message_update 持续更新；
-   *  消息落盘后清零——那时会话统计已包含它，避免重复计数）。 */
-  private runningOutputTokens = 0;
-  private providerConfig?: Parameters<ModelRuntime["registerProvider"]>[1];
-  private providerId = "models-dev";
-  private requestedModel?: string;
-  private requestedThinkingLevel?: ModelThinkingLevel;
-  /** 手动上下文容量（token）：覆盖模型自带 contextWindow；undefined = 模型默认。 */
-  private contextWindowOverride?: number;
-  /** 任务级速度窗口：本轮 prompt 派发 → 首个流式输出 → 本轮结束。 */
-  private promptStartedAt?: number;
-  private firstOutputAt?: number;
-  /** 首字符时刻的累计输出 token 基线：窗口起点之前的产出不计入平均速度。 */
-  private outputAtFirst = 0;
-  private generationEndedAt?: number;
-  /** 定格的首字符响应时间：下一个任务的首字符到达前保持不变。 */
-  private lastTtftMs?: number;
-  /** 可注入时钟（测试用）；所有状态指标的计时都走这里。 */
-  private readonly clock: () => number;
   /** 用户主动请求停止（双击 Esc）：把中止当正常结束而非错误。 */
   private abortRequested = false;
-  private collector?: ToolObservationCollector;
   /** Holder the delegate tool reads; swapped per task in runTask(). */
   private readonly delegateState: DelegateState = {};
   private readonly cwd: string;
-  private readonly agentDir: string;
 
   public constructor(private readonly options: AgentOptions) {
-    this.clock = options.now ?? Date.now;
     this.cwd = options.cwd ?? process.cwd();
-    this.agentDir = options.agentDir ?? join(getUserDataDir(), "agents", options.name);
-    this.modelRuntime = options.modelRuntime;
-    this.piSession = options.sessionManager;
+    const agentDir = options.agentDir ?? join(getUserDataDir(), "agents", options.name);
+    this.metrics = new StreamMetrics(options.now ?? Date.now);
+    this.settings = new ModelSettings(options.configStore);
+    this.host = new SessionHost({
+      cwd: this.cwd,
+      agentDir,
+      systemPrompt: options.systemPrompt,
+      tools: options.tools,
+      customTools: () => this.customTools(),
+      sinks: {
+        onText: (delta) => this.events.emit({ type: "text", agent: options.name, delta }),
+        onThinking: (delta) => this.events.emit({ type: "thinking", agent: options.name, delta }),
+        onToolStart: (toolCallId, toolName, args) =>
+          this.events.emit({ type: "toolStart", agent: options.name, toolCallId, toolName, args }),
+        onToolEnd: (toolCallId, toolName, isError) =>
+          this.events.emit({ type: "toolEnd", agent: options.name, toolCallId, toolName, isError })
+      },
+      metrics: this.metrics
+    });
+  }
+
+  /** 订阅该 agent 的会话事件流（文本/思考、工具生命周期、流结束）；返回退订函数。 */
+  public on(listener: AgentListener): () => void {
+    return this.events.on(listener);
   }
 
   /** Current global default model (provider/model) as configured via /model. */
   public get currentModel(): string | undefined {
-    return this.requestedModel;
+    return this.settings.model;
   }
 
   /** Effective thinking level: the session's live value, else the pending preference. */
   public get currentThinkingLevel(): ModelThinkingLevel | undefined {
-    return this.session?.thinkingLevel ?? this.requestedThinkingLevel;
+    return this.host.session?.thinkingLevel ?? this.settings.thinkingLevel;
   }
 
   /**
@@ -200,9 +168,9 @@ export class Agent {
    * model preference when no session exists yet. Best-effort by design.
    */
   public get statusSnapshot(): AgentStatusSnapshot {
-    const session = this.session;
+    const session = this.host.session;
     const model = session?.model;
-    if (!session || !model) return { model: this.requestedModel, busy: this.prompting };
+    if (!session || !model) return { model: this.settings.model, busy: this.prompting };
     const stats = session.getSessionStats();
     const usage = stats.contextUsage;
     return {
@@ -212,31 +180,14 @@ export class Agent {
       contextWindow: usage?.contextWindow,
       contextPercent: usage?.percent ?? undefined,
       inputTokens: stats.tokens.input,
-      outputTokens: stats.tokens.output + this.runningOutputTokens,
+      outputTokens: stats.tokens.output + this.metrics.runningOutputTokens,
       cacheRead: stats.tokens.cacheRead,
       cacheWrite: stats.tokens.cacheWrite,
       cost: stats.cost,
-      ttftMs: this.lastTtftMs,
-      avgOutputSpeed: this.generationSpeed(),
+      ttftMs: this.metrics.ttftMs,
+      avgOutputSpeed: this.metrics.speed(stats.tokens.output),
       busy: this.prompting
     };
-  }
-
-  /**
-   * 任务级平均输出速度（tok/s）：时间窗从首个流式输出到本轮结束，分子是
-   * 窗口基线之后的累计输出 token。本轮首字符未到（firstOutputAt 早于本轮
-   * 派发时刻，仍是上一任务的旧窗口）时沿用在上一任务终点定格的值，不随新
-   * 任务的等待时间摊薄；首字符从未到达或窗长为零时 undefined。
-   */
-  private generationSpeed(): number | undefined {
-    if (this.firstOutputAt === undefined) return undefined;
-    const liveWindow = this.prompting && this.promptStartedAt !== undefined
-      && this.firstOutputAt >= this.promptStartedAt;
-    const end = liveWindow ? this.clock() : this.generationEndedAt ?? this.firstOutputAt;
-    const seconds = (end - this.firstOutputAt) / 1000;
-    if (seconds <= 0) return undefined;
-    const output = this.session?.getSessionStats().tokens.output ?? 0;
-    return Math.max(0, output + this.runningOutputTokens - this.outputAtFirst) / seconds;
   }
 
   /** Applies a previously persisted snapshot; returns a human-readable summary. */
@@ -248,7 +199,7 @@ export class Agent {
     } catch (error) {
       return `配置读取失败，使用默认配置：${error instanceof Error ? error.message : String(error)}`;
     }
-    this.snapshot = { ...saved };
+    this.settings.adopt(saved);
     const parts: string[] = [];
     try {
       if (saved.providerId && saved.providerConfig) {
@@ -267,11 +218,11 @@ export class Agent {
       }
       if (saved.thinkingLevel) {
         // Pending preference: validated and clamped against the model once the session opens.
-        this.requestedThinkingLevel = saved.thinkingLevel as ModelThinkingLevel;
+        this.settings.setThinkingLevel(saved.thinkingLevel as ModelThinkingLevel);
         parts.push(`thinking ${saved.thinkingLevel}`);
       }
       if (saved.contextWindow && saved.contextWindow > 0) {
-        this.contextWindowOverride = saved.contextWindow;
+        this.settings.setContextWindow(saved.contextWindow);
         parts.push(`上下文容量 ${saved.contextWindow}`);
       }
     } catch (error) {
@@ -281,85 +232,23 @@ export class Agent {
   }
 
   private async ensureSession(): Promise<AgentSession> {
-    if (this.session) return this.session;
-
+    const existing = this.host.session;
+    if (existing) return existing;
     this.modelRuntime ??= await ModelRuntime.create({ refreshOnCreate: false });
-    if (this.providerConfig) this.modelRuntime.registerProvider(this.providerId, this.providerConfig);
-    return await this.openSession(this.piSession ?? PiSessionManager.inMemory(this.cwd));
+    const config = this.settings.providerConfig;
+    if (config) this.modelRuntime.registerProvider(this.settings.providerId, config);
+    return await this.openSession(this.host.sessionManager ?? PiSessionManager.inMemory(this.cwd));
   }
 
   /**
-   * Releases the old AgentSession and binds the given Pi session as the
-   * current one; re-applies model/thinking afterwards (a failed model
-   * re-application does not block the switch — it stays pending).
+   * Opens a session on the host, then re-applies model/thinking afterwards
+   * (a failed model re-application does not block the switch — it stays
+   * pending, or Pi falls back to its default selection).
    */
   private async openSession(sessionManager: PiSessionManager): Promise<AgentSession> {
-    this.unsubscribe?.();
-    this.unsubscribe = undefined;
-    this.session?.dispose();
-    this.session = undefined;
-    const extras =
-      typeof this.options.systemPrompt === "function" ? this.options.systemPrompt() : this.options.systemPrompt ?? [];
-    const resourceLoader = new DefaultResourceLoader({
-      cwd: this.cwd,
-      agentDir: this.agentDir,
-      appendSystemPromptOverride: (base) => [...base, ...extras]
-    });
-    await resourceLoader.reload();
-    const { session } = await createAgentSession({
-      cwd: this.cwd,
-      resourceLoader,
-      sessionManager,
-      modelRuntime: this.modelRuntime!,
-      customTools: this.customTools(),
-      ...(this.options.tools && this.options.tools.length > 0 ? { tools: this.options.tools } : {})
-    });
-    this.session = session;
-    this.piSession = sessionManager;
-    this.unsubscribe = session.subscribe((event) => {
-      this.collector?.handle(event);
-      // 流式 usage：message_update 携带进行中消息的累计输出 token（Anthropic
-      // 每个 message_delta 更新一次，思考/正文都包含在 output_tokens 里），
-      // 供状态栏实时速度采样；会话统计只在消息落盘时更新，单靠它速度表
-      // 在整个生成期间都是 Δ=0。message_end 时统计已包含该消息，清零防重复。
-      if (event.type === "message_update" && event.message.role === "assistant") {
-        this.runningOutputTokens = event.message.usage?.output ?? this.runningOutputTokens;
-        // 本轮的首个流式输出事件＝首字符到达（firstOutputAt 早于本轮派发
-        // 时刻说明还是上一任务的旧窗口）：刷新 TTFT 定格值、重开速度窗口；
-        // 基线取此刻累计输出（含本消息已报的 usage，起始 token 不进平均）。
-        if (this.firstOutputAt === undefined
-          || (this.promptStartedAt !== undefined && this.firstOutputAt < this.promptStartedAt)) {
-          const at = this.clock();
-          this.lastTtftMs = this.promptStartedAt !== undefined ? at - this.promptStartedAt : undefined;
-          this.firstOutputAt = at;
-          this.outputAtFirst = (this.session?.getSessionStats().tokens.output ?? 0) + this.runningOutputTokens;
-          this.generationEndedAt = undefined;
-        }
-      } else if (event.type === "message_end" && event.message.role === "assistant") {
-        this.runningOutputTokens = 0;
-      } else if (event.type === "agent_end") {
-        this.runningOutputTokens = 0; // 中断等未走 message_end 的兑底
-      }
-      forwardAssistantEvent(event, {
-        appendText: (delta) => {
-          this.responseBuffer += delta;
-        },
-        onText: (delta) => {
-          if (this.streamToUi) this.options.onText(delta, this.options.name);
-        },
-        onThinking: (delta) => {
-          if (this.streamToUi) this.options.onThinking(delta, this.options.name);
-        },
-        onToolStart: (toolCallId, toolName, args) => {
-          if (this.streamToUi) this.options.onToolStart(toolCallId, toolName, args, this.options.name);
-        },
-        onToolEnd: (toolCallId, toolName, isError) => {
-          if (this.streamToUi) this.options.onToolEnd(toolCallId, toolName, isError, this.options.name);
-        }
-      });
-    });
+    const session = await this.host.open(sessionManager, this.modelRuntime!);
     try {
-      const model = this.requestedModel ?? this.options.resolveModel?.();
+      const model = this.settings.model ?? this.options.resolveModel?.();
       if (model) await this.applyModel(model);
     } catch {
       // The model may be unavailable after a provider switch: keep it pending
@@ -388,11 +277,7 @@ export class Agent {
    */
   public detach(): void {
     if (this.prompting) throw new SessionBusyError("会话正在输出，无法切换；请等待当前任务完成");
-    this.unsubscribe?.();
-    this.unsubscribe = undefined;
-    this.session?.dispose();
-    this.session = undefined;
-    this.piSession = undefined;
+    this.host.detach();
   }
 
   /** Whether a prompt is currently streaming (session switches are rejected). */
@@ -405,9 +290,9 @@ export class Agent {
    * 保留在会话与 UI 中；结束后 runTask 正常返回（不报错）。
    */
   public async abort(): Promise<void> {
-    if (!this.prompting || !this.session) return;
+    if (!this.prompting || !this.host.session) return;
     this.abortRequested = true;
-    await this.session.abort().catch(() => undefined);
+    await this.host.session.abort().catch(() => undefined);
   }
 
   /**
@@ -419,13 +304,13 @@ export class Agent {
    */
   private async promptModel(prompt: string, options: { stream?: boolean; timeoutMs?: number } = {}): Promise<string> {
     const session = await this.ensureSession();
-    const previous = this.streamToUi;
-    this.streamToUi = options.stream === true;
-    this.responseBuffer = "";
+    const previous = this.host.streaming;
+    this.host.setStreaming(options.stream === true);
+    this.host.resetOutput();
     this.prompting = true;
     // 新任务只刷新派发时刻；上一任务的指标保持定格展示，等本轮首字符到
-    // 达才刷新（事件里以 firstOutputAt < promptStartedAt 识别旧窗口）。
-    this.promptStartedAt = this.clock();
+    // 达才刷新（StreamMetrics 以 firstOutputAt < promptStartedAt 识别旧窗口）。
+    this.metrics.markPromptStart();
     const run = session.prompt(prompt);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = options.timeoutMs
@@ -438,14 +323,12 @@ export class Agent {
       : undefined;
     try {
       await (timeout ? Promise.race([run, timeout]) : run);
-      const text = this.responseBuffer.trim();
-      this.responseBuffer = "";
-      return text;
+      return this.host.takeOutput().trim();
     } catch (error) {
       if (this.abortRequested) {
         // 用户主动停止：不算错误，返回已生成的部分文本。
         this.abortRequested = false;
-        return this.responseBuffer.trim();
+        return this.host.takeOutput().trim();
       }
       if (error instanceof StepTimeoutError) {
         await session.abort().catch(() => undefined);
@@ -456,10 +339,10 @@ export class Agent {
       clearTimeout(timer);
       this.prompting = false;
       // 定格窗口终点：最终平均速度随流结束后的最后一次快照推送展示。
-      this.generationEndedAt = this.clock();
+      this.metrics.markPromptEnd();
       this.abortRequested = false;
-      this.streamToUi = previous;
-      this.options.onStreamEnd(this.options.name);
+      this.host.setStreaming(previous);
+      this.events.emit({ type: "streamEnd", agent: this.options.name });
     }
   }
 
@@ -478,7 +361,7 @@ export class Agent {
         const prompt = attempt === 0
           ? `Step ${step.id}: ${step.goal}\nWhen done, summarize what you changed, tests, and risks.`
           : `Step ${step.id}（重试）：${step.goal}\n\n上一次尝试未完成：${describeError(lastError)}\n请修正问题并完成该步骤，完成后总结改动、测试与风险。`;
-        this.collector = new ToolObservationCollector();
+        this.host.setObserver(new ToolObservationCollector());
         await this.promptModel(prompt, { stream: true, timeoutMs });
         return this.completeRecord(step);
       } catch (error) {
@@ -497,13 +380,13 @@ export class Agent {
   /** Builds a record from the session's current observation and final text. */
   private completeRecord(step: { id: string; goal: string }): StepRecord {
     const observation: ToolObservation =
-      this.collector?.observation ?? { toolCalls: 0, errors: [], changedFiles: [] };
+      this.host.observer?.observation ?? { toolCalls: 0, errors: [], changedFiles: [] };
     return {
       id: step.id,
       agent: this.options.name,
       goal: step.goal,
       status: "completed",
-      summary: this.session?.getLastAssistantText() ?? "",
+      summary: this.host.session?.getLastAssistantText() ?? "",
       changedFiles: observation.changedFiles,
       toolCalls: observation.toolCalls,
       error: observation.errors.length > 0 ? observation.errors.join("；") : undefined
@@ -525,15 +408,9 @@ export class Agent {
     }
   }
 
-  /** The delegate tool when the delegate capability is wired and agents exist. */
+  /** SDK custom tools: the delegate tool when the delegate capability is wired and agents exist. */
   private customTools(): ToolDefinition[] {
     const tools = [...(this.options.customTools ?? [])];
-    // 内置 bash 描述不约束搜索工具，模型偶尔仍会用 grep：换成明确禁用
-    // grep、强制 rg 的同名替身（custom tool 在 createAgentSession 中按名字
-    // 覆盖内置定义）。调用方显式传入的 bash 工具优先，此时不注入。
-    if (!tools.some((tool) => tool.name === "bash")) {
-      tools.unshift(createRgBashToolOverride(this.cwd));
-    }
     if (this.delegateAvailable()) tools.push(createDelegateTool(this.delegateServices(), this.delegateState));
     return tools;
   }
@@ -552,23 +429,23 @@ export class Agent {
   }
 
   public async configureProvider(providerId: string, config: unknown, modelId?: string): Promise<string> {
-    this.providerId = providerId;
-    this.providerConfig = config as Parameters<ModelRuntime["registerProvider"]>[1];
+    const typed = config as ProviderConfig;
+    this.settings.setProvider(providerId, typed);
     // Switching providers invalidates a model selected for the previous one.
-    if (this.requestedModel && !this.requestedModel.startsWith(`${providerId}/`)) {
-      this.requestedModel = undefined;
-    }
+    this.settings.invalidateForeignModel(providerId);
     const specifier = modelId ? `${providerId}/${modelId}` : undefined;
-    if (specifier) this.requestedModel = specifier;
+    if (specifier) this.settings.setModel(specifier);
     if (this.modelRuntime) {
-      this.modelRuntime.registerProvider(providerId, this.providerConfig);
-      if (specifier && this.session) await this.applyModel(specifier);
+      this.modelRuntime.registerProvider(providerId, typed);
+      if (specifier && this.host.session) await this.applyModel(specifier);
     }
     const update: Partial<AgentConfigSnapshot> = { providerId, providerConfig: config };
     if (specifier) update.model = specifier;
-    else if (this.snapshot.model && !this.snapshot.model.startsWith(`${providerId}/`)) update.model = undefined;
-    await this.persist(update);
-    return `provider 已配置，接口：${this.providerConfig.api ?? "默认"}${modelId ? `；模型：${modelId}` : ""}`;
+    else if (this.settings.saved.model && !this.settings.saved.model.startsWith(`${providerId}/`)) {
+      update.model = undefined;
+    }
+    await this.settings.persist(update);
+    return `provider 已配置，接口：${typed.api ?? "默认"}${modelId ? `；模型：${modelId}` : ""}`;
   }
 
   /**
@@ -578,49 +455,45 @@ export class Agent {
   public async setApiKey(key: string): Promise<string> {
     const trimmed = key.trim();
     if (!trimmed) throw new Error("API key 不能为空；如需改用环境变量，请重新执行 /provider");
-    if (!this.providerConfig) throw new Error("请先使用 /provider 选择 provider");
-    this.providerConfig = { ...this.providerConfig, apiKey: trimmed };
+    if (!this.settings.providerConfig) throw new Error("请先使用 /provider 选择 provider");
+    this.settings.setProvider(this.settings.providerId, { ...this.settings.providerConfig, apiKey: trimmed });
     if (this.modelRuntime) {
-      this.modelRuntime.registerProvider(this.providerId, this.providerConfig);
-      if (this.session && this.requestedModel) await this.applyModel(this.requestedModel);
+      this.modelRuntime.registerProvider(this.settings.providerId, this.settings.providerConfig);
+      if (this.host.session && this.settings.model) await this.applyModel(this.settings.model);
     }
-    await this.persist({ apiKey: trimmed });
+    await this.settings.persist({ apiKey: trimmed });
     return `API key 已配置并持久化（${maskKey(trimmed)}）`;
   }
 
   public async setModel(specifier: string): Promise<string> {
     const message = await this.applyModel(specifier.trim());
-    await this.persist({ model: specifier.trim() });
+    await this.settings.persist({ model: specifier.trim() });
     return message;
   }
 
   private async applyModel(specifier: string): Promise<string> {
-    if (!this.session) {
-      this.requestedModel = specifier;
+    if (!this.host.session) {
+      this.settings.setModel(specifier);
       return `模型将在会话建立后切换为 ${specifier}`;
     }
-    const separator = specifier.indexOf("/");
-    if (separator <= 0 || separator === specifier.length - 1) {
-      throw new Error("模型格式应为 provider/model，例如 openai/gpt-4o");
-    }
-    const provider = specifier.slice(0, separator);
-    const modelId = specifier.slice(separator + 1);
-    const model = this.modelRuntime!.getModel(provider, modelId);
+    const split = ModelSettings.splitSpecifier(specifier);
+    if (!split) throw new Error("模型格式应为 provider/model，例如 openai/gpt-4o");
+    const model = this.modelRuntime!.getModel(split.provider, split.modelId);
     if (!model) throw new Error(`找不到模型：${specifier}`);
-    await this.session.setModel(this.patchContextWindow(model));
-    this.requestedModel = specifier;
+    await this.host.session.setModel(this.settings.patchModel(model));
+    this.settings.setModel(specifier);
     return `当前模型：${specifier}`;
   }
 
   /**
-   * 手动设置上下文容量（token）：克隆模型定义改写 contextWindow，Pi 的自动
-   * 压缩阈值与用量百分比都按新容量计算（如给 1M 模型设 200k）。undefined
-   * 恢复模型默认。
+   * 手动设置上下文容量（token）：覆盖模型自带 contextWindow，Pi 的自动压缩
+   * 阈值与用量百分比都按新容量计算（如给 1M 模型设 200k）。undefined 恢复
+   * 模型默认。
    */
   public async setContextWindow(tokens?: number): Promise<string> {
-    this.contextWindowOverride = tokens && tokens > 0 ? tokens : undefined;
-    await this.persist({ contextWindow: this.contextWindowOverride });
-    const model = this.session?.model;
+    this.settings.setContextWindow(tokens);
+    await this.settings.persist({ contextWindow: this.settings.contextWindow });
+    const model = this.host.session?.model;
     if (model) {
       try {
         await this.applyModel(`${model.provider}/${model.id}`);
@@ -628,8 +501,8 @@ export class Agent {
         // 模型重应用失败：覆盖保持待生效，下次会话打开时生效。
       }
     }
-    return this.contextWindowOverride
-      ? `上下文容量已设为 ${this.contextWindowOverride} tokens${model ? `（模型上限 ${model.contextWindow}）` : ""}；自动压缩按新容量触发`
+    return this.settings.contextWindow
+      ? `上下文容量已设为 ${this.settings.contextWindow} tokens${model ? `（模型上限 ${model.contextWindow}）` : ""}；自动压缩按新容量触发`
       : "上下文容量已恢复为模型默认";
   }
 
@@ -639,50 +512,35 @@ export class Agent {
    * 没有可压缩的内容。
    */
   public async compact(customInstructions?: string): Promise<string> {
-    if (!this.session) throw new Error("会话尚未建立（草稿态），没有可压缩的上下文");
-    const result = await this.session.compact(customInstructions);
+    const session = this.host.session;
+    if (!session) throw new Error("会话尚未建立（草稿态），没有可压缩的上下文");
+    const result = await session.compact(customInstructions);
     const after = result.estimatedTokensAfter !== undefined ? `，压缩后约 ${result.estimatedTokensAfter} tokens` : "";
     return `已压缩上下文：${result.tokensBefore} tokens${after}；摘要 ${[...result.summary].length} 字`;
   }
 
-  /** 手动容量覆盖模型的 contextWindow（仅数据克隆，不修改共享模型表）。 */
-  private patchContextWindow<M extends { contextWindow: number }>(model: M): M {
-    return this.contextWindowOverride ? { ...model, contextWindow: this.contextWindowOverride } : model;
-  }
-
   /** Thinking levels the current model supports (ascending); before a session exists, resolved from the pending model preference. */
   public thinkingLevels(): string[] {
-    const model = this.session?.model ?? this.requestedModelInstance();
+    const model = this.host.session?.model
+      ?? this.settings.requestedModelInstance((provider, modelId) => this.modelRuntime?.getModel(provider, modelId));
     return model ? [...getSupportedThinkingLevels(model)] : [];
-  }
-
-  /** Resolves the pending model preference against the runtime; undefined when unset or unknown. */
-  private requestedModelInstance(): ReturnType<ModelRuntime["getModel"]> | undefined {
-    const specifier = this.requestedModel;
-    if (!specifier || !this.modelRuntime) return undefined;
-    const separator = specifier.indexOf("/");
-    if (separator <= 0 || separator === specifier.length - 1) return undefined;
-    return this.modelRuntime.getModel(specifier.slice(0, separator), specifier.slice(separator + 1));
   }
 
   public async setThinkingLevel(level: string): Promise<string> {
     const message = this.applyThinkingLevel(level);
-    await this.persist({ thinkingLevel: this.requestedThinkingLevel });
+    await this.settings.persist({ thinkingLevel: this.settings.thinkingLevel });
     return message;
   }
 
   private applyThinkingLevel(level: string): string {
     // 草稿态（无会话）也允许设置：按待生效的模型校验，会话建立后自动应用。
-    const model = this.session?.model ?? this.requestedModelInstance();
+    const model = this.host.session?.model
+      ?? this.settings.requestedModelInstance((provider, modelId) => this.modelRuntime?.getModel(provider, modelId));
     if (!model) throw new Error("请先使用 /model 选择模型；thinking level 由当前模型决定");
-    const normalized = level.trim().toLowerCase() as ModelThinkingLevel;
-    const supported = getSupportedThinkingLevels(model);
-    if (!supported.includes(normalized)) {
-      throw new Error(`当前模型支持的 thinking level：${supported.join(", ")}`);
-    }
-    this.session?.setThinkingLevel(normalized);
-    this.requestedThinkingLevel = normalized;
-    return this.session
+    const normalized = this.settings.validateThinkingLevel(level, model);
+    this.host.session?.setThinkingLevel(normalized);
+    this.settings.setThinkingLevel(normalized);
+    return this.host.session
       ? `当前 thinking level：${normalized}`
       : `thinking level 将在会话建立后应用：${normalized}`;
   }
@@ -694,55 +552,35 @@ export class Agent {
    * supported level. A no-op until the model resolves.
    */
   private applyThinkingDefaults(): void {
-    const session = this.session;
+    const session = this.host.session;
     const model = session?.model;
     if (!session || !model) return;
-    const requested = this.requestedThinkingLevel ?? this.options.resolveThinkingLevel?.();
-    const supported = getSupportedThinkingLevels(model);
-    const level = requested ? clampThinkingLevel(model, requested) : supported[supported.length - 1];
+    const level = this.settings.resolveThinkingDefault(model, this.options.resolveThinkingLevel?.());
     session.setThinkingLevel(level);
-    this.requestedThinkingLevel = level;
+    this.settings.setThinkingLevel(level);
   }
 
   public status(): string {
-    const session = this.session;
+    const session = this.host.session;
     const model = session?.model;
     if (session && model) {
       return `模型：${model.provider}/${model.id}；thinking：${session.thinkingLevel}`;
     }
+    const saved = this.settings.saved;
     const pending = [
-      this.snapshot.providerId && `provider ${this.snapshot.providerId}`,
-      this.requestedModel && `模型 ${this.requestedModel}`,
-      this.snapshot.apiKey && `API key ${maskKey(this.snapshot.apiKey)}`,
-      this.requestedThinkingLevel && `thinking ${this.requestedThinkingLevel}`
+      saved.providerId && `provider ${saved.providerId}`,
+      this.settings.model && `模型 ${this.settings.model}`,
+      saved.apiKey && `API key ${maskKey(saved.apiKey)}`,
+      this.settings.thinkingLevel && `thinking ${this.settings.thinkingLevel}`
     ].filter(Boolean);
     return pending.length > 0
       ? `配置已就绪（${pending.join("，")}），会话尚未建立`
       : "会话尚未建立，未配置模型";
   }
 
-  private async persist(update: Partial<AgentConfigSnapshot>): Promise<void> {
-    if (!this.options.configStore) return;
-    this.snapshot = { ...this.snapshot, ...update };
-    await this.options.configStore.save(this.snapshot);
-  }
-
   public async close(): Promise<void> {
-    this.unsubscribe?.();
-    this.unsubscribe = undefined;
-    this.session?.dispose();
-    this.session = undefined;
-    this.piSession = undefined;
-    this.responseBuffer = "";
+    this.host.close();
     this.modelRuntime = undefined;
-    this.providerConfig = undefined;
-    this.providerId = "models-dev";
-    this.requestedModel = undefined;
-    this.requestedThinkingLevel = undefined;
+    this.settings.reset();
   }
-}
-
-/** Masks a key for logs and status lines: keeps a short head and tail. */
-function maskKey(key: string): string {
-  return key.length <= 8 ? "***" : `${key.slice(0, 3)}...${key.slice(-4)}`;
 }

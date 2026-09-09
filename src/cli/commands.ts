@@ -1,6 +1,13 @@
 import type { AgentDefinition } from "../core/agent-format.ts";
-import type { SessionManager } from "../core/session/session-manager.ts";
-import { SessionBusyError, SessionClosedError, SessionNotFoundError } from "../core/session/session-types.ts";
+import type { SessionRegistry } from "../core/session/session-registry.ts";
+import {
+  deleteSessionById as flowDeleteSessionById,
+  dispatchTask as flowDispatchTask,
+  openDraftSession as flowOpenDraftSession,
+  sessionCommandError,
+  switchToSessionId as flowSwitchToSessionId,
+  type SessionFlowPorts
+} from "../core/session/session-flows.ts";
 import type { TuiRepl } from "./tui-repl.ts";
 import type { AgentStatusSnapshot } from "../pi/agent.ts";
 import type { ToastLevel } from "./components.ts";
@@ -76,7 +83,7 @@ export interface CommandServices {
   /** User-created agents available for delegation. */
   agents?: { list(): AgentDefinition[] };
   /** 会话管理；提供后启用 /new /sessions /switch /close。 */
-  sessions?: SessionManager;
+  sessions?: SessionRegistry;
 }
 
 export interface CommandState {
@@ -104,118 +111,109 @@ function staticArgCompletions(items: readonly AutocompleteItem[]): (prefix: stri
 }
 
 /**
- * 斜杠命令索引：编辑器补全提示（SlashAutocompleteProvider）的数据源，
- * 须与下方 executeCommand 的分发保持同步（含别名）。argumentHint 仅用于
- * 提示列展示；参数可枚举的命令可声明 getArgumentCompletions（如 /context）。
+ * 命令注册表：名称、别名、描述、参数提示、补全与处理器的唯一真相。
+ * SLASH_COMMANDS（编辑器补全提示的数据源）由它派生，分发由 executeCommand
+ * 查表完成——不再存在「补全列表与分发 if 链」两份需要人工同步的真相。
+ * argumentHint 仅用于提示列展示；参数可枚举的命令声明 getArgumentCompletions。
  */
-export const SLASH_COMMANDS: readonly SlashCommand[] = [
-  { name: "exit", description: "退出 pi-swarm" },
-  { name: "quit", description: "退出（/exit 别名）" },
-  { name: "status", description: "查看 supervisor / 会话 / 子 agent 状态" },
-  { name: "provider", argumentHint: "[id] [api]", description: "选择模型 provider 与接口类型" },
-  { name: "model", argumentHint: "[provider/]model", description: "切换模型" },
-  { name: "thinking", argumentHint: "[level]", description: "调整思考深度（thinking level）" },
-  { name: "apikey", argumentHint: "<key>", description: "设置 API key（明文存于 config.json）" },
+interface CommandEntry {
+  name: string;
+  aliases?: readonly string[];
+  description: string;
+  argumentHint?: string;
+  getArgumentCompletions?: (prefix: string) => AutocompleteItem[];
+  /** 处理器：args 是命令名之后的剩余文本（已 trim；空串表示无参数）。 */
+  handle: (args: string, services: CommandServices, state: CommandState) => Promise<CommandOutcome | void>;
+}
+
+const COMMANDS: readonly CommandEntry[] = [
+  { name: "exit", aliases: ["quit"], description: "退出 pi-swarm", handle: async () => "exit" },
+  { name: "status", description: "查看 supervisor / 会话 / 子 agent 状态", handle: (_args, services) => commandStatus(services) },
+  {
+    name: "provider",
+    argumentHint: "[id] [api]",
+    description: "选择模型 provider 与接口类型",
+    handle: (args, services, state) => {
+      const [providerId, apiName] = args.split(/\s+/, 2);
+      return commandProvider(providerId || undefined, apiName || undefined, services, state);
+    }
+  },
+  { name: "model", argumentHint: "[provider/]model", description: "切换模型", handle: (args, services, state) => commandModel(args || undefined, services, state) },
+  { name: "thinking", argumentHint: "[level]", description: "调整思考深度（thinking level）", handle: (args, services) => commandThinking(args || undefined, services) },
+  { name: "apikey", argumentHint: "<key>", description: "设置 API key（明文存于 config.json）", handle: (args, services, state) => commandApiKey(args || undefined, services, state) },
   {
     name: "context",
     argumentHint: "<tokens|reset>",
     description: "查看/设置上下文容量",
-    getArgumentCompletions: staticArgCompletions([{ value: "reset", label: "reset", description: "恢复模型默认容量" }])
+    getArgumentCompletions: staticArgCompletions([{ value: "reset", label: "reset", description: "恢复模型默认容量" }]),
+    handle: (args, services) => commandContext(args, services)
   },
-  { name: "compact", argumentHint: "[侧重点]", description: "手动压缩上下文" },
-  { name: "new", argumentHint: "[名称]", description: "新建会话（草稿，首次发送时创建）" },
-  { name: "sessions", description: "列出全部会话" },
-  { name: "ls", description: "列出全部会话（/sessions 别名）" },
+  { name: "compact", argumentHint: "[侧重点]", description: "手动压缩上下文", handle: (args, services) => commandCompact(args, services) },
+  { name: "new", argumentHint: "[名称]", description: "新建会话（草稿，首次发送时创建）", handle: (args, services) => commandNew(args, services) },
+  { name: "sessions", aliases: ["ls"], description: "列出全部会话", handle: (_args, services) => commandSessions(services) },
   {
     name: "switch",
     argumentHint: "<id|序号|draft>",
     description: "切换会话",
-    getArgumentCompletions: staticArgCompletions([{ value: "draft", label: "draft", description: "切到未保存草稿（等同 ＋ 新建）" }])
+    getArgumentCompletions: staticArgCompletions([{ value: "draft", label: "draft", description: "切到未保存草稿（等同 ＋ 新建）" }]),
+    handle: (args, services) => commandSwitch(args, services)
   },
-  { name: "close", argumentHint: "[id|序号]", description: "关闭会话" },
-  { name: "delete", argumentHint: "<id|序号>", description: "删除会话（含记录文件）" }
+  { name: "close", argumentHint: "[id|序号]", description: "关闭会话", handle: (args, services) => commandClose(args, services) },
+  { name: "delete", argumentHint: "<id|序号>", description: "删除会话（含记录文件）", handle: (args, services) => commandDelete(args, services) }
 ];
+
+/**
+ * 编辑器补全提示（SlashAutocompleteProvider）的数据源：从命令注册表派生，
+ * 主命令与别名各占一项（别名描述标注来源命令），顺序即注册表顺序。
+ */
+export const SLASH_COMMANDS: readonly SlashCommand[] = COMMANDS.flatMap((entry) =>
+  [entry.name, ...(entry.aliases ?? [])].map((name) => ({
+    name,
+    description: name === entry.name ? entry.description : `${entry.description}（/${entry.name} 别名）`,
+    ...(entry.argumentHint ? { argumentHint: entry.argumentHint } : {}),
+    ...(entry.getArgumentCompletions ? { getArgumentCompletions: entry.getArgumentCompletions } : {})
+  }))
+);
 
 export async function executeCommand(line: string, services: CommandServices, state: CommandState): Promise<CommandOutcome> {
   const goal = line.trim();
   if (!goal) return "continue";
-  if (goal === "/exit" || goal === "/quit") return "exit";
-  if (goal === "/status") {
-    services.log(`[主 agent] supervisor：${services.agent?.status?.() ?? "状态不可用"}`);
-    if (services.sessions) {
-      const draft = services.sessions.isDraft();
-      const currentSession = services.sessions.current();
-      services.log(
-        draft
-          ? "[主 agent] 当前会话：草稿（未保存；首次发送时创建）"
-          : currentSession
-            ? `[主 agent] 当前会话：${currentSession.name ?? currentSession.id}（${currentSession.id}）`
-            : "[主 agent] 当前会话：无（输入任务将自动创建）"
-      );
-    }
-    const agents = services.agents?.list() ?? [];
+  if (!goal.startsWith("/")) {
+    await dispatchTask(goal, services, state);
+    return "continue";
+  }
+  const name = goal.slice(1).split(/\s+/, 1)[0].toLowerCase();
+  const entry = COMMANDS.find((candidate) => candidate.name === name || candidate.aliases?.includes(name));
+  if (!entry) {
+    // 未识别的斜杠输入按任务文本派发（与历史行为一致：supervisor 自行解读）。
+    await dispatchTask(goal, services, state);
+    return "continue";
+  }
+  const args = goal.slice(1 + name.length).trim();
+  const outcome = await entry.handle(args, services, state);
+  return outcome === "exit" ? "exit" : "continue";
+}
+
+/** /status：supervisor / 当前会话 / 子 agent 三段状态。 */
+async function commandStatus(services: CommandServices): Promise<void> {
+  services.log(`[主 agent] supervisor：${services.agent?.status?.() ?? "状态不可用"}`);
+  if (services.sessions) {
+    const draft = services.sessions.isDraft();
+    const currentSession = services.sessions.current();
     services.log(
-      agents.length > 0
-        ? `[主 agent] 已加载 agents：${agents.map((agent) => agent.name).join(", ")}`
-        : "[主 agent] 未加载任何子 agent，所有任务由 supervisor 自执行。"
+      draft
+        ? "[主 agent] 当前会话：草稿（未保存；首次发送时创建）"
+        : currentSession
+          ? `[主 agent] 当前会话：${currentSession.name ?? currentSession.id}（${currentSession.id}）`
+          : "[主 agent] 当前会话：无（输入任务将自动创建）"
     );
-    return "continue";
   }
-  if (goal === "/provider" || goal.startsWith("/provider ")) {
-    const [, providerId, apiName] = goal.split(/\s+/, 3);
-    await commandProvider(providerId, apiName, services, state);
-    return "continue";
-  }
-  if (goal === "/model") {
-    await commandModel(undefined, services, state);
-    return "continue";
-  }
-  if (goal.startsWith("/model ")) {
-    await commandModel(goal.slice("/model ".length).trim(), services, state);
-    return "continue";
-  }
-  if (goal === "/thinking") {
-    await commandThinking(undefined, services);
-    return "continue";
-  }
-  if (goal.startsWith("/thinking ")) {
-    await commandThinking(goal.slice("/thinking ".length), services);
-    return "continue";
-  }
-  if (goal === "/apikey" || goal.startsWith("/apikey ")) {
-    await commandApiKey(goal.slice("/apikey".length).trim(), services, state);
-    return "continue";
-  }
-  if (goal === "/context" || goal.startsWith("/context ")) {
-    await commandContext(goal.slice("/context".length).trim(), services);
-    return "continue";
-  }
-  if (goal === "/compact" || goal.startsWith("/compact ")) {
-    await commandCompact(goal.slice("/compact".length).trim(), services);
-    return "continue";
-  }
-  if (goal === "/new" || goal.startsWith("/new ")) {
-    await commandNew(goal.slice("/new".length).trim(), services);
-    return "continue";
-  }
-  if (goal === "/sessions" || goal === "/ls") {
-    await commandSessions(services);
-    return "continue";
-  }
-  if (goal === "/switch" || goal.startsWith("/switch ")) {
-    await commandSwitch(goal.slice("/switch".length).trim(), services);
-    return "continue";
-  }
-  if (goal === "/close" || goal.startsWith("/close ")) {
-    await commandClose(goal.slice("/close".length).trim(), services);
-    return "continue";
-  }
-  if (goal === "/delete" || goal.startsWith("/delete ")) {
-    await commandDelete(goal.slice("/delete".length).trim(), services);
-    return "continue";
-  }
-  await dispatchTask(goal, services, state);
-  return "continue";
+  const agents = services.agents?.list() ?? [];
+  services.log(
+    agents.length > 0
+      ? `[主 agent] 已加载 agents：${agents.map((agent) => agent.name).join(", ")}`
+      : "[主 agent] 未加载任何子 agent，所有任务由 supervisor 自执行。"
+  );
 }
 
 async function commandProvider(
@@ -501,7 +499,7 @@ async function commandThinking(level: string | undefined, services: CommandServi
 /** 解析 <id|序号> 引用：先按 id 精确匹配，再按 /sessions 的 1 基序号。 */
 async function resolveSessionRef(
   ref: string,
-  sessions: SessionManager
+  sessions: SessionRegistry
 ): Promise<{ id: string; name?: string } | undefined> {
   const direct = sessions.get(ref);
   if (direct) return direct;
@@ -514,48 +512,27 @@ async function resolveSessionRef(
   return undefined;
 }
 
-function sessionCommandError(error: unknown): string {
-  if (error instanceof SessionBusyError) return error.message;
-  if (error instanceof SessionClosedError) return error.message;
-  if (error instanceof SessionNotFoundError) return error.message;
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** 无显式草稿名时，用首条消息摘要作为会话名（压平空白，截到 24 字）。 */
-function goalSessionName(goal: string): string | undefined {
-  const text = goal.replace(/\s+/g, " ").trim();
-  if (!text) return undefined;
-  const chars = Array.from(text);
-  const clipped = chars.slice(0, 24).join("");
-  return chars.length > 24 ? `${clipped}…` : clipped;
-}
-
 /**
- * 新建会话统一入口（/new 与会话栏「＋」共用）：只开草稿，不创建任何记录。
- * 清空 transcript、解绑 agent 会话；模型/thinking 等待生效配置保留在 agent
- * 上，首次发送任务时由 materialize 真正落盘。重复点击幂等。
+ * 把命令层服务适配为 core 会话用例端口：视图动作路由到 TUI（转录清理、
+ * markdown 追加、历史回放），提示路由到 toast/log 通道。业务规则本体在
+ * core/session/session-flows.ts——本层只留 UI 装配。
  */
+function flowPorts(services: CommandServices): SessionFlowPorts {
+  return {
+    sessions: services.sessions,
+    agent: services.agent,
+    view: {
+      clearTranscript: () => services.repl?.clearTranscript(),
+      appendMarkdown: (markdown) => services.repl?.appendMarkdown(markdown),
+      hint: (message, level = "info") => hint(services, message, level),
+      replay: (pi) => replaySessionHistory(pi, services)
+    }
+  };
+}
+
+/** 新建会话（/new、会话栏「＋」共用）：规则见 core 的同名用例。 */
 export async function openDraftSession(services: CommandServices, name?: string): Promise<void> {
-  const sessions = services.sessions;
-  if (!sessions) {
-    hint(services, "会话管理未配置。", "warning");
-    return;
-  }
-  if (services.agent?.isBusy?.()) {
-    hint(services, "会话正在输出，无法切换；请等待当前任务完成。", "warning");
-    return;
-  }
-  try {
-    services.agent?.detach?.();
-  } catch (error) {
-    // detach 失败（理论上仅在 busy 并发时发生）：保持原状，不进入草稿。
-    hint(services, `无法进入草稿：${sessionCommandError(error)}`, "error");
-    return;
-  }
-  sessions.startDraft(name);
-  services.repl?.clearTranscript();
-  services.repl?.appendMarkdown("*✎ 草稿：新会话将在首次发送时创建；可先 /model /thinking 配置*");
-  hint(services, `已打开草稿${name ? `（名称：${name}）` : ""}；首次发送时创建，重复点击「新建」只是重新打开它。`);
+  await flowOpenDraftSession(flowPorts(services), name);
 }
 
 async function commandNew(name: string, services: CommandServices): Promise<void> {
@@ -587,43 +564,9 @@ async function commandSessions(services: CommandServices): Promise<void> {
  * 并取得 Pi 实例），再移动指针，最后重绑 agent 并回放历史；失败时尽力把指针
  * 回滚到原会话，避免指针与实际会话脱节。
  */
+/** 切换会话（/switch、会话栏点击共用）：规则见 core 的同名用例。 */
 export async function switchToSessionId(id: string, services: CommandServices): Promise<void> {
-  const sessions = services.sessions;
-  if (!sessions) {
-    hint(services, "会话管理未配置。", "warning");
-    return;
-  }
-  if (services.agent?.isBusy?.()) {
-    hint(services, "会话正在输出，无法切换；请等待当前任务完成。", "warning");
-    return;
-  }
-  const target = sessions.get(id);
-  if (!target) {
-    hint(services, `找不到会话：${id.trim() || "(空)"}（可用 /sessions 查看）`, "warning");
-    return;
-  }
-  if (sessions.current()?.id === target.id) {
-    hint(services, `已是当前会话：${target.name ?? target.id}`);
-    return;
-  }
-  const previous = sessions.current();
-  try {
-    const pi = await sessions.bind(target.id);
-    await sessions.switch(target.id);
-    const message =
-      (await services.agent?.rebind?.(pi)) ?? `已切换会话（agent 不支持运行时切换，仅更新指针）：${target.name ?? target.id}`;
-    // transcript 属于会话内容，切换成功后必须整体替换而不是追加：否则旧会话
-    // 的消息残留（切到空会话时回放 0 条，屏幕看起来纹丝不动，尤其明显）。
-    // 放在 rebind 成功之后：rebind 失败会走 catch 回滚指针留在原会话，
-    // 此时屏幕内容仍然有效，不应被清掉。
-    services.repl?.clearTranscript();
-    hint(services, message);
-    replaySessionHistory(pi, services);
-  } catch (error) {
-    const now = sessions.current();
-    if (previous && now && now.id !== previous.id) await sessions.switch(previous.id).catch(() => undefined);
-    hint(services, `切换失败：${sessionCommandError(error)}`, "error");
-  }
+  await flowSwitchToSessionId(flowPorts(services), id);
 }
 
 async function commandSwitch(ref: string, services: CommandServices): Promise<void> {
@@ -685,52 +628,9 @@ async function commandClose(ref: string, services: CommandServices): Promise<voi
   }
 }
 
-/**
- * 删除会话核心（/delete 与会话栏右键菜单共用）：删除当前会话时先解绑 agent
- * （释放 JSONL 文件句柄，Windows 上打开中的文件无法删除）再删；随后打开侧栏
- * 同位的会话（updatedAt 倒序：后一位顶替，被删的是末位则取前一位），没有其他
- * 活跃会话时才转入草稿态并清空 transcript；删除非当前会话不动指针。
- */
+/** 删除会话（/delete、会话栏右键菜单共用）：规则见 core 的同名用例。 */
 export async function deleteSessionById(id: string, services: CommandServices): Promise<void> {
-  const sessions = services.sessions;
-  if (!sessions) {
-    hint(services, "会话管理未配置。", "warning");
-    return;
-  }
-  if (services.agent?.isBusy?.()) {
-    hint(services, "会话正在输出，无法删除；请等待当前任务完成。", "warning");
-    return;
-  }
-  const target = sessions.get(id);
-  if (!target) {
-    hint(services, `找不到会话：${id.trim() || "(空)"}（可用 /sessions 查看）`, "warning");
-    return;
-  }
-  const wasCurrent = sessions.current()?.id === target.id;
-  // 删除前先定位：按侧栏顺序（updatedAt 倒序，仅活跃会话）记下被删会话的位置，
-  // 删除后由同位会话顶替打开，而不是落回草稿。
-  const activeBefore = wasCurrent
-    ? (await sessions.list()).filter((session) => session.status === "active")
-    : [];
-  const position = activeBefore.findIndex((session) => session.id === target.id);
-  try {
-    if (wasCurrent) services.agent?.detach?.();
-    const removed = await sessions.delete(target.id);
-    hint(services, `已删除会话：${removed.name ?? removed.id}`);
-    if (wasCurrent) {
-      // 同位会话顶替（列表后一位优先；被删的是末位则取前一位），走 /switch
-      // 同一核心流程；没有其他活跃会话才转入草稿态，后续输入不丢。
-      const successor = activeBefore[position + 1] ?? activeBefore[position - 1];
-      if (successor) await switchToSessionId(successor.id, services);
-      if (!sessions.current()) {
-        sessions.startDraft();
-        services.repl?.clearTranscript();
-        services.repl?.appendMarkdown("*✎ 草稿：新会话将在首次发送时创建*");
-      }
-    }
-  } catch (error) {
-    hint(services, `删除失败：${sessionCommandError(error)}`, "error");
-  }
+  await flowDeleteSessionById(flowPorts(services), id);
 }
 
 async function commandDelete(ref: string, services: CommandServices): Promise<void> {
@@ -751,44 +651,7 @@ async function commandDelete(ref: string, services: CommandServices): Promise<vo
   await deleteSessionById(target.id, services);
 }
 
+/** 任务派发（命令层与未来 headless 入口共用 core 流程）：规则见 core。 */
 async function dispatchTask(goal: string, services: CommandServices, _state: CommandState): Promise<void> {
-  if (!services.agent?.runTask) {
-    hint(services, "任务执行未配置。", "warning");
-    return;
-  }
-  if (services.agent.isBusy?.()) {
-    hint(services, "已有任务正在执行，请等待完成后再输入。", "warning");
-    return;
-  }
-  // 用户输入的回显由 TUI 气泡承担（TuiRepl.handleSubmit），此处不再回显；
-  // 斜杠命令是 UI 操作且可能含密钥（/apikey），两种渠道都不回显。
-  // 当前会话不存在（草稿、已关闭或从未创建）时物化承接：草稿名优先，无则
-  // 用首条消息摘要命名，保证无缝体验。
-  let sessionId = services.sessions?.current()?.id;
-  if (!sessionId && services.sessions) {
-    try {
-      const record = await services.sessions.materialize(goalSessionName(goal));
-      try {
-        const pi = await services.sessions.bind(record.id);
-        hint(services, (await services.agent?.rebind?.(pi)) ?? `已创建会话：${record.name ?? record.id}`);
-        sessionId = record.id;
-      } catch (error) {
-        // 刚物化的会话未被 agent 使用：关闭它，避免指针与实际会话脱节、touch 错误记账
-        await services.sessions.close(record.id).catch(() => undefined);
-        hint(services, `自动创建会话失败：${sessionCommandError(error)}`, "error");
-      }
-    } catch (error) {
-      hint(services, `自动创建会话失败，任务将在无会话状态下执行：${sessionCommandError(error)}`, "error");
-    }
-  }
-  try {
-    await services.agent.runTask(goal);
-  } catch (error) {
-    hint(services, `任务执行失败：${sessionCommandError(error)}`, "error");
-  } finally {
-    // 一轮任务 ≈ 一条用户消息 + 一条回复；touch 失败不影响任务结果
-    if (sessionId && services.sessions) {
-      await services.sessions.touch(sessionId, { messages: 2 }).catch(() => undefined);
-    }
-  }
+  await flowDispatchTask(flowPorts(services), goal);
 }
