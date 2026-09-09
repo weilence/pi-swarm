@@ -92,8 +92,10 @@ const pool = new SessionContextPool({
     repl?.registerAgent("supervisor", context.id);
     output.attachAgent(context.agent);
   },
-  onSubAgent: (_context, agent, name) => {
-    repl?.registerAgent(name);
+  onSubAgent: (context, agent, name) => {
+    // 子 agent 标签归属派发它的会话：缺省命名空间是「当前视图」，视图若在
+    // 草稿/别的会话上，流式输出会带 context.id 落进看不见的缓冲。
+    repl?.registerAgent(name, context.id);
     output.attachAgent(agent);
   }
 });

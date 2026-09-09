@@ -17,6 +17,8 @@ export interface SessionFlowView {
   showDraft?(): void;
   /** 向指定会话命名空间追加 markdown 行（草稿占位说明等）。 */
   appendMarkdown?(markdown: string, session?: string): void;
+  /** 向指定会话命名空间回显一条用户消息气泡（草稿物化承接首条消息时用）。 */
+  appendUserMessage?(message: string, session?: string): void;
   /** 用户提示（toast 或日志，宿主决定）。 */
   hint(message: string, level?: FlowHintLevel): void;
   /** 缓冲为空（进程重启后首次切入）时的 JSONL 历史回放；缺省跳过。 */
@@ -146,7 +148,9 @@ export async function switchWorktreeScope(ports: SessionFlowPorts, ref: string |
   } else {
     sessions.startDraft();
     ports.view.showDraft?.();
-    ports.view.appendMarkdown?.("*✎ 草稿：新会话将在此作用域创建*", "supervisor");
+    // 第二参数是 session 而非 agent：缺省即当前（刚打开的）草稿命名空间；
+    // 传 "supervisor" 会把占位说明写进幽灵标签页，聊天区域看不到。
+    ports.view.appendMarkdown?.("*✎ 草稿：新会话将在此作用域创建*");
     ports.view.hint("当前作用域还没有会话：输入任务将在此创建。");
   }
 }
@@ -253,6 +257,17 @@ export async function closeSessionById(ports: SessionFlowPorts, id?: string): Pr
 }
 
 /**
+ * 草稿物化后的视口跟随：会话指针已指向新 id，而转录视口还停在草稿命名空间
+ * ——用户气泡回显进了草稿缓冲，流式输出则带新 id 写进不可见的后台缓冲，
+ * 聊天区域会一直空白（切走再切回才补放）。这里把视口挂到新会话，并把首条
+ * 消息气泡补进新命名空间；斜杠文本与 ChatPanel 的提交回显规则一致，不回显。
+ */
+function followMaterializedView(ports: SessionFlowPorts, sessionId: string, goal: string): void {
+  ports.view.showSession?.(sessionId);
+  if (!goal.startsWith("/")) ports.view.appendUserMessage?.(goal, sessionId);
+}
+
+/**
  * 任务派发核心（命令层与未来 headless 入口共用）：聚焦会话的 busy 守卫
  * （后台会话不受影响）、草稿物化（盖章当前作用域）、ensure 执行上下文、
  * runTask 执行与 touch 记账。
@@ -289,6 +304,7 @@ export async function dispatchTask(ports: SessionFlowPorts, goal: string): Promi
   if (!sessionId) return;
   try {
     const context = await ports.agent.ensure(sessionId);
+    if (justMaterialized) followMaterializedView(ports, sessionId, goal);
     await context.runTask(goal);
   } catch (error) {
     if (justMaterialized) {

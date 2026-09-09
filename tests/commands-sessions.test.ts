@@ -172,6 +172,26 @@ test("/new opens a draft without creating anything; the first task materializes 
   assert.equal(current.worktree, undefined, "main workspace scope has no worktree stamp");
 });
 
+test("the first task in a draft follows the view into the materialized session", async () => {
+  const { sessions } = await makeSessions();
+  const { tasks, ran } = makeTasks();
+  const repl = makeReplStub();
+  const services = makeServices(sessions, tasks, repl);
+
+  await run("/new alpha", services);
+  assert.deepEqual(repl.mounted, ["draft"], "opening the draft mounts the draft namespace");
+
+  await run("hello worktree", services);
+  const current = sessions.current()!;
+  assert.deepEqual(
+    repl.mounted,
+    ["draft", current.id],
+    "the view follows the materialized session instead of staying on the invisible draft"
+  );
+  assert.deepEqual(repl.replayed, [current.id], "the first message is echoed into the new namespace so streaming lands on the mounted buffer");
+  assert.deepEqual(ran, [`${current.id}:hello worktree`]);
+});
+
 test("a task without a draft names the new session from the message summary", async () => {
   const { sessions } = await makeSessions();
   const { tasks } = makeTasks();

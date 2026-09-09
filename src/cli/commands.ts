@@ -554,6 +554,7 @@ function flowPorts(services: CommandServices): SessionFlowPorts {
         services.repl?.clearTranscript(undefined, DRAFT_SESSION);
       },
       appendMarkdown: (markdown, session) => services.repl?.appendMarkdown(markdown, undefined, session),
+      appendUserMessage: (message, session) => services.repl?.appendUserMessage(message, session),
       hint: (message, level = "info") => hint(services, message, level),
       replay: (pi, session) => replaySessionHistory(pi, session, services)
     }
