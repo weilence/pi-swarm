@@ -127,9 +127,11 @@ export class Agent {
   public constructor(private readonly options: AgentOptions) {
     this.cwd = options.cwd ?? process.cwd();
     const agentDir = options.agentDir ?? join(getUserDataDir(), "agents", options.name);
+    this.modelRuntime = options.modelRuntime;
     this.metrics = new StreamMetrics(options.now ?? Date.now);
     this.settings = new ModelSettings(options.configStore);
     this.host = new SessionHost({
+      sessionManager: options.sessionManager,
       cwd: this.cwd,
       agentDir,
       systemPrompt: options.systemPrompt,
@@ -166,11 +168,25 @@ export class Agent {
    * Structured snapshot for the editor status bar: live session stats
    * (context usage, cumulative token accounting, cost) plus the pending
    * model preference when no session exists yet. Best-effort by design.
+   *
+   * 草稿态（无会话）：模型/thinking/容量都来自待生效偏好——thinking 取已
+   * 配置的偏好；上下文容量取待生效模型的 contextWindow（手动 /context
+   * 覆盖优先），让状态栏在会话建立前就能完整预览配置。
    */
   public get statusSnapshot(): AgentStatusSnapshot {
     const session = this.host.session;
     const model = session?.model;
-    if (!session || !model) return { model: this.settings.model, busy: this.prompting };
+    if (!session || !model) {
+      const pending = this.settings.requestedModelInstance((provider, modelId) =>
+        this.modelRuntime?.getModel(provider, modelId)
+      );
+      return {
+        model: this.settings.model,
+        thinkingLevel: this.settings.thinkingLevel,
+        contextWindow: pending ? this.settings.patchModel(pending).contextWindow : this.settings.contextWindow,
+        busy: this.prompting
+      };
+    }
     const stats = session.getSessionStats();
     const usage = stats.contextUsage;
     return {

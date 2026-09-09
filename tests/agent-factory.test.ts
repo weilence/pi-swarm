@@ -8,6 +8,8 @@ import type { StreamMetrics } from "../src/pi/stream-metrics.ts";
 import { SessionBusyError } from "../src/core/session/session-types.ts";
 import type { AgentConfigSnapshot, ConfigStore } from "../src/core/config/config-store.ts";
 import type { AgentDefinition } from "../src/core/agent-format.ts";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { toPiProviderConfig, type ModelsDevProvider } from "../src/models-dev/catalog.ts";
 
 /** 测试用最小定义：supervisor 角色的内置提示词等价物。 */
 function makeDefinition(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
@@ -91,6 +93,75 @@ test("setThinkingLevel requires a model and persists nothing without one", async
   assert.deepEqual(agent.thinkingLevels(), []);
   await assert.rejects(agent.setThinkingLevel("high"), /请先使用 \/model/);
   assert.equal(store.saved.length, 0);
+});
+
+/** 最小 reasoning 模型的 models.dev provider 假体（走生产同款转换）。 */
+function makeReasoningProvider(): ModelsDevProvider {
+  return {
+    id: "test-provider",
+    name: "Test Provider",
+    api: "https://api.test-provider.invalid/v1",
+    env: ["TEST_PROVIDER_API_KEY"],
+    models: {
+      "thought-1": {
+        id: "thought-1",
+        name: "Thought 1",
+        reasoning: true,
+        reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+        limit: { context: 200_000, output: 8_192 }
+      }
+    }
+  };
+}
+
+/**
+ * 回归：新对话（草稿态、无会话）下 /provider /model /thinking 依赖注入的
+ * 共享 ModelRuntime。曾因构造函数丢失 modelRuntime 赋值，草稿态全部失效：
+ * thinking 解析不到模型直接报错、provider 不注册进 runtime、首条任务时
+ * ensureSession 私建新 runtime 丢掉共享配置。
+ */
+test("injected modelRuntime works in draft mode: provider registers, model/thinking resolve", async () => {
+  const store = makeStore();
+  const runtime = await ModelRuntime.create({ refreshOnCreate: false });
+  const agent = makeAgent(store, { modelRuntime: runtime });
+  const provider = makeReasoningProvider();
+  await agent.configureProvider(provider.id, toPiProviderConfig(provider));
+  await agent.setModel("test-provider/thought-1");
+
+  // provider 即刻注册进共享 runtime（子 agent / 后续会话可见）。
+  assert.ok(runtime.getModel("test-provider", "thought-1"), "provider must be registered into the shared runtime");
+  // 草稿态即可解析待生效模型并校验/设置 thinking level。
+  assert.ok(agent.thinkingLevels().length > 0, "thinking levels must resolve before a session exists");
+  const message = await agent.setThinkingLevel("high");
+  assert.match(message, /将在会话建立后应用：high/);
+});
+
+/**
+ * 草稿态状态栏预览：thinking 取待生效偏好，上下文容量取待生效模型的
+ * contextWindow（/context 手动覆盖优先），会话建立前就能完整预览配置。
+ */
+test("draft statusSnapshot previews pending thinking and context window", async () => {
+  const runtime = await ModelRuntime.create({ refreshOnCreate: false });
+  const agent = makeAgent(makeStore(), { modelRuntime: runtime });
+  await agent.configureProvider(makeReasoningProvider().id, toPiProviderConfig(makeReasoningProvider()));
+  await agent.setModel("test-provider/thought-1");
+
+  // 已选模型、未配 thinking/容量：thinking 缺省，上下文取模型默认 200k。
+  const plain = agent.statusSnapshot;
+  assert.equal(plain.model, "test-provider/thought-1");
+  assert.equal(plain.thinkingLevel, undefined);
+  assert.equal(plain.contextWindow, 200_000);
+
+  // 配置 thinking 与手动容量后：预览跟随待生效偏好（覆盖优先于模型默认）。
+  await agent.setThinkingLevel("high");
+  await agent.setContextWindow(100_000);
+  const configured = agent.statusSnapshot;
+  assert.equal(configured.thinkingLevel, "high");
+  assert.equal(configured.contextWindow, 100_000);
+
+  // /context reset：回落到模型默认容量。
+  await agent.setContextWindow(undefined);
+  assert.equal(agent.statusSnapshot.contextWindow, 200_000);
 });
 
 test("persistence failures propagate to the caller", async () => {
@@ -213,10 +284,12 @@ test("statusSnapshot plumbs host session stats and stream metrics into the UI sh
     metrics: StreamMetrics;
   };
 
-  // 草稿态（无会话）：只回显待生效偏好与 busy，无任何指标。
+  // 草稿态（无会话、未配置）：只回显待生效偏好与 busy，无任何指标。
   internals.prompting = true;
   const draft = agent.statusSnapshot;
   assert.equal(draft.model, undefined);
+  assert.equal(draft.thinkingLevel, undefined);
+  assert.equal(draft.contextWindow, undefined);
   assert.equal(draft.busy, true);
   assert.equal(draft.ttftMs, undefined);
   assert.equal(draft.avgOutputSpeed, undefined);

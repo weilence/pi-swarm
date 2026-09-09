@@ -23,6 +23,8 @@ export interface SessionHostOptions {
   cwd: string;
   /** Pi agent directory（每个 agent 独立，避免互相污染资源加载）。 */
   agentDir: string;
+  /** Injected Pi session manager (persistent JSONL); in-memory fallback when omitted. */
+  sessionManager?: PiSessionManager;
   /** Role prompt entries appended after the resource loader's base prompt. A function is rebuilt per session open. */
   systemPrompt?: string[] | (() => string[]);
   /** Tool allowlist; omitted means Pi's defaults. */
@@ -66,6 +68,7 @@ grep is slower, ignores .gitignore, and noisier. Commands containing grep waste 
  * 把会话建好、把事件分发出去。
  */
 export class SessionHost {
+  private readonly options: SessionHostOptions;
   private current?: AgentSession;
   private unsubscribe?: () => void;
   private piSession?: PiSessionManager;
@@ -73,7 +76,11 @@ export class SessionHost {
   private streamToUi = true;
   private collector?: ToolObservationCollector;
 
-  public constructor(private readonly options: SessionHostOptions) {}
+  public constructor(options: SessionHostOptions) {
+    this.options = options;
+    // 注入的持久会话管理器是首个 open() 的默认绑定对象（旧 Agent 行为）。
+    this.piSession = options.sessionManager;
+  }
 
   /** 当前打开的会话；草稿态为 undefined。 */
   public get session(): AgentSession | undefined {
