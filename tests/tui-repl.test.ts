@@ -1018,17 +1018,23 @@ test("sessions sidebar rows list current/closed/empty states and stay inside the
   assert.ok(!plain(22).includes("很长的会话名称占位符很多字"), "long names are ellipsized before rendering");
 });
 
-test("setDraftMode pins a highlighted ✎ 草稿 row at the top of the sidebar", () => {
+test("setDraftMode pins a highlighted ✎ 草稿 row under its scope's group header", () => {
   const { repl, ui } = makeRepl();
   const { rows } = sidebarParts(ui);
   const plain = (width = 22) => stripTerminalSequences(rows.render(width).join("\n"));
+  const rendered = (): string[] => rows.render(22).map((line) => stripTerminalSequences(line));
 
   assert.ok(!plain().includes("草稿"), "no draft row before setDraftMode");
 
+  // 主工作区草稿：组头之下、组内会话之上（物化后按 updatedAt 倒序也是这个位置）。
+  repl.setSessions([makeSummary({ id: "s1", name: "会话甲" })]);
   repl.setDraftMode(true);
-  const rendered = rows.render(22);
   assert.ok(plain().includes("✎ 草稿（未保存）"), "the draft row is visible");
-  assert.ok(rendered.join("\n").includes("\x1b[7m"), "the draft row uses the current-session highlight");
+  assert.ok(rows.render(22).join("\n").includes("\x1b[7m"), "the draft row uses the current-session highlight");
+  const main = rendered();
+  assert.ok(main[0].includes("⎇ 主工作区"), "the main-workspace group header leads the list");
+  assert.ok(main[1].includes("✎ 草稿"), "the draft sits directly under its group header");
+  assert.ok(main[2].includes("会话甲"), "sessions of the same group follow the draft");
 
   // The hint stays hidden while a draft is open (the draft itself is the hint).
   repl.setSessions([]);
@@ -1036,6 +1042,46 @@ test("setDraftMode pins a highlighted ✎ 草稿 row at the top of the sidebar",
 
   repl.setDraftMode(false);
   assert.ok(!plain().includes("草稿"), "leaving draft mode removes the row");
+});
+
+test("a draft opened inside a worktree renders under that worktree's group, not at the top", () => {
+  const { repl, ui } = makeRepl();
+  const { rows } = sidebarParts(ui);
+  const rendered = (): string[] => rows.render(22).map((line) => stripTerminalSequences(line));
+
+  repl.setSessions([
+    makeSummary({ id: "s1", name: "主区会话" }),
+    makeSummary({ id: "s2", name: "分支会话", worktree: "wt-fix" })
+  ]);
+  repl.setDraftMode(true, "wt-fix");
+
+  const lines = rendered();
+  const draftAt = lines.findIndex((line) => line.includes("✎ 草稿"));
+  const wtHeaderAt = lines.findIndex((line) => line.includes("⎇ wt-fix"));
+  assert.ok(draftAt > 0, "the draft row exists");
+  assert.equal(draftAt, wtHeaderAt + 1, "the draft sits directly under the wt-fix header");
+  assert.ok(lines[0].includes("⎇ 主工作区"), "the main workspace still leads the list");
+  assert.ok(lines[draftAt + 1].includes("分支会话"), "the worktree's own sessions follow the draft");
+
+  // 切作用域后草稿跟随新作用域：同一草稿现在落在主工作区组里。
+  repl.setDraftMode(true, undefined);
+  const moved = rendered();
+  assert.equal(moved.findIndex((line) => line.includes("✎ 草稿")), 1, "the draft follows the main workspace");
+});
+
+test("a draft in a session-less worktree opens its own group at the end", () => {
+  const { repl, ui } = makeRepl();
+  const { rows } = sidebarParts(ui);
+  const rendered = (): string[] => rows.render(22).map((line) => stripTerminalSequences(line));
+
+  repl.setSessions([makeSummary({ id: "s1", name: "主区会话" })]);
+  repl.setDraftMode(true, "wt-fresh");
+
+  const lines = rendered();
+  assert.ok(lines[0].includes("⎇ 主工作区"), "main workspace first");
+  assert.ok(lines[1].includes("主区会话"), "its session follows");
+  assert.ok(lines[2].includes("⎇ wt-fresh"), "the empty scope gets its own header appended last");
+  assert.ok(lines[3].includes("✎ 草稿"), "with the draft as its only row");
 });
 
 test("clearTranscript empties the active transcript (draft starts from a clean slate)", () => {
@@ -1209,7 +1255,7 @@ test("d on a sidebar session opens a delete confirmation driven by the keyboard"
   assert.deepEqual(deleted, ["s1"]);
 });
 
-test("with a draft open the first sidebar row is the draft and the second is session one", () => {
+test("with a draft open the first selectable sidebar row is the draft, the next is session one", () => {
   const ui = makeFakeUi();
   const activated: string[] = [];
   const deleted: string[] = [];

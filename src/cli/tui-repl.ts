@@ -77,6 +77,8 @@ export class TuiRepl {
   private sessionList: readonly SessionEntryState[] = [];
   /** True while the unsaved draft (新建未发送) is the active view. */
   private draftMode = false;
+  /** 草稿归属作用域（undefined = 主工作区）；决定草稿行落在哪个分组头之下。 */
+  private draftScope?: string;
   /** Which region owns the keyboard right now. */
   private focus: FocusMode = "editor";
   private readonly tabBar: AgentTabBar;
@@ -137,7 +139,7 @@ export class TuiRepl {
     // separates sidebar from the chat column, which fills the rest with its
     // own auto-visible scrollbar above the pinned editor.
     this.sidebar = new SessionSidebar(
-      () => ({ entries: this.sessionList, draft: this.draftMode }),
+      () => ({ entries: this.sessionList, draft: this.draftMode, draftScope: this.draftScope }),
       {
         onActivate: (id) => void this.options.onSessionClick?.(id),
         onDeleteRequest: (entry) => this.confirmDelete(entry),
@@ -238,10 +240,11 @@ export class TuiRepl {
     this.ui.requestRender();
   }
 
-  /** Toggles the draft entry (✎ 草稿) at the top of the sessions sidebar. */
-  public setDraftMode(active: boolean): void {
-    if (this.draftMode === active) return;
+  /** Toggles the draft entry (✎ 草稿)；渲染在 scope 对应的作用域分组头之下。 */
+  public setDraftMode(active: boolean, scope?: string): void {
+    if (this.draftMode === active && this.draftScope === scope) return;
     this.draftMode = active;
+    this.draftScope = scope;
     this.ui.requestRender();
   }
 

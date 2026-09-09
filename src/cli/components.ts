@@ -85,10 +85,11 @@ export class SidebarBorderLine {
 }
 /**
  * Sessions sidebar rows: the draft entry (✎ 草稿， shown while a draft is
- * open) first, then one session per line — current highlighted, closed marked
- * ✕. Fully keyboard-driven: while focused, ↑/↓ move the selection (the
- * reverse-video row), Enter opens, n starts a draft, d asks to delete, Esc
- * returns to the editor; handleInput reports whether it consumed the key.
+ * open) under its scope's group header, then one session per line — current
+ * highlighted, closed marked ✕. Fully keyboard-driven: while focused, ↑/↓
+ * move the selection (the reverse-video row), Enter opens, n starts a draft,
+ * d asks to delete, Esc returns to the editor; handleInput reports whether it
+ * consumed the key.
  * Rendered inside a full-height ScrollView (see TuiRepl): overflow is handled
  * by scrolling with a visible scrollbar, not by truncation. The empty-state
  * hint keeps the lazy-creation invariant: startup creates nothing, the first
@@ -99,7 +100,7 @@ export class SessionSidebar implements Component {
   private focused = false;
 
   public constructor(
-    private readonly snapshot: () => { entries: readonly SessionEntryState[]; draft: boolean; },
+    private readonly snapshot: () => { entries: readonly SessionEntryState[]; draft: boolean; draftScope?: string; },
     private readonly handlers: {
       onActivate(id: string): void;
       onDeleteRequest(entry: SessionEntryState): void;
@@ -206,10 +207,16 @@ export class SessionSidebar implements Component {
   public invalidate(): void { }
 
   private rows(): readonly SidebarRow[] {
-    const { entries, draft } = this.snapshot();
-    const rows: SidebarRow[] = [];
-    if (draft) rows.push({ kind: "draft" });
-    for (const row of groupRows(entries)) rows.push(row);
+    const { entries, draft, draftScope } = this.snapshot();
+    const rows: SidebarRow[] = groupRows(entries);
+    // 草稿行归属当前作用域（物化时盖章的就是它）：插在对应分组头之下，
+    // 而不是整张列表的最上面；该作用域还没有会话时在末尾补建分组。
+    if (draft) {
+      const label = draftScope || "主工作区";
+      const header = rows.findIndex((row) => row.kind === "group" && row.label === label);
+      if (header >= 0) rows.splice(header + 1, 0, { kind: "draft" });
+      else rows.push({ kind: "group", label }, { kind: "draft" });
+    }
     return rows;
   }
 

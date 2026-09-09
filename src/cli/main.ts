@@ -198,13 +198,13 @@ const sharedServices = {
     setTerminalTitle(name ? `swarm - ${name} - ${cwd}` : `swarm - ${cwd}`);
   };
   // 会话栏与状态栏快照：会话是延迟创建的（启动不建会话、「＋ 新建」只开草稿），
-  // 草稿激活时列表顶部多一行「✎ 草稿」；首个任务物化、/new /switch /close
+  // 草稿激活时在当前作用域分组头下多一行「✎ 草稿」；首个任务物化、/new /switch /close
   // /delete /worktree、点击会话之后，都统一在这里刷新。busy/未读标记来自
   // 执行池与聊天缓冲，输出轮询的 onTick 也会触发本函数。
   const refreshBarsImpl = async (): Promise<void> => {
     const ui = repl;
     if (!ui) return;
-    ui.setDraftMode(sessionManager.isDraft());
+    ui.setDraftMode(sessionManager.isDraft(), sessionManager.currentScope());
     const list = await sessionManager.list();
     ui.setSessions(
       list.map((session) => ({
