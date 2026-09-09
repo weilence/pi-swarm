@@ -13,6 +13,12 @@ export interface SessionEntryState {
   name: string;
   current: boolean;
   closed: boolean;
+  /** 归属作用域名；undefined = 主工作区（分组展示用）。 */
+  worktree?: string;
+  /** 该会话正在流式输出（行内 ⏳ 标记）。 */
+  busy?: boolean;
+  /** 该会话有未读输出（行内 • 标记，切回清零）。 */
+  unread?: boolean;
 }
 
 /** Render-time snapshot of one tab for the tab bar. */
@@ -23,7 +29,28 @@ export interface AgentTabState {
 }
 
 /** One selectable sidebar row: the draft pseudo-entry or a real session. */
-type SidebarRow = { kind: "draft" } | { kind: "session"; entry: SessionEntryState };
+type SidebarRow = { kind: "draft" } | { kind: "group"; label: string } | { kind: "session"; entry: SessionEntryState };
+
+/**
+ * 侧栏分组顺序：主工作区永远在最上，其余作用域按首次出现序（即最近活跃
+ * 优先，与 entries 的 updatedAt 倒序一致）。
+ */
+function groupRows(entries: readonly SessionEntryState[]): SidebarRow[] {
+  const rows: SidebarRow[] = [];
+  const groups = new Map<string, SessionEntryState[]>();
+  for (const entry of entries) {
+    const key = entry.worktree ?? "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(entry);
+  }
+  // 稳定排序只把主工作区（空 key）提到最前，其余保持首次出现序。
+  const ordered = [...groups.entries()].sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : 0));
+  for (const [key, groupEntries] of ordered) {
+    rows.push({ kind: "group", label: key || "主工作区" });
+    for (const entry of groupEntries) rows.push({ kind: "session", entry });
+  }
+  return rows;
+}
 
 /**
  * One border edge of the sessions sidebar; the top edge carries the title and
@@ -101,7 +128,8 @@ export class SessionSidebar implements Component {
     }
     if (matchesKey(data, "enter")) {
       const row = this.selectedRow();
-      if (row) this.handlers.onActivate(row.kind === "draft" ? "draft" : row.entry.id);
+      if (row?.kind === "session") this.handlers.onActivate(row.entry.id);
+      else if (row) this.handlers.onActivate("draft");
       return true;
     }
     if (matchesKey(data, "n")) {
@@ -153,10 +181,19 @@ export class SessionSidebar implements Component {
       return lines;
     }
     rows.forEach((row, index) => {
+      if (row.kind === "group") {
+        lines.push(" " + dim(truncateToWidth(`⎇ ${row.label}`, labelWidth)));
+        return;
+      }
       const label =
         row.kind === "draft"
           ? truncateToWidth("✎ 草稿（未保存）", labelWidth)
-          : truncateToWidth(`${row.entry.current ? "●" : row.entry.closed ? "✕" : " "} ${row.entry.name}`, labelWidth);
+          : truncateToWidth(
+              `${row.entry.current ? "●" : row.entry.closed ? "✕" : " "} ${row.entry.name}${
+                row.entry.unread || row.entry.busy ? " " : ""
+              }${row.entry.unread ? "•" : ""}${row.entry.busy ? "⏳" : ""}`,
+              labelWidth
+            );
       const isCurrent = row.kind === "draft" || (row.kind === "session" && row.entry.current);
       const isSelected = this.focused && index === this.selected;
       const isClosed = row.kind === "session" && row.entry.closed;
@@ -172,7 +209,7 @@ export class SessionSidebar implements Component {
     const { entries, draft } = this.snapshot();
     const rows: SidebarRow[] = [];
     if (draft) rows.push({ kind: "draft" });
-    for (const entry of entries) rows.push({ kind: "session", entry });
+    for (const row of groupRows(entries)) rows.push(row);
     return rows;
   }
 
@@ -181,20 +218,29 @@ export class SessionSidebar implements Component {
     return this.rows()[this.selected];
   }
 
-  /** Keeps the selection inside the (possibly shrunken) row list. */
+  /** Keeps the selection inside the (possibly shrunken) row list; group 头不可选中。 */
   private clampSelection(): void {
-    const count = this.rows().length;
-    if (count === 0) {
+    const rows = this.rows();
+    if (rows.length === 0) {
       this.selected = 0;
       return;
     }
-    this.selected = Math.min(this.selected, count - 1);
+    this.selected = Math.min(this.selected, rows.length - 1);
+    let scanned = 0;
+    while (rows[this.selected]?.kind === "group" && scanned < rows.length) {
+      this.selected = (this.selected + 1) % rows.length;
+      scanned += 1;
+    }
   }
 
   private move(delta: number): void {
-    const count = this.rows().length;
-    if (count === 0) return;
-    this.selected = (this.selected + delta + count) % count;
+    const rows = this.rows();
+    if (rows.length === 0) return;
+    let index = this.selected;
+    do {
+      index = (index + delta + rows.length) % rows.length;
+    } while (rows[index].kind === "group" && index !== this.selected);
+    this.selected = index;
   }
 }
 /** Single-line, right-aligned row of agent tabs; keyboard cycling lives in TuiRepl. */
@@ -503,7 +549,7 @@ export class StatusBar implements Component {
 
   private line(): string {
     const s = this.snapshot;
-    const parts: string[] = [`模型 ${s.model ?? "未选择"}`];
+    const parts: string[] = [`⎇ ${s.worktree ?? "主工作区"}`, `模型 ${s.model ?? "未选择"}`];
     if (s.thinkingLevel) parts.push(`thinking ${s.thinkingLevel}`);
     if (s.contextWindow && s.contextWindow > 0) {
       const used = s.contextTokens ?? 0;

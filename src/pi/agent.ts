@@ -52,6 +52,8 @@ export interface AgentStatusSnapshot {
   avgOutputSpeed?: number;
   /** True while a prompt is streaming. */
   busy?: boolean;
+  /** 当前作用域名（状态栏 ⎇ 显示）；undefined = 主工作区。由入口组装，非 agent 自身状态。 */
+  worktree?: string;
 }
 
 /**
@@ -70,6 +72,8 @@ export interface AgentStatusSnapshot {
 export interface AgentOptions {
   /** UI 标签，也是事件流里携带的 agent 标注。 */
   name: string;
+  /** 并行会话命名空间标注：事件流携带，供输出路由把流写进对应会话的缓冲。 */
+  sessionId?: string;
   /** Shared Pi runtime; created lazily when omitted. */
   modelRuntime?: ModelRuntime;
   /** Working directory for the agent session; defaults to the project root. */
@@ -138,12 +142,12 @@ export class Agent {
       tools: options.tools,
       customTools: () => this.customTools(),
       sinks: {
-        onText: (delta) => this.events.emit({ type: "text", agent: options.name, delta }),
-        onThinking: (delta) => this.events.emit({ type: "thinking", agent: options.name, delta }),
+        onText: (delta) => this.events.emit({ type: "text", agent: options.name, sessionId: options.sessionId, delta }),
+        onThinking: (delta) => this.events.emit({ type: "thinking", agent: options.name, sessionId: options.sessionId, delta }),
         onToolStart: (toolCallId, toolName, args) =>
-          this.events.emit({ type: "toolStart", agent: options.name, toolCallId, toolName, args }),
+          this.events.emit({ type: "toolStart", agent: options.name, sessionId: options.sessionId, toolCallId, toolName, args }),
         onToolEnd: (toolCallId, toolName, isError) =>
-          this.events.emit({ type: "toolEnd", agent: options.name, toolCallId, toolName, isError })
+          this.events.emit({ type: "toolEnd", agent: options.name, sessionId: options.sessionId, toolCallId, toolName, isError })
       },
       metrics: this.metrics
     });
@@ -358,7 +362,7 @@ export class Agent {
       this.metrics.markPromptEnd();
       this.abortRequested = false;
       this.host.setStreaming(previous);
-      this.events.emit({ type: "streamEnd", agent: this.options.name });
+      this.events.emit({ type: "streamEnd", agent: this.options.name, sessionId: this.options.sessionId });
     }
   }
 

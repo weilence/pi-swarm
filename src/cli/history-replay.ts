@@ -122,7 +122,12 @@ function collectEntry(
  * 解析渲染；超过 maxMessages 只保留最近部分，并在最前插入省略提示。
  * 解析失败由调用方兜底（不抛错，不影响 /switch 的切换结果）。
  */
-export function replayHistory(repl: TuiRepl, entries: SessionEntry[], options: ReplayOptions = {}): number {
+export function replayHistory(
+  repl: TuiRepl,
+  entries: SessionEntry[],
+  options: ReplayOptions = {},
+  session?: string
+): number {
   const maxMessages = options.maxMessages ?? DEFAULT_MAX_MESSAGES;
   const maxMessageChars = options.maxMessageChars ?? DEFAULT_MAX_MESSAGE_CHARS;
   const toolArgs = new Map<string, unknown>();
@@ -135,31 +140,31 @@ export function replayHistory(repl: TuiRepl, entries: SessionEntry[], options: R
     }
   }
   if (items.length === 0) return 0;
-  repl.appendLine(`[主 agent] 已回放 ${items.length} 条历史记录：`);
+  repl.appendLine(`[主 agent] 已回放 ${items.length} 条历史记录：`, undefined, session);
   if (items.length > maxMessages) {
     const omitted = items.length - maxMessages;
-    repl.appendMarkdown(`*……（已省略更早的 ${omitted} 条）*`);
+    repl.appendMarkdown(`*……（已省略更早的 ${omitted} 条）*`, undefined, session);
     items.splice(0, omitted);
   }
   for (const item of items) {
     switch (item.kind) {
       case "user":
-        repl.appendUserMessage(item.text);
+        repl.appendUserMessage(item.text, session);
         break;
       case "thinking":
-        repl.appendThinking(item.text);
+        repl.appendThinking(item.text, undefined, session);
         break;
       case "assistant":
-        repl.appendMarkdown(item.aborted ? `${item.text}（已中断）` : item.text);
+        repl.appendMarkdown(item.aborted ? `${item.text}（已中断）` : item.text, undefined, session);
         break;
       case "assistantError":
-        repl.appendMarkdown(`⚠️ 助手返回错误：${item.message}`);
+        repl.appendMarkdown(`⚠️ 助手返回错误：${item.message}`, undefined, session);
         break;
       case "tool":
-        repl.appendToolCall(item.toolName, item.summary, item.isError);
+        repl.appendToolCall(item.toolName, item.summary, item.isError, undefined, session);
         break;
       case "note":
-        repl.appendMarkdown(item.markdown);
+        repl.appendMarkdown(item.markdown, undefined, session);
         break;
     }
   }

@@ -1,14 +1,18 @@
 import type { AgentDefinition } from "../core/agent-format.ts";
+import type { WorktreeRegistry } from "../core/worktree/worktree-registry.ts";
 import type { SessionRegistry } from "../core/session/session-registry.ts";
 import {
+  closeSessionById,
   deleteSessionById as flowDeleteSessionById,
   dispatchTask as flowDispatchTask,
+  listWorktrees,
   openDraftSession as flowOpenDraftSession,
-  sessionCommandError,
   switchToSessionId as flowSwitchToSessionId,
+  switchWorktreeScope,
   type SessionFlowPorts
 } from "../core/session/session-flows.ts";
 import type { TuiRepl } from "./tui-repl.ts";
+import { DRAFT_SESSION } from "./chat-panel.ts";
 import type { AgentStatusSnapshot } from "../pi/agent.ts";
 import type { ToastLevel } from "./components.ts";
 import { replayHistory } from "./history-replay.ts";
@@ -53,20 +57,25 @@ export interface AgentController {
   status?(): string;
   /** 结构化状态快照（编辑器下方状态栏）；缺省时状态栏保持占位文本。 */
   readonly statusSnapshot?: AgentStatusSnapshot;
-  /** 把 AgentSession 重绑到指定 Pi 会话（/switch、任务物化使用）。 */
-  rebind?(sessionManager: PiSessionManager): Promise<string>;
-  /** 解除当前会话绑定回到草稿态（/new 使用）；待生效的模型/thinking 保留。 */
-  detach?(): void;
   /** 手动设置上下文容量（token）；undefined 恢复模型默认。 */
   setContextWindow?(tokens?: number): Promise<string>;
   /** 手动压缩上下文；customInstructions 可选，指定摘要侧重点。 */
   compact?(customInstructions?: string): Promise<string>;
-  /** 用户主动中止当前输出（双击 Esc）。 */
+  /** 用户主动中止聚焦会话的当前输出（双击 Esc）。 */
   abort?(): Promise<void>;
-  /** prompt 流式输出进行中（此时拒绝切换会话）。 */
+  /** 聚焦会话是否正在流式输出。 */
   isBusy?(): boolean;
-  /** Runs one user task through the supervisor's model-driven loop. */
-  runTask?(goal: string): Promise<string>;
+}
+
+/**
+ * 执行池门面（并行会话）：按会话粒度的 busy 查询 / context 创建 / 释放。
+ * 与 {@link AgentController} 的区别：后者面向「聚焦会话的 agent」，这里面向
+ * 「任意 id 的会话」（后台会话的 close/delete 守卫、任务派发都用它）。
+ */
+export interface SessionTasks {
+  isBusy(id: string): boolean;
+  ensure(id: string): Promise<{ runTask(goal: string): Promise<string> }>;
+  dispose?(id: string): Promise<void>;
 }
 
 export interface CommandServices {
@@ -84,6 +93,10 @@ export interface CommandServices {
   agents?: { list(): AgentDefinition[] };
   /** 会话管理；提供后启用 /new /sessions /switch /close。 */
   sessions?: SessionRegistry;
+  /** worktree 作用域注册表；提供后启用 /worktree /worktrees。 */
+  worktrees?: WorktreeRegistry;
+  /** 执行池门面；提供后任务派发/会话关闭删除走并行会话语义。 */
+  tasks?: SessionTasks;
 }
 
 export interface CommandState {
@@ -158,6 +171,13 @@ const COMMANDS: readonly CommandEntry[] = [
     getArgumentCompletions: staticArgCompletions([{ value: "draft", label: "draft", description: "切到未保存草稿（等同 ＋ 新建）" }]),
     handle: (args, services) => commandSwitch(args, services)
   },
+  {
+    name: "worktree",
+    argumentHint: "[名称|.]",
+    description: "切换 worktree 作用域（省略名称=随机新建，.=主工作区）",
+    handle: (args, services) => commandWorktree(args, services)
+  },
+  { name: "worktrees", description: "列出 worktree 作用域", handle: (_args, services) => listWorktrees(flowPorts(services)) },
   { name: "close", argumentHint: "[id|序号]", description: "关闭会话", handle: (args, services) => commandClose(args, services) },
   { name: "delete", argumentHint: "<id|序号>", description: "删除会话（含记录文件）", handle: (args, services) => commandDelete(args, services) }
 ];
@@ -200,11 +220,12 @@ async function commandStatus(services: CommandServices): Promise<void> {
   if (services.sessions) {
     const draft = services.sessions.isDraft();
     const currentSession = services.sessions.current();
+    services.log(`[主 agent] 当前作用域：⎇ ${services.sessions.currentScope() ?? "主工作区"}`);
     services.log(
       draft
-        ? "[主 agent] 当前会话：草稿（未保存；首次发送时创建）"
+        ? "[主 agent] 当前会话：草稿（未保存；首次发送时在当前作用域创建）"
         : currentSession
-          ? `[主 agent] 当前会话：${currentSession.name ?? currentSession.id}（${currentSession.id}）`
+          ? `[主 agent] 当前会话：${currentSession.name ?? currentSession.id}（${currentSession.id}${currentSession.worktree ? `，⎇ ${currentSession.worktree}` : ""}）`
           : "[主 agent] 当前会话：无（输入任务将自动创建）"
     );
   }
@@ -520,12 +541,21 @@ async function resolveSessionRef(
 function flowPorts(services: CommandServices): SessionFlowPorts {
   return {
     sessions: services.sessions,
-    agent: services.agent,
+    worktrees: services.worktrees,
+    agent: services.tasks,
     view: {
-      clearTranscript: () => services.repl?.clearTranscript(),
-      appendMarkdown: (markdown) => services.repl?.appendMarkdown(markdown),
+      showSession: (session) => {
+        services.repl?.setActiveSession(session);
+        // 已有缓冲内容 → 切回即补放；空 → 由调用方回放 JSONL。
+        return services.repl?.sessionPopulated(session) ?? true;
+      },
+      showDraft: () => {
+        services.repl?.setActiveSession(DRAFT_SESSION);
+        services.repl?.clearTranscript(undefined, DRAFT_SESSION);
+      },
+      appendMarkdown: (markdown, session) => services.repl?.appendMarkdown(markdown, undefined, session),
       hint: (message, level = "info") => hint(services, message, level),
-      replay: (pi) => replaySessionHistory(pi, services)
+      replay: (pi, session) => replaySessionHistory(pi, session, services)
     }
   };
 }
@@ -547,14 +577,25 @@ async function commandSessions(services: CommandServices): Promise<void> {
   }
   const list = await sessions.list();
   if (list.length === 0) {
-    hint(services, "暂无会话；输入任务或 /new <名称> 开始（首次发送时创建）。");
+    hint(services, "暂无会话；输入任务或 /new <名称> 开始（首次发送时创建）。/worktree <名称> 可切作用域。");
     return;
   }
-  services.log("[主 agent] 会话列表（/switch <id|序号> 切换，/close <id|序号> 关闭）：");
+  // 按作用域分组输出（主工作区最前）；序号保持全局连续，与 /switch <序号> 对齐。
+  const groups = new Map<string, { index: number; session: (typeof list)[number] }[]>();
   for (const [index, session] of list.entries()) {
-    const flags = session.status === "closed" ? "已关闭" : "活跃";
-    const current = session.current ? "，当前" : "";
-    services.log(`  ${index + 1}. ${session.name}（${flags}${current}，消息 ${session.messageCount}，更新 ${session.updatedAt}）${session.id}`);
+    const key = session.worktree ?? "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push({ index: index + 1, session });
+  }
+  const ordered = [...groups.entries()].sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : 0));
+  services.log("[主 agent] 会话列表（/switch <id|序号> 切换，/close 关闭，/worktree 切作用域）：");
+  for (const [key, groupEntries] of ordered) {
+    services.log(`  ⎇ ${key || "主工作区"}`);
+    for (const { index, session } of groupEntries) {
+      const flags = session.status === "closed" ? "已关闭" : "活跃";
+      const current = session.current ? "，当前" : "";
+      services.log(`    ${index}. ${session.name}（${flags}${current}，消息 ${session.messageCount}，更新 ${session.updatedAt}）${session.id}`);
+    }
   }
 }
 
@@ -593,16 +634,15 @@ async function commandSwitch(ref: string, services: CommandServices): Promise<vo
 }
 
 /**
- * 切换成功后回放目标会话历史（compaction-aware）：直接驱动 TUI 组件，与实时
- * 显示同源（气泡/折叠思考/✔✘ 工具行）。整个过程不抛错——回放失败只提示，
- * 不影响切换结果。/new 不回放（新会话没有历史）。目标会话为空时回放 0 条，
- * 补一行占位说明，避免清屏后看起来像没切换。
+ * 切换成功后回放目标会话历史（compaction-aware，写入该会话命名空间）：直接
+ * 驱动 TUI 组件，与实时显示同源（气泡/折叠思考/✔✘ 工具行）。整个过程不抛
+ * 错——回放失败只提示，不影响切换结果。
  */
-function replaySessionHistory(pi: PiSessionManager, services: CommandServices): void {
+function replaySessionHistory(pi: PiSessionManager, session: string, services: CommandServices): void {
   if (!services.repl) return;
   try {
-    const count = replayHistory(services.repl, pi.buildContextEntries());
-    if (count === 0) services.repl.appendMarkdown("*（空会话：暂无历史记录）*");
+    const count = replayHistory(services.repl, pi.buildContextEntries(), undefined, session);
+    if (count === 0) services.repl.appendMarkdown("*（空会话：暂无历史记录）*", undefined, session);
   } catch (error) {
     hint(services, `历史回放失败：${error instanceof Error ? error.message : String(error)}`, "error");
   }
@@ -614,18 +654,17 @@ async function commandClose(ref: string, services: CommandServices): Promise<voi
     hint(services, "会话管理未配置。", "warning");
     return;
   }
-  const target = ref ? await resolveSessionRef(ref, sessions) : sessions.current();
-  if (!target) {
-    hint(services, ref ? `找不到会话：${ref}（可用 /sessions 查看）` : "没有当前会话可关闭。", "warning");
+  const target = ref ? await resolveSessionRef(ref, sessions) : undefined;
+  if (ref && !target) {
+    hint(services, `找不到会话：${ref}（可用 /sessions 查看）`, "warning");
     return;
   }
-  const wasCurrent = sessions.current()?.id === target.id;
-  try {
-    const closed = await sessions.close(target.id);
-    hint(services, `已关闭会话：${closed.name ?? closed.id}${wasCurrent ? "（原当前会话；输入任务将开启新草稿，或 /switch 切换）" : ""}`);
-  } catch (error) {
-    hint(services, `关闭失败：${sessionCommandError(error)}`, "error");
-  }
+  await closeSessionById(flowPorts(services), target?.id);
+}
+
+/** /worktree：切换作用域；`.` 回主工作区，名称省略随机新建。 */
+async function commandWorktree(args: string, services: CommandServices): Promise<void> {
+  await switchWorktreeScope(flowPorts(services), args || undefined);
 }
 
 /** 删除会话（/delete、会话栏右键菜单共用）：规则见 core 的同名用例。 */

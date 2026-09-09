@@ -15,6 +15,8 @@ export interface SessionRecord {
   messageCount: number;
   /** 建立会话时的模型 specifier（provider/model），仅展示用。 */
   model?: string;
+  /** 创建时归属的作用域名；undefined = 主工作区。终身不变。 */
+  worktree?: string;
 }
 
 export type SessionStatus = "active" | "closed";
@@ -29,6 +31,8 @@ export interface SessionSummary {
   updatedAt: string;
   messageCount: number;
   model?: string;
+  /** 归属作用域名；undefined = 主工作区。 */
+  worktree?: string;
 }
 
 /** 会话错误基类：便于上层与测试区分。 */
@@ -45,7 +49,10 @@ export class SessionNotFoundError extends SessionError {}
 /** switch 到已关闭的会话。 */
 export class SessionClosedError extends SessionError {}
 
-/** prompt 流式输出进行中拒绝切换。 */
+/** 会话所属 worktree 目录丢失（被手动删除等）：bind 拒绝，不静默回退主工作区。 */
+export class WorktreeScopeMissingError extends SessionError {}
+
+/** prompt 流式输出进行中拒绝并发 prompt。 */
 export class SessionBusyError extends SessionError {}
 
 /** 状态由 closedAt 推导：closedAt 存在即 closed。 */

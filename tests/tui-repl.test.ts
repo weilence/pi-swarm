@@ -5,7 +5,7 @@ import { Container, Markdown, stripTerminalSequences, TuiAltScreen, Text, visibl
 import { splitMarkdownBlocks, type ChatPanel } from "../src/cli/chat-panel.ts";
 import { summarizeToolArgs, TuiRepl } from "../src/cli/tui-repl.ts";
 import { PickerComponent, StatusBar, StatusLine, ToastStack } from "../src/cli/components.ts";
-import type { SessionSummary } from "../src/core/session/session-types.ts";
+import type { SessionEntryState } from "../src/cli/components.ts";
 
 test("splitMarkdownBlocks cuts on blank lines outside code fences", () => {
   assert.deepEqual(splitMarkdownBlocks("para1\n\npara2"), { blocks: ["para1"], rest: "para2" });
@@ -926,15 +926,12 @@ test("collapsible reasoning expands and collapses via the transcript-mode f key"
   assert.equal(reasoning.render(80).length, 1, "second press collapses again");
 });
 
-/** Minimal SessionSummary for sessions-bar tests. */
-function makeSummary(overrides: Partial<SessionSummary> & { id: string }): SessionSummary {
+/** Minimal sidebar entry for sessions-bar tests. */
+function makeSummary(overrides: Partial<SessionEntryState> & { id: string }): SessionEntryState {
   return {
     name: overrides.id,
-    status: "active",
     current: false,
-    createdAt: "2025-01-01T00:00:00.000Z",
-    updatedAt: "2025-01-01T00:00:00.000Z",
-    messageCount: 0,
+    closed: false,
     ...overrides
   };
 }
@@ -975,7 +972,8 @@ test("sessions sidebar is a full-height bordered column with scrollable rows", (
   // Overflow is the ScrollView's job, not truncation: every session stays a row.
   const sessions = Array.from({ length: 30 }, (_, index) => makeSummary({ id: `s${index}`, name: `会话${index}号` }));
   repl.setSessions(sessions);
-  assert.equal(rows.render(22).length, 30, "one row per session, nothing dropped (＋ 新建 lives on the border)");
+  // 作用域分组头（⎇ 主工作区）+ 每会话一行。
+  assert.equal(rows.render(22).length, 31, "group header + one row per session, nothing dropped");
   assert.equal((scroll as unknown as { scrollbar: string }).scrollbar, "auto", "the sidebar thumb stays hidden at rest (no gray stripe by the gap)");
   assert.equal((scroll as unknown as { primary: boolean }).primary, false, "the transcript stays the primary scroller");
   assert.equal((scroll as unknown as { overscroll: string }).overscroll, "contain", "sidebar wheel does not chain into the chat");
@@ -1002,7 +1000,7 @@ test("sessions sidebar rows list current/closed/empty states and stay inside the
   repl.setSessions([
     makeSummary({ id: "s1", name: "会话甲", current: true }),
     makeSummary({ id: "s2", name: "会话乙" }),
-    makeSummary({ id: "s3", name: "会话丙", status: "closed" })
+    makeSummary({ id: "s3", name: "会话丙", closed: true })
   ]);
   const rendered = rows.render(22);
   const raw = rendered.join("\n");
@@ -1074,7 +1072,8 @@ test("sidebar keyboard navigation: ↑↓ select, Enter opens, n starts a draft,
 
   assert.ok(press(ui, "\x1bs"), "Alt+S focuses the sidebar");
   const { rows } = sidebarParts(ui);
-  assert.ok(rows.render(22)[0].includes("\x1b[7m"), "the selected row is highlighted while focused");
+  // 第 0 行是分组头（不可选中）：首个可选行是索引 1 的会话甲。
+  assert.ok(rows.render(22)[1].includes("\x1b[7m"), "the selected row is highlighted while focused");
 
   press(ui, "\x1b[B"); // ↓ → 会话乙
   press(ui, "\r"); // Enter opens it
@@ -1093,11 +1092,11 @@ test("sidebar selection wraps around and follows into the scroll viewport", () =
   const { scroll, rows } = sidebarParts(ui);
   (scroll as unknown as {
     updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void;
-  }).updateLayout(30, 10, () => undefined);
+  }).updateLayout(31, 10, () => undefined);
   press(ui, "\x1bs");
-  press(ui, "\x1b[A"); // ↑ from row 0 wraps to the last row
-  assert.equal((scroll as unknown as { scrollTop: number }).scrollTop, 20, "wrap scrolls so the selection stays visible");
-  assert.ok(rows.render(22)[29].includes("\x1b[7m"), "the wrapped selection is highlighted");
+  press(ui, "\x1b[A"); // ↑ from the first session wraps to the last row (header is skipped)
+  assert.equal((scroll as unknown as { scrollTop: number }).scrollTop, 21, "wrap scrolls so the selection stays visible");
+  assert.ok(rows.render(22)[30].includes("\x1b[7m"), "the wrapped selection is highlighted");
 });
 
 test("Tab hops between sidebar and transcript; Esc returns to the editor", () => {
@@ -1334,4 +1333,38 @@ test("y/a in transcript mode and ctrl+o in the editor run the clipboard copy pat
   editor.setText("草稿第一行");
   assert.equal(press(ui, "\x0f"), true, "ctrl+o is consumed by the copy binding");
   assert.match(toastText(), /输入框内容复制失败|输入框内容已复制/, "ctrl+o copies the editor content");
+});
+
+test("parallel sessions: background streams buffer, switching catches up, unread clears", () => {
+  const { repl, ui, log, stream } = makeRepl();
+
+  // 会话 s1 在后台流式输出：不进入当前视图，持续写自己的缓冲并标未读。
+  repl.streamThinking("后台思考", "supervisor", "s1");
+  repl.streamText("后台答案\n\n第二段", "supervisor", "s1");
+  repl.toolStart("supervisor", "t1", "bash", { command: "ls" }, "s1");
+  repl.toolEnd("supervisor", "t1", false, "s1");
+  repl.endStream("supervisor", "s1");
+  assert.equal(log.children.length, 0, "background session output stays out of the active view");
+  assert.equal(stream.children.length, 0, "background thinking does not touch the live tail");
+  assert.equal(repl.sessionUnread("s1"), true, "the background session is flagged unread");
+
+  // 切过去：缓冲整体挂载 = 补放完整；未读清零。
+  repl.setActiveSession("s1");
+  const [s1Log] = mountedChat(ui).children as [Container];
+  assert.ok(s1Log.children.length >= 3, "the buffered stream replays in full on switch");
+  assert.equal(repl.sessionUnread("s1"), false, "switching clears the session unread flag");
+
+  // 切回来：原视图内容原封不动（缓冲互不串扰）。
+  const s1View = mountedChat(ui);
+  repl.setActiveSession("draft");
+  assert.notEqual(mountedChat(ui), s1View, "the draft view remounts its own buffer");
+});
+
+test("status bar renders the current scope (⎇ worktree name)", () => {
+  const { repl } = makeRepl();
+  const bar = (repl as unknown as { statusBar: { set(s: unknown): void; render(w: number): string[] } }).statusBar;
+  bar.set({ model: "openai/gpt-4o", worktree: "wt-fix" });
+  assert.ok(stripTerminalSequences(bar.render(80)[0]).includes("⎇ wt-fix"), "a bound scope shows its name");
+  bar.set({ model: "openai/gpt-4o" });
+  assert.ok(stripTerminalSequences(bar.render(80)[0]).includes("⎇ 主工作区"), "the main workspace has a marker too");
 });

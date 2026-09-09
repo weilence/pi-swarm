@@ -32,6 +32,8 @@ function rosterPrompt(agents: AgentDefinition[]): string {
 export interface AgentFactoryOptions {
   /** Agent 定义（markdown 解析结果）：name、description、prompt 与工具允许名单。 */
   definition: AgentDefinition;
+  /** 并行会话命名空间标注（事件路由用）；子 agent 与所属会话的 supervisor 同值。 */
+  sessionId?: string;
   /**
    * Shared ModelRuntime：/provider 注册的 provider 对该 agent 会话可见。
    * 协调者传入全局共享实例；子 agent 同样共享，模型/thinking 缺省时经
@@ -85,6 +87,7 @@ export function createAgent(options: AgentFactoryOptions): Agent {
   const { definition, delegate } = options;
   return new Agent({
     name: definition.name,
+    sessionId: options.sessionId,
     modelRuntime: options.modelRuntime,
     cwd: options.cwd,
     agentDir: options.agentDir

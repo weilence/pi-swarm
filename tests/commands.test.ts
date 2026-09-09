@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { executeCommand, type AgentController, type CommandServices, type CommandState } from "../src/cli/commands.ts";
+import { executeCommand, type AgentController, type CommandServices, type CommandState, type SessionTasks } from "../src/cli/commands.ts";
+import { SessionRegistry } from "../src/core/session/session-registry.ts";
+import { InMemorySessionStore } from "../src/core/session/session-store.ts";
 import type { TuiRepl } from "../src/cli/tui-repl.ts";
 import type { ModelsDevProvider } from "../src/cli/../models-dev/catalog.ts";
 
@@ -375,64 +377,86 @@ test("/status reports supervisor state and /exit wins over other commands", asyn
 
 const noAgents = { list: () => [] };
 
+/** 派发类测试共用的会话管理（内存索引，延迟工厂/目录都指向临时目录）。 */
+async function makeTaskSessions(): Promise<SessionRegistry> {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "pi-swarm-dispatch-"));
+  const sessions = new SessionRegistry({
+    cwd: dir,
+    store: new InMemorySessionStore(),
+    sessionDir: join(dir, "sessions")
+  });
+  await sessions.initialize();
+  return sessions;
+}
+
+/** 执行池门面桩：ensure 返回带可注入 runTask 的伪 context；busy 可选全局生效。 */
+function makeTasks(ran: string[], options: { busy?: boolean; runError?: Error } = {}): SessionTasks {
+  return {
+    isBusy: () => options.busy ?? false,
+    ensure: async (id) => ({
+      runTask: async (goal: string) => {
+        if (options.runError) throw options.runError;
+        ran.push(`${id}:${goal}`);
+        return "任务完成";
+      }
+    })
+  };
+}
+
 test("task input runs through the supervisor's runTask", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
   services.agents = noAgents;
+  services.sessions = await makeTaskSessions();
   const ran: string[] = [];
-  services.agent = {
-    ...makeAgent(recording),
-    async runTask(goal: string) {
-      ran.push(goal);
-      return "任务完成";
-    }
-  };
+  services.tasks = makeTasks(ran);
   await executeCommand("实现登录", services, {});
-  assert.deepEqual(ran, ["实现登录"]);
+  assert.deepEqual(ran.map((entry) => entry.split(":")[1]), ["实现登录"]);
 });
 
 test("dispatchTask does not echo the input; echoing is the TUI bubble's job", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
   services.agents = noAgents;
+  services.sessions = await makeTaskSessions();
   const timeline: string[] = [];
   services.log = (line) => timeline.push(line);
-  services.agent = {
-    ...makeAgent(recording),
-    async runTask(goal: string) {
-      timeline.push(`[runTask] ${goal}`);
+  services.tasks = makeTasks([], {});
+  services.tasks.ensure = async (id) => ({
+    runTask: async (goal: string) => {
+      timeline.push(`[runTask] ${id}:${goal}`);
       return "任务完成";
     }
-  };
+  });
   await executeCommand("实现登录", services, {});
-  assert.deepEqual(timeline, ["[runTask] 实现登录"], "no markdown echo — the TUI bubble owns it");
+  assert.equal(timeline.filter((line) => line.startsWith("[runTask]")).length, 1, "runTask ran exactly once");
+  assert.ok(!timeline.some((line) => line.includes("实现登录") && !line.startsWith("[runTask]")), "no markdown echo — the TUI bubble owns it");
 });
 
 test("rejected dispatch (busy) leaves the input out of the transcript", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  services.agent = {
-    ...makeAgent(recording),
-    isBusy: () => true,
-    async runTask() {
-      throw new Error("should not run");
-    }
-  };
+  const sessions = await makeTaskSessions();
+  await sessions.create();
+  services.sessions = sessions;
+  const ran: string[] = [];
+  services.tasks = makeTasks(ran, { busy: true });
   await executeCommand("实现登录", services, {});
   assert.match(services.logs.join("\n"), /已有任务正在执行/);
-  assert.ok(!services.logs.join("\n").includes("实现登录"), "rejected dispatch leaves the goal out of the log entirely");
+  assert.deepEqual(ran, [], "busy session never reaches runTask");
 });
 
 test("task input is rejected while the supervisor is busy", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  services.agent = {
-    ...makeAgent(recording),
-    isBusy: () => true,
-    async runTask() {
-      throw new Error("should not run");
-    }
-  };
+  const sessions = await makeTaskSessions();
+  await sessions.create();
+  services.sessions = sessions;
+  const ran: string[] = [];
+  services.tasks = makeTasks(ran, { busy: true });
   await executeCommand("实现登录", services, {});
   assert.match(services.logs.join("\n"), /已有任务正在执行/);
 });
@@ -440,12 +464,8 @@ test("task input is rejected while the supervisor is busy", async () => {
 test("runTask failures surface as a task error log", async () => {
   const recording = { providerConfigs: [] as Recording["providerConfigs"], models: [], thinkingLevels: [] };
   const services = makeServices(recording);
-  services.agent = {
-    ...makeAgent(recording),
-    async runTask() {
-      throw new Error("no model configured");
-    }
-  };
+  services.sessions = await makeTaskSessions();
+  services.tasks = makeTasks([], { runError: new Error("no model configured") });
   await executeCommand("实现登录", services, {});
   assert.match(services.logs.join("\n"), /任务执行失败：no model configured/);
 });

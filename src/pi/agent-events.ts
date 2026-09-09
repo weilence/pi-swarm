@@ -1,10 +1,10 @@
-/** agent 会话流向消费者的单一事件类型：文本/思考流、工具生命周期、流结束。 */
+/** agent 会话流向消费者的单一事件类型：文本/思考流、工具生命周期、流结束。sessionId 标注事件属于哪个并行会话（路由/缓冲归位用）。 */
 export type AgentEvent =
-  | { type: "text"; agent: string; delta: string }
-  | { type: "thinking"; agent: string; delta: string }
-  | { type: "streamEnd"; agent: string }
-  | { type: "toolStart"; agent: string; toolCallId: string; toolName: string; args: unknown }
-  | { type: "toolEnd"; agent: string; toolCallId: string; toolName: string; isError: boolean };
+  | { type: "text"; agent: string; sessionId?: string; delta: string }
+  | { type: "thinking"; agent: string; sessionId?: string; delta: string }
+  | { type: "streamEnd"; agent: string; sessionId?: string }
+  | { type: "toolStart"; agent: string; sessionId?: string; toolCallId: string; toolName: string; args: unknown }
+  | { type: "toolEnd"; agent: string; sessionId?: string; toolCallId: string; toolName: string; isError: boolean };
 
 export type AgentListener = (event: AgentEvent) => void;
 

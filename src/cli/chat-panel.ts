@@ -10,8 +10,8 @@ import { AgentTabState, BlankLine, CollapsibleReasoning, SESSION_SIDEBAR_WIDTH, 
 
 export interface ChatPanelOptions {
   ui: ViewportTUI;
-  /** Returns "exit" to end the process (e.g. the /exit command). */
-  onSubmit: (line: string) => Promise<CommandOutcome | void>;
+  /** Returns "exit" to end the process (e.g. the /exit command); session 是提交时刻的会话命名空间。 */
+  onSubmit: (line: string, session: string) => Promise<CommandOutcome | void>;
   onExit: () => void;
   /** True while the editor owns the keyboard; drives the dimmed-border cue. */
   isInputFocused: () => boolean;
@@ -25,6 +25,8 @@ export interface ChatPanelOptions {
 
 /** Agent that owns output when no explicit label is passed. */
 const DEFAULT_AGENT = "supervisor";
+/** 草稿态的会话命名空间（未物化的新会话视图）；与会话 id 空间隔离（uuid 不会撞）。 */
+export const DRAFT_SESSION = "draft";
 
 /** Counts opening code fences so blocks inside ``` pairs stay together. */
 function countFences(text: string): number {
@@ -60,6 +62,8 @@ export function splitMarkdownBlocks(buffer: string): { blocks: string[]; rest: s
 /** Per-agent transcript state: the panel mounts only the active one. */
 interface AgentTranscript {
   name: string;
+  /** 归属的会话命名空间（并行会话各自一套转录缓冲，切回即补放）。 */
+  session: string;
   /** Mounted in the chat window while active; holds log + stream containers. */
   container: Container;
   log: Container;
@@ -75,6 +79,11 @@ interface AgentTranscript {
   reasonings: CollapsibleReasoning[];
   /** 转录纯文本（逻辑行，未按屏宽折行）；transcriptText / 复制的数据源。 */
   plain: string[];
+}
+
+/** 转录缓冲的双键：会话命名空间 + agent 标签。 */
+function tabKey(session: string, agent: string): string {
+  return `${session}/${agent}`;
 }
 
 /**
@@ -101,8 +110,15 @@ export class ChatPanel extends VStack {
   private toastOverlay?: OverlayHandle;
   private toastLayout?: { editorRows: number; pillWidth: number };
   private readonly markdownTheme: MarkdownTheme;
+  /** 转录缓冲，按 `session/agent` 双键：会话是并行单位，agent 是会话内的标签。 */
   private readonly tabs = new Map<string, AgentTranscript>();
   private activeAgent = DEFAULT_AGENT;
+  /** 当前展示的会话命名空间；后台会话的流持续写入自己的缓冲（切回即补放）。 */
+  private activeSession = DRAFT_SESSION;
+  /** 各会话的提交中任务（提交时刻的会话）；编辑器只被聚焦会话的 busy 锁住。 */
+  private readonly busySessions = new Set<string>();
+  /** 后台期间有过输出的会话（侧栏 • 标记；切回该会话即清除）。 */
+  private readonly unreadSessions = new Set<string>();
   private thinkSeq = 0;
   /** Live tool calls by "agent/toolCallId"; removed when the call finishes. */
   private readonly toolLines = new Map<string, ToolCallLine>();
@@ -110,8 +126,6 @@ export class ChatPanel extends VStack {
   private readonly statusLines = new Map<number, StatusLine>();
   private statusSeq = 0;
   private pendingAnswer?: (answer: string) => void;
-  /** True while a submitted task is running; Enter is swallowed, text is kept. */
-  private busy = false;
   /** 运行中的工具行 → 纯文本下标；结束时把 ⏳ 行原地改写为 ✔/✘。 */
   private readonly pendingPlain = new Map<string, { tab: AgentTranscript; index: number; toolName: string }>();
 
@@ -143,12 +157,12 @@ export class ChatPanel extends VStack {
       if (this.pendingAnswer) {
         const settle = this.pendingAnswer;
         this.pendingAnswer = undefined;
-        this.setBusy(true);
+        this.setSessionBusy(this.activeSession, true);
         this.appendUserMessage(text);
         settle(text);
         return;
       }
-      if (this.busy) return;
+      if (this.busySessions.has(this.activeSession)) return;
       void this.handleSubmit(text);
     };
     this.inputArea.addChild(this.editor);
@@ -169,15 +183,17 @@ export class ChatPanel extends VStack {
   }
 
   /** Registers a tab for an agent (idempotent); the first one becomes active. */
-  public registerAgent(name: string): void {
-    if (this.tabs.has(name)) return;
+  public registerAgent(name: string, session: string = this.activeSession): void {
+    const key = tabKey(session, name);
+    if (this.tabs.has(key)) return;
     const log = new Container();
     const stream = new Container();
     const container = new Container();
     container.addChild(log);
     container.addChild(stream);
-    this.tabs.set(name, {
+    this.tabs.set(key, {
       name,
+      session,
       container,
       log,
       stream,
@@ -188,8 +204,7 @@ export class ChatPanel extends VStack {
       reasonings: [],
       plain: []
     });
-    if (this.tabs.size === 1) {
-      this.activeAgent = name;
+    if (session === this.activeSession && this.sessionTabs(this.activeSession).length === 1) {
       this.mountTranscript(container);
     }
     this.options.ui.requestRender();
@@ -197,7 +212,7 @@ export class ChatPanel extends VStack {
 
   /** Switches the mounted transcript to the given agent and clears its unread flag. */
   public setActiveAgent(name: string): void {
-    const tab = this.tabs.get(name);
+    const tab = this.tabs.get(tabKey(this.activeSession, name));
     if (!tab || name === this.activeAgent) return;
     this.mountTranscript(tab.container);
     this.activeAgent = name;
@@ -206,9 +221,46 @@ export class ChatPanel extends VStack {
     this.options.ui.requestRender();
   }
 
+  /**
+   * 切换展示的会话命名空间：挂载目标会话的转录缓冲（O(1) 换引用，后台期间
+   * 的增量已在缓冲里，切回即完整补放），并清掉该会话的未读标记。
+   */
+  public setActiveSession(session: string): void {
+    if (session === this.activeSession) return;
+    this.activeSession = session;
+    const tab = this.tabFor(this.activeAgent, session);
+    this.mountTranscript(tab.container);
+    tab.unread = false;
+    this.unreadSessions.delete(session);
+    // 编辑器的提交锁跟随聚焦会话：后台会话再忙也不锁当前输入框。
+    this.editor.disableSubmit = this.busySessions.has(session);
+    this.refreshStreamArea();
+    this.options.ui.requestRender();
+  }
+
+  /** 当前展示的会话命名空间。 */
+  public get session(): string {
+    return this.activeSession;
+  }
+
+  /** 某会话是否已有落盘在缓冲里的内容（未读过 JSONL 历史 → false，需要回放）。 */
+  public isPopulated(session: string): boolean {
+    return this.sessionTabs(session).some((tab) => tab.plain.length > 0);
+  }
+
+  /** 某会话是否存在未读输出（切回该会话时清除；agent 级未读仍由标签栏展示）。 */
+  public sessionUnread(session: string): boolean {
+    return this.unreadSessions.has(session);
+  }
+
+  /** 某会话的标签（按注册序，即 tabStates 的展示序）。 */
+  private sessionTabs(session: string): AgentTranscript[] {
+    return [...this.tabs.values()].filter((tab) => tab.session === session);
+  }
+
   /** Cycles the active agent tab (Alt+↑/↓), wrapping around. */
   public cycleAgent(delta: number): void {
-    const names = [...this.tabs.keys()];
+    const names = this.sessionTabs(this.activeSession).map((tab) => tab.name);
     if (names.length < 2) return;
     const index = names.indexOf(this.activeAgent);
     this.setActiveAgent(names[(index + delta + names.length) % names.length]);
@@ -216,7 +268,7 @@ export class ChatPanel extends VStack {
 
   /** Render-time tab states for the owner's tab bar. */
   public tabStates(): readonly AgentTabState[] {
-    return [...this.tabs.values()].map((tab) => ({
+    return this.sessionTabs(this.activeSession).map((tab) => ({
       name: tab.name,
       active: tab.name === this.activeAgent,
       unread: tab.unread
@@ -228,8 +280,8 @@ export class ChatPanel extends VStack {
    * draft view so 「新建」 starts from a clean slate instead of appending to
    * the previous session's output.
    */
-  public clearTranscript(agent: string = this.activeAgent): void {
-    const tab = this.tabs.get(agent);
+  public clearTranscript(agent: string = this.activeAgent, session: string = this.activeSession): void {
+    const tab = this.tabs.get(tabKey(session, agent));
     if (!tab) return;
     this.flushStream(tab);
     tab.log.clear();
@@ -256,113 +308,115 @@ export class ChatPanel extends VStack {
     this.scrollView.scrollBy(lines);
   }
 
-  public appendLine(line: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
+  public appendLine(line: string, agent: string = DEFAULT_AGENT, session: string = this.activeSession): void {
+    const tab = this.tabFor(agent, session);
     // A log line between stream chunks is later content: commit the live tail
     // first so the transcript order matches arrival order.
     this.flushStream(tab);
     tab.log.addChild(new Text(line, 0, 0));
     tab.plain.push(stripTerminalSequences(line));
-    this.markUnread(tab, agent);
+    this.markUnread(tab);
     this.options.ui.requestRender();
   }
 
-  public streamThinking(delta: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
+  public streamThinking(delta: string, agent: string = DEFAULT_AGENT, session: string = this.activeSession): void {
+    const tab = this.tabFor(agent, session);
     // Text → thinking switch: the pending text tail is finished content, commit
     // it so the transcript keeps the model's real interleaved order.
     if (tab.streamKind === "text") this.flushStream(tab);
     tab.streamKind = "thinking";
     tab.thinkingBuffer += delta;
-    this.markUnread(tab, agent);
+    this.markUnread(tab);
     this.refreshStreamArea();
   }
 
-  public streamText(delta: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
+  public streamText(delta: string, agent: string = DEFAULT_AGENT, session: string = this.activeSession): void {
+    const tab = this.tabFor(agent, session);
     // Thinking → text switch: fold the thinking run into the transcript, collapsed.
     if (tab.streamKind === "thinking") this.flushStream(tab);
     tab.streamKind = "text";
     const { blocks, rest } = splitMarkdownBlocks(tab.partialBlock + delta);
     for (const block of blocks) this.addStreamMarkdown(tab, block);
     tab.partialBlock = rest;
-    this.markUnread(tab, agent);
+    this.markUnread(tab);
     this.refreshStreamArea();
   }
 
-  public endStream(agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
+  public endStream(agent: string = DEFAULT_AGENT, session: string = this.activeSession): void {
+    const tab = this.tabFor(agent, session);
     this.flushStream(tab);
     // Safety net: calls still marked running (e.g. after an abort without an
     // end event) are shown as interrupted instead of spinning forever.
-    for (const [key, line] of this.toolLines) {
-      if (key.startsWith(`${agent}/`)) {
-        line.finish(true);
-        this.toolLines.delete(key);
-        const pending = this.pendingPlain.get(key);
-        if (pending) {
-          pending.tab.plain[pending.index] = `✘ ${pending.toolName}`;
-          this.pendingPlain.delete(key);
-        }
+    const keyPrefix = `${tabKey(session, agent)}/`;
+    for (const key of [...this.toolLines.keys()]) {
+      if (!key.startsWith(keyPrefix)) continue;
+      this.toolLines.get(key)!.finish(true);
+      this.toolLines.delete(key);
+      const pending = this.pendingPlain.get(key);
+      if (pending) {
+        pending.tab.plain[pending.index] = `✘ ${pending.toolName}`;
+        this.pendingPlain.delete(key);
       }
     }
-    this.markUnread(tab, agent);
+    this.markUnread(tab);
     this.refreshStreamArea();
   }
 
   /** A tool call started: commits the pending stream tail, shows a running line. */
-  public toolStart(agent: string, toolCallId: string, toolName: string, args: unknown): void {
-    const tab = this.tabFor(agent);
+  public toolStart(agent: string, toolCallId: string, toolName: string, args: unknown, session: string = this.activeSession): void {
+    const tab = this.tabFor(agent, session);
     // Tools run between text segments: commit the live tail first so the
     // transcript order matches what the model actually did.
     this.flushStream(tab);
     const summary = summarizeToolArgs(args);
-    this.toolLines.set(`${agent}/${toolCallId}`, new ToolCallLine(toolName, summary));
-    tab.log.addChild(this.toolLines.get(`${agent}/${toolCallId}`)!);
+    const key = `${tabKey(session, agent)}/${toolCallId}`;
+    this.toolLines.set(key, new ToolCallLine(toolName, summary));
+    tab.log.addChild(this.toolLines.get(key)!);
     const label = `${toolName}${summary ? ` ${summary}` : ""}`;
-    this.pendingPlain.set(`${agent}/${toolCallId}`, { tab, index: tab.plain.push(`⏳ ${label}`) - 1, toolName: label });
-    this.markUnread(tab, agent);
+    this.pendingPlain.set(key, { tab, index: tab.plain.push(`⏳ ${label}`) - 1, toolName: label });
+    this.markUnread(tab);
     this.options.ui.requestRender();
   }
 
   /** A tool call finished: flip its line to ✔/✘ in place. */
-  public toolEnd(agent: string, toolCallId: string, isError: boolean): void {
-    this.toolLines.get(`${agent}/${toolCallId}`)?.finish(isError);
-    this.toolLines.delete(`${agent}/${toolCallId}`);
-    const pending = this.pendingPlain.get(`${agent}/${toolCallId}`);
+  public toolEnd(agent: string, toolCallId: string, isError: boolean, session: string = this.activeSession): void {
+    const key = `${tabKey(session, agent)}/${toolCallId}`;
+    this.toolLines.get(key)?.finish(isError);
+    this.toolLines.delete(key);
+    const pending = this.pendingPlain.get(key);
     if (pending) {
       pending.tab.plain[pending.index] = `${isError ? "✘" : "✔"} ${pending.toolName}`;
-      this.pendingPlain.delete(`${agent}/${toolCallId}`);
+      this.pendingPlain.delete(key);
     }
-    const tab = this.tabs.get(agent);
+    const tab = this.tabs.get(tabKey(session, agent));
     if (tab) {
-      this.markUnread(tab, agent);
+      this.markUnread(tab);
       this.options.ui.requestRender();
     }
   }
 
   /** A finished tool-call row from history replay; renders like a settled live row. */
-  public appendToolCall(toolName: string, summary: string, isError: boolean, agent: string = DEFAULT_AGENT): void {
+  public appendToolCall(toolName: string, summary: string, isError: boolean, agent: string = DEFAULT_AGENT, session: string = this.activeSession): void {
     const line = new ToolCallLine(toolName, summary);
     line.finish(isError);
-    const tab = this.tabFor(agent);
+    const tab = this.tabFor(agent, session);
     tab.log.addChild(line);
     tab.plain.push(`${isError ? "✘" : "✔"} ${toolName}${summary ? ` ${summary}` : ""}`);
     this.options.ui.requestRender();
   }
 
   /** One finished thinking entry (collapsible), as the live stream would leave it. */
-  public appendThinking(text: string, agent: string = DEFAULT_AGENT): void {
-    const tab = this.tabFor(agent);
+  public appendThinking(text: string, agent: string = DEFAULT_AGENT, session: string = this.activeSession): void {
+    const tab = this.tabFor(agent, session);
     this.flushStream(tab);
     if (text.trim()) tab.log.addChild(this.newReasoning(text.trim(), tab));
     this.options.ui.requestRender();
   }
 
-  /** Echoes a submitted user message as a right-aligned bubble in the active tab. */
-  public appendUserMessage(message: string): void {
+  /** Echoes a submitted user message as a right-aligned bubble in the given session's tab. */
+  public appendUserMessage(message: string, session: string = this.activeSession): void {
     if (!message.trim()) return;
-    const tab = this.activeTab();
+    const tab = this.tabFor(DEFAULT_AGENT, session);
     this.flushStream(tab);
     tab.log.addChild(new UserMessage(message));
     tab.plain.push(message);
@@ -455,9 +509,9 @@ export class ChatPanel extends VStack {
     this.toasts.clear();
   }
 
-  public appendMarkdown(markdown: string, agent: string = DEFAULT_AGENT): void {
+  public appendMarkdown(markdown: string, agent: string = DEFAULT_AGENT, session: string = this.activeSession): void {
     if (!markdown.trim()) return;
-    const tab = this.tabFor(agent);
+    const tab = this.tabFor(agent, session);
     this.flushStream(tab);
     this.addMarkdown(tab, markdown);
   }
@@ -469,7 +523,7 @@ export class ChatPanel extends VStack {
   public askQuestion(question: string): Promise<string> {
     return new Promise<string>((resolve) => {
       this.appendLine(question);
-      this.setBusy(false);
+      this.setSessionBusy(this.activeSession, false);
       this.pendingAnswer = resolve;
     });
   }
@@ -503,7 +557,7 @@ export class ChatPanel extends VStack {
     if (!markdown.trim()) return;
     tab.log.addChild(new Markdown(markdown, 0, 0, this.markdownTheme));
     tab.plain.push(markdown);
-    this.markUnread(tab, tab.name);
+    this.markUnread(tab);
     this.options.ui.requestRender();
   }
 
@@ -553,21 +607,28 @@ export class ChatPanel extends VStack {
   }
 
   private activeTab(): AgentTranscript {
-    return this.tabs.get(this.activeAgent)!;
+    return this.tabs.get(tabKey(this.activeSession, this.activeAgent))!;
   }
 
   /** Returns the agent's transcript, registering a tab on first use. */
-  private tabFor(agent: string): AgentTranscript {
-    let tab = this.tabs.get(agent);
+  private tabFor(agent: string, session: string = this.activeSession): AgentTranscript {
+    const key = tabKey(session, agent);
+    let tab = this.tabs.get(key);
     if (!tab) {
-      this.registerAgent(agent);
-      tab = this.tabs.get(agent)!;
+      this.registerAgent(agent, session);
+      tab = this.tabs.get(key)!;
     }
     return tab;
   }
 
-  private markUnread(tab: AgentTranscript, agent: string): void {
-    if (agent !== this.activeAgent) tab.unread = true;
+  /** 非当前展示标签（其他 agent 或后台会话）的输出都算未读。 */
+  private markUnread(tab: AgentTranscript): void {
+    if (tab.session !== this.activeSession) {
+      this.unreadSessions.add(tab.session);
+      tab.unread = true;
+    } else if (tab.name !== this.activeAgent) {
+      tab.unread = true;
+    }
   }
 
   private newReasoning(buffer: string, tab: AgentTranscript): CollapsibleReasoning {
@@ -592,24 +653,29 @@ export class ChatPanel extends VStack {
     this.options.ui.requestRender();
   }
 
-  private setBusy(busy: boolean): void {
-    this.busy = busy;
-    // The editor stays mounted and focused; Enter is ignored while busy so the
-    // queued text survives until the running task finishes.
-    this.editor.disableSubmit = busy;
+  /**
+   * 会话级提交锁：只有聚焦会话的任务锁住编辑器；后台会话的 busy 不影响
+   * 当前输入。任务结束时若该会话正是聚焦会话，才触发 onIdle 焦点策略。
+   */
+  private setSessionBusy(session: string, busy: boolean): void {
+    if (busy) this.busySessions.add(session);
+    else this.busySessions.delete(session);
+    this.editor.disableSubmit = this.busySessions.has(this.activeSession);
     this.options.ui.requestRender();
-    if (!busy) this.options.onIdle();
+    if (!busy && session === this.activeSession) this.options.onIdle();
   }
 
   private async handleSubmit(text: string): Promise<void> {
     // 斜杠命令是 UI 操作且可能含密钥（/apikey），不作为聊天气泡回显。
+    // 提交时刻锁住的是提交时的会话：期间用户切走，编辑器不背旧会话的锁。
+    const session = this.activeSession;
     if (!text.startsWith("/")) this.appendUserMessage(text);
-    this.setBusy(true);
+    this.setSessionBusy(session, true);
     try {
-      const outcome = await this.options.onSubmit(text);
+      const outcome = await this.options.onSubmit(text, session);
       if (outcome === "exit") this.options.onExit();
     } finally {
-      this.setBusy(false);
+      this.setSessionBusy(session, false);
     }
   }
 }

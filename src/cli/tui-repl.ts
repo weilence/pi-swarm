@@ -1,7 +1,6 @@
 import { getKeybindings, type AutocompleteProvider, HStack, isKeyRelease, matchesKey, type OverlayHandle, ProcessTerminal, ScrollView, type ViewportTUI, visibleWidth, VStack } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { SwarmAltScreen } from "./alt-screen.ts";
-import type { SessionSummary } from "../core/session/session-types.ts";
 import { macAltKeyHint } from "./alt-key-hint.ts";
 import { summarizeToolArgs } from "../core/tool-summary.ts";
 import type { CommandOutcome, PickerOption } from "./commands.ts";
@@ -25,8 +24,8 @@ export { summarizeToolArgs };
 export interface TuiReplOptions {
   /** Injected viewport TUI for tests; defaults to a ProcessTerminal + SwarmAltScreen (fullscreen) pair. */
   ui?: ViewportTUI;
-  /** Returns "exit" to end the process (e.g. the /exit command). */
-  onSubmit: (line: string) => Promise<CommandOutcome | void>;
+  /** Returns "exit" to end the process (e.g. the /exit command); session 是提交时刻的会话命名空间。 */
+  onSubmit: (line: string, session: string) => Promise<CommandOutcome | void>;
   onExit: () => void;
   /** A sidebar session was activated (Enter/n); "draft" means the ＋ 新建/草稿 entry. */
   onSessionClick?: (sessionId: string) => void | Promise<void>;
@@ -113,7 +112,7 @@ export class TuiRepl {
 
     this.chat = new ChatPanel({
       ui: this.ui,
-      onSubmit: options.onSubmit,
+      onSubmit: (line, session) => options.onSubmit(line, session),
       onExit: options.onExit,
       isInputFocused: () => this.focus === "editor",
       autocompleteEngine: options.autocompleteEngine,
@@ -209,8 +208,8 @@ export class TuiRepl {
   // ---- ChatPanel facades: output, streaming, transcripts, asking ----
 
   /** Registers a tab for an agent (idempotent); the first one becomes active. */
-  public registerAgent(name: string): void {
-    this.chat.registerAgent(name);
+  public registerAgent(name: string, session?: string): void {
+    this.chat.registerAgent(name, session);
   }
 
   /** Switches the mounted transcript to the given agent and clears its unread flag. */
@@ -218,14 +217,24 @@ export class TuiRepl {
     this.chat.setActiveAgent(name);
   }
 
-  /** Replaces the sidebar snapshot (already updatedAt-desc from the manager). */
-  public setSessions(list: readonly SessionSummary[]): void {
-    this.sessionList = list.map((session) => ({
-      id: session.id,
-      name: session.name,
-      current: session.current,
-      closed: session.status === "closed"
-    }));
+  /** 切换展示的会话命名空间（并行会话的视图切换；缓冲保留，切回即补放）。 */
+  public setActiveSession(session: string): void {
+    this.chat.setActiveSession(session);
+  }
+
+  /** 某会话是否有未读输出（侧栏 • 标记的数据源）。 */
+  public sessionUnread(session: string): boolean {
+    return this.chat.sessionUnread(session);
+  }
+
+  /** 某会话的转录缓冲是否已有内容（false = 需要 JSONL 历史回放）。 */
+  public sessionPopulated(session: string): boolean {
+    return this.chat.isPopulated(session);
+  }
+
+  /** Replaces the sidebar snapshot（含 busy/unread/作用域标注，由入口组装）。 */
+  public setSessions(entries: readonly SessionEntryState[]): void {
+    this.sessionList = entries;
     this.ui.requestRender();
   }
 
@@ -237,53 +246,53 @@ export class TuiRepl {
   }
 
   /** See {@link ChatPanel.clearTranscript}. */
-  public clearTranscript(agent?: string): void {
-    this.chat.clearTranscript(agent);
+  public clearTranscript(agent?: string, session?: string): void {
+    this.chat.clearTranscript(agent, session);
   }
 
   /** See {@link ChatPanel.appendLine}. */
-  public appendLine(line: string, agent?: string): void {
-    this.chat.appendLine(line, agent);
+  public appendLine(line: string, agent?: string, session?: string): void {
+    this.chat.appendLine(line, agent, session);
   }
 
   /** See {@link ChatPanel.streamThinking}. */
-  public streamThinking(delta: string, agent?: string): void {
-    this.chat.streamThinking(delta, agent);
+  public streamThinking(delta: string, agent?: string, session?: string): void {
+    this.chat.streamThinking(delta, agent, session);
   }
 
   /** See {@link ChatPanel.streamText}. */
-  public streamText(delta: string, agent?: string): void {
-    this.chat.streamText(delta, agent);
+  public streamText(delta: string, agent?: string, session?: string): void {
+    this.chat.streamText(delta, agent, session);
   }
 
   /** See {@link ChatPanel.endStream}. */
-  public endStream(agent?: string): void {
-    this.chat.endStream(agent);
+  public endStream(agent?: string, session?: string): void {
+    this.chat.endStream(agent, session);
   }
 
   /** See {@link ChatPanel.toolStart}. */
-  public toolStart(agent: string, toolCallId: string, toolName: string, args: unknown): void {
-    this.chat.toolStart(agent, toolCallId, toolName, args);
+  public toolStart(agent: string, toolCallId: string, toolName: string, args: unknown, session?: string): void {
+    this.chat.toolStart(agent, toolCallId, toolName, args, session);
   }
 
   /** See {@link ChatPanel.toolEnd}. */
-  public toolEnd(agent: string, toolCallId: string, isError: boolean): void {
-    this.chat.toolEnd(agent, toolCallId, isError);
+  public toolEnd(agent: string, toolCallId: string, isError: boolean, session?: string): void {
+    this.chat.toolEnd(agent, toolCallId, isError, session);
   }
 
   /** See {@link ChatPanel.appendToolCall}. */
-  public appendToolCall(toolName: string, summary: string, isError: boolean, agent?: string): void {
-    this.chat.appendToolCall(toolName, summary, isError, agent);
+  public appendToolCall(toolName: string, summary: string, isError: boolean, agent?: string, session?: string): void {
+    this.chat.appendToolCall(toolName, summary, isError, agent, session);
   }
 
   /** See {@link ChatPanel.appendThinking}. */
-  public appendThinking(text: string, agent?: string): void {
-    this.chat.appendThinking(text, agent);
+  public appendThinking(text: string, agent?: string, session?: string): void {
+    this.chat.appendThinking(text, agent, session);
   }
 
   /** See {@link ChatPanel.appendUserMessage}. */
-  public appendUserMessage(message: string): void {
-    this.chat.appendUserMessage(message);
+  public appendUserMessage(message: string, session?: string): void {
+    this.chat.appendUserMessage(message, session);
   }
 
   /** See {@link ChatPanel.beginStatus}: spinner line for long-running commands. */
@@ -302,8 +311,8 @@ export class TuiRepl {
   }
 
   /** See {@link ChatPanel.appendMarkdown}. */
-  public appendMarkdown(markdown: string, agent?: string): void {
-    this.chat.appendMarkdown(markdown, agent);
+  public appendMarkdown(markdown: string, agent?: string, session?: string): void {
+    this.chat.appendMarkdown(markdown, agent, session);
   }
 
   /** See {@link ChatPanel.askQuestion}. */

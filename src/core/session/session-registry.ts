@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { SessionManager as PiSessionManager, type NewSessionOptions } from "@earendil-works/pi-coding-agent";
 import { getUserDataDir } from "../userdata.ts";
 import type { SessionRecord, SessionSummary } from "./session-types.ts";
-import { normalizeOptionalText, sessionStatus, SessionClosedError, SessionError, SessionNotFoundError } from "./session-types.ts";
+import { normalizeOptionalText, sessionStatus, SessionClosedError, SessionError, SessionNotFoundError, WorktreeScopeMissingError } from "./session-types.ts";
 import type { SessionStore } from "./session-store.ts";
 
 /** 可注入的 Pi 会话工厂；默认 PiSessionManager.create（测试可替换为 inMemory）。 */
@@ -34,6 +34,8 @@ export interface SessionRegistryOptions {
   createPiSession?: PiSessionFactory;
   /** Pi 会话打开器注入，测试用。 */
   openPiSession?: PiSessionOpener;
+  /** 作用域名 → 目录绝对路径；缺省恒返 undefined（未接 worktree 时全部落主工作区）。 */
+  resolveWorktreeCwd?: (name: string) => Promise<string | undefined>;
 }
 
 /** 默认过期阈值：30 天。 */
@@ -53,8 +55,11 @@ export class SessionRegistry {
   private readonly now: () => Date;
   private readonly createPiSession: PiSessionFactory;
   private readonly openPiSession: PiSessionOpener;
+  private readonly resolveWorktreeCwd?: (name: string) => Promise<string | undefined>;
   private records: SessionRecord[] = [];
   private currentId?: string;
+  /** 当前作用域（undefined = 主工作区）；只存内存，启动总在主工作区。 */
+  private scope?: string;
   /** 草稿态开启标志；与 currentId 解耦：未命名草稿也要与启动时的「无会话」区分开。 */
   private draftOpen = false;
   /** 草稿态的待用名字（/new <name> 提供）；物化时作为会话名，无则用首条消息摘要。 */
@@ -71,6 +76,17 @@ export class SessionRegistry {
     this.now = options.now ?? (() => new Date());
     this.createPiSession = options.createPiSession ?? ((cwd, dir, opts) => PiSessionManager.create(cwd, dir, opts));
     this.openPiSession = options.openPiSession ?? ((path, dir, cwd) => PiSessionManager.open(path, dir, cwd));
+    this.resolveWorktreeCwd = options.resolveWorktreeCwd;
+  }
+
+  /** 当前作用域名（undefined = 主工作区）；/worktree 切换的就是它。 */
+  public currentScope(): string | undefined {
+    return this.scope;
+  }
+
+  /** 移动作用域指针：undefined 切回主工作区。纯内存操作，不碰任何会话。 */
+  public switchWorktree(name?: string): void {
+    this.scope = normalizeOptionalText(name);
   }
 
   /** 把变更操作排入互斥队列；单次失败不阻断后续操作。 */
@@ -153,7 +169,9 @@ export class SessionRegistry {
       createdAt: timestamp,
       updatedAt: timestamp,
       messageCount: 0,
-      ...(model ? { model } : {})
+      ...(model ? { model } : {}),
+      // 创建时盖当前作用域章，终身不变（容器模型：会话永远归属创建时的 worktree）。
+      ...(this.scope ? { worktree: this.scope } : {})
     };
     // 先持久化再改内存：save 失败（磁盘满等）时内存索引与指针保持原状，
     // 不会出现 current 指向未落盘会话的不一致。
@@ -197,10 +215,19 @@ export class SessionRegistry {
     const record = this.find(id);
     if (!record) throw new SessionNotFoundError(`会话不存在：${normalizeOptionalText(id) ?? "(空)"}`);
     if (record.closedAt) throw new SessionClosedError(`会话已关闭，无法绑定：${record.name ?? record.id}`);
-    if (record.sessionFile && (await fileExists(record.sessionFile))) {
-      return this.openPiSession(record.sessionFile, this.sessionDir, this.cwd);
+    // 归属作用域 → 工作目录：Pi 会话与后续的子 agent 都落在这里。
+    // 目录丢失（被手动删除等）直接报错，不静默回退主工作区——旧 JSONL 里的
+    // 历史语义依赖于当初的工作目录，静默换目录只会掩盖问题。
+    let cwd = this.cwd;
+    if (record.worktree) {
+      const resolved = await this.resolveWorktreeCwd?.(record.worktree);
+      if (!resolved) throw new WorktreeScopeMissingError(`会话所在的 worktree 不存在或不可用：${record.worktree}（可能已被删除）`);
+      cwd = resolved;
     }
-    const pi = this.createPiSession(this.cwd, this.sessionDir, { id: record.id });
+    if (record.sessionFile && (await fileExists(record.sessionFile))) {
+      return this.openPiSession(record.sessionFile, this.sessionDir, cwd);
+    }
+    const pi = this.createPiSession(cwd, this.sessionDir, { id: record.id });
     const file = pi.isPersisted() ? pi.getSessionFile() : undefined;
     if (file && file !== record.sessionFile) {
       record.sessionFile = file;
@@ -339,7 +366,8 @@ export class SessionRegistry {
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       messageCount: record.messageCount,
-      ...(record.model ? { model: record.model } : {})
+      ...(record.model ? { model: record.model } : {}),
+      ...(record.worktree ? { worktree: record.worktree } : {})
     };
   }
 }
